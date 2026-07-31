@@ -34,9 +34,12 @@ const App = Program.make({
 }).pipe((program) =>
   Program.init(program, {
     update: {
-      Inc: (msg, model) => Effect.succeed({ count: model.count + msg.by }),
-      Dec: (msg, model) => Effect.succeed({ count: model.count - msg.by }),
-      Reset: () => Effect.succeed({ count: 0 }),
+      Inc: (msg, model) => [
+        { count: model.count + msg.by },
+        [Effect.succeed({ _tag: "Reset" }), Effect.succeed({ _tag: "Reset" })],
+      ],
+      Dec: (msg, model) => ({ count: model.count - msg.by }),
+      Reset: () => ({ count: 0 }),
     },
   }),
 );
