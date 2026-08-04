@@ -112,9 +112,20 @@ export type NoTransform<P extends AnyPropsSchema> = [P["Encoded"]] extends [P["T
  * Neither failure is recoverable from the value alone: given a props object,
  * nothing tells you which fields were *meant* to be opaque. The annotation is
  * that record. A serialiser walks `PropsSchema.fields`, finds the entries whose
- * `ast._tag` is `"Declaration"`, and substitutes a placeholder — which can say
- * more than the type ever could, since at runtime it has the function's `name`
- * and `length`.
+ * `ast._tag` is `"Declaration"`, and substitutes a placeholder.
+ *
+ * The placeholder can say more than the type ever could, because `name` on a
+ * function reaching a prop is inferred from the *call site*: `onCheckout={fn}`
+ * reports `"fn"` — which handler, not merely that there was one. Pair it with
+ * the first line of `toString()` to identify inline arrows, truncated, and
+ * behind a dev flag since it exposes source text.
+ *
+ * Not `length`: it counts leading parameters up to the first default or rest,
+ * so `(...args) => {}` reports 0 and `(a, b = 1) => {}` reports 1. Beside a
+ * prop declared `(orderId: string) => void` that reads as a mismatch when
+ * nothing is wrong. A signature cannot be checked at runtime — which is the
+ * whole reason `callback` exists — and a number that looks like it might be
+ * checking one is worse than no number.
  *
  * Optional fields need unwrapping: `Schema.optional(callback<F>())` is a
  * `Union` of `[Declaration, Undefined]`, so the annotation sits on the member,
