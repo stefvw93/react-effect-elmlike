@@ -98,10 +98,8 @@ const Presence = define({
   props: Props,
   state: State,
   actions,
-  hooks: {
-    visible: function useVisible() {
-      return usePageVisible();
-    },
+  hooks: function usePresenceHooks() {
+    return { visible: usePageVisible() };
   },
 });
 

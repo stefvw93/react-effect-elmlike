@@ -54,7 +54,7 @@ export class CartApi extends Context.Service<
 
 // --- community hooks --------------------------------------------------------
 
-declare function useCatalogQuery(customerId: string): { readonly stale: boolean };
+declare function useCatalog(customerId: string): { readonly stale: boolean };
 declare function useOnlineStatus(): boolean;
 
 // --- props ------------------------------------------------------------------
@@ -138,16 +138,12 @@ const Cart = define({
   ],
 
   // Called in render position with the current props. `props` needs no
-  // annotation — `Cart` already knows what it is. The `use` prefix on the
-  // function expression is what puts these inside `rules-of-hooks`; see the
-  // note on `HookSpec`.
-  hooks: {
-    catalog: function useCatalog(props) {
-      return useCatalogQuery(props.customerId);
-    },
-    online: function useOnline() {
-      return useOnlineStatus();
-    },
+  // annotation — `Cart` already knows what it is.
+  hooks: function useCartHooks(props) {
+    return {
+      catalog: useCatalog(props.customerId),
+      online: useOnlineStatus(),
+    };
   },
 });
 

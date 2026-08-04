@@ -248,34 +248,34 @@ export type AnyHooks = Record<string, unknown>;
  * `@hookChanged`, which can change state again. That is the same footgun as a
  * bad dependency array, and it is on you in the same way.
  *
- * **Write each entry as a named function expression whose name begins with
- * `use`:**
+ * **One function, named `use…`, returning the record:**
  *
- *     hooks: {
- *       catalog: function useCatalog(props) { return useCatalogQuery(props.id) },
+ *     hooks: function useCartHooks(props, state) {
+ *       const catalog = useCatalogQuery(props.customerId)
+ *       return { catalog, stale: catalog.stale, online: useOnlineStatus() }
  *     }
  *
- * Not decoration. `rules-of-hooks` decides whether a function may call hooks by
- * looking at its *name*, and an anonymous arrow in an object property is
- * neither a component nor a hook — so the entry is rejected outright, and the
- * one invariant this slot depends on goes unchecked. Naming the function
- * expression puts the entry back inside the rule, which then enforces the real
- * thing: no conditional hook call, no early return, no loop. The key stays
- * whatever reads best at the use site (`hooks.catalog`), and contextual typing
- * is unaffected — the parameters still need no annotations.
+ * It reads like the top of an ordinary React component because that is exactly
+ * what it is. The `use` prefix is not there to appease anything: this really is
+ * a custom hook by React's own definition — a function that calls hooks — and
+ * naming it so is what puts the body inside `rules-of-hooks`, which then
+ * enforces the invariant the whole slot depends on. No conditional call, no
+ * early return, no loop.
  *
- * The same lint forces one other house rule: reach for services with
+ * A record of per-key functions would read the same and infer the same, but it
+ * cannot express the `const catalog = …` line above: a hook called once and
+ * projected several ways. Calling `useQuery` twice to get two tracked values is
+ * two subscriptions, not one.
+ *
+ * `H` is inferred from the return type; `props` and `state` are contextually
+ * typed from the surrounding `define`, so nothing here needs an annotation.
+ *
+ * One related house rule, forced by the same lint: reach for services with
  * `Effect.flatMap(Service, …)` or `Effect.gen`, never `Service.use(…)`. The
  * rule reads any `.use(` as React 19's `use` hook and rejects it everywhere
  * outside a component.
- *
- * A reverse mapped type. `H` is inferred from what each function *returns*,
- * while the parameters written here contextually type every one — so the hooks
- * need no annotations of their own.
  */
-export type HookSpec<Props, State, H extends AnyHooks> = {
-  readonly [K in keyof H]: (props: Props, state: State) => H[K];
-};
+export type HookSpec<Props, State, H extends AnyHooks> = (props: Props, state: State) => H;
 
 /**
  * Everything readable at a moment: accumulated state plus ambient inputs.
