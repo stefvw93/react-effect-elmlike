@@ -72,9 +72,7 @@ function Sidebar({ children }: { readonly children?: ReactNode }): ReactNode {
   const [open, setOpen] = useState(true);
   return (
     <aside>
-      <button onClick={() => setOpen((previous) => !previous)}>
-        {open ? "hide" : "show"}
-      </button>
+      <button onClick={() => setOpen((previous) => !previous)}>{open ? "hide" : "show"}</button>
       {open && children}
     </aside>
   );
@@ -89,7 +87,7 @@ function ReleaseButton({ customerId }: { readonly customerId: string }): ReactNo
   return (
     <button
       onClick={() => {
-        runtime.runFork(CartApi.use((api) => api.release(customerId)));
+        runtime.runFork(Effect.flatMap(CartApi, (api) => api.release(customerId)));
       }}
     >
       Release hold

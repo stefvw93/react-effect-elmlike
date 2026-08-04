@@ -99,7 +99,9 @@ const Presence = define({
   state: State,
   actions,
   hooks: {
-    visible: () => usePageVisible(),
+    visible: function useVisible() {
+      return usePageVisible();
+    },
   },
 });
 
@@ -115,7 +117,7 @@ export const presence = Presence.create({
     "@mounted": ({ props, state }) => [
       { ...state, connected: true },
       Stream.callback<PresenceAction, never, PresenceSocket | Scope.Scope>((queue) =>
-        PresenceSocket.use((socket) =>
+        Effect.flatMap(PresenceSocket, (socket) =>
           socket.join(props.roomId, (event) => {
             Queue.offerUnsafe(queue, eventToAction(event));
           }),
@@ -166,7 +168,7 @@ export const presence = Presence.create({
     // Tell the server. Runs on the root scope, so it survives this component
     // being torn down — but not the tab being closed.
     "@unmounted": ({ props }) =>
-      PresenceSocket.use((socket) => socket.announceLeave(props.roomId)),
+      Effect.flatMap(PresenceSocket, (socket) => socket.announceLeave(props.roomId)),
   },
 
   render: ({ state, props }) => (

@@ -83,7 +83,7 @@ export const search = Search.create({
                 // The delay sits inside the interruptible region, which is what
                 // turns "restart" into a debounce rather than just a cancel.
                 Effect.delay(
-                  SearchApi.use((api) => api.query(action.text, props.filter)),
+                  Effect.flatMap(SearchApi, (api) => api.query(action.text, props.filter)),
                   "300 millis",
                 ),
                 {
@@ -104,9 +104,7 @@ export const search = Search.create({
     // `for` is carried so a response can say what it answers — which keeps this
     // correct even if the policy is ever relaxed to "parallel".
     HitsArrived: (action, { state }) =>
-      action.for === state.text
-        ? { ...state, hits: action.hits, pending: false }
-        : state,
+      action.for === state.text ? { ...state, hits: action.hits, pending: false } : state,
 
     QueryFailed: (action, { state }) => ({
       ...state,

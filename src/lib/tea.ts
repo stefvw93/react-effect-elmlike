@@ -51,8 +51,7 @@ import type { Cause, Effect, Layer, ManagedRuntime, Schema, Stream } from "effec
  */
 export type AnyActionSchema = Schema.TaggedStruct<any, any>;
 
-export type ActionOf<Actions extends ReadonlyArray<AnyActionSchema>> =
-  Actions[number]["Type"];
+export type ActionOf<Actions extends ReadonlyArray<AnyActionSchema>> = Actions[number]["Type"];
 
 /**
  * State is a schema too, for the same reasons as the actions: it is the other
@@ -206,9 +205,7 @@ export type Concurrency<Actions extends ReadonlyArray<AnyActionSchema>> = {
  * same word the lifecycle actions below use for an incoming prop or hook
  * value. Same meaning in both places.
  */
-export type Next<State, Action, R = never> =
-  | State
-  | readonly [State, Command<Action, R>];
+export type Next<State, Action, R = never> = State | readonly [State, Command<Action, R>];
 
 /**
  * Accessors, so a test can fold a sequence of actions without pattern matching
@@ -251,6 +248,27 @@ export type AnyHooks = Record<string, unknown>;
  * `@hookChanged`, which can change state again. That is the same footgun as a
  * bad dependency array, and it is on you in the same way.
  *
+ * **Write each entry as a named function expression whose name begins with
+ * `use`:**
+ *
+ *     hooks: {
+ *       catalog: function useCatalog(props) { return useCatalogQuery(props.id) },
+ *     }
+ *
+ * Not decoration. `rules-of-hooks` decides whether a function may call hooks by
+ * looking at its *name*, and an anonymous arrow in an object property is
+ * neither a component nor a hook — so the entry is rejected outright, and the
+ * one invariant this slot depends on goes unchecked. Naming the function
+ * expression puts the entry back inside the rule, which then enforces the real
+ * thing: no conditional hook call, no early return, no loop. The key stays
+ * whatever reads best at the use site (`hooks.catalog`), and contextual typing
+ * is unaffected — the parameters still need no annotations.
+ *
+ * The same lint forces one other house rule: reach for services with
+ * `Effect.flatMap(Service, …)` or `Effect.gen`, never `Service.use(…)`. The
+ * rule reads any `.use(` as React 19's `use` hook and rejects it everywhere
+ * outside a component.
+ *
  * A reverse mapped type. `H` is inferred from what each function *returns*,
  * while the parameters written here contextually type every one — so the hooks
  * need no annotations of their own.
@@ -284,8 +302,11 @@ export interface Snapshot<Props, State, H extends AnyHooks> {
 
 export type Dispatch<Action> = (action: Action) => void;
 
-export interface RenderSnapshot<Props, State, Action, H extends AnyHooks>
-  extends Snapshot<Props, State, H> {
+export interface RenderSnapshot<Props, State, Action, H extends AnyHooks> extends Snapshot<
+  Props,
+  State,
+  H
+> {
   readonly dispatch: Dispatch<Action>;
 }
 
@@ -338,9 +359,7 @@ export type LifecycleAction<Props, H extends AnyHooks> =
  */
 export interface LifecycleHandlers<Props, State, Action, H extends AnyHooks, R = never> {
   /** Fires once, after the initial state exists. Where startup commands live. */
-  readonly "@mounted"?: (
-    snapshot: Snapshot<Props, State, H>,
-  ) => Next<State, Action, R>;
+  readonly "@mounted"?: (snapshot: Snapshot<Props, State, H>) => Next<State, Action, R>;
 
   /**
    * Props are a fresh object every render, so this fires constantly. That is
@@ -389,9 +408,7 @@ export interface LifecycleHandlers<Props, State, Action, H extends AnyHooks, R =
    * browser will not wait for a fiber. Anything requiring delivery wants
    * `navigator.sendBeacon` in a `pagehide` handler, which cannot be an Effect.
    */
-  readonly "@unmounted"?: (
-    snapshot: Snapshot<Props, State, H>,
-  ) => Effect.Effect<void, never, R>;
+  readonly "@unmounted"?: (snapshot: Snapshot<Props, State, H>) => Effect.Effect<void, never, R>;
 }
 
 // ---------------------------------------------------------------------------
@@ -464,9 +481,7 @@ export interface Definition<
   Actions extends ReadonlyArray<AnyActionSchema>,
   H extends AnyHooks,
 > {
-  readonly initialState: (
-    initialState: (props: Props) => State,
-  ) => (props: Props) => State;
+  readonly initialState: (initialState: (props: Props) => State) => (props: Props) => State;
 
   readonly reducer: <U extends Reducer<Props, State, Actions, H, any>>(reducer: U) => U;
 

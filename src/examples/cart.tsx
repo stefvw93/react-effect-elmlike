@@ -54,7 +54,7 @@ export class CartApi extends Context.Service<
 
 // --- community hooks --------------------------------------------------------
 
-declare function useCatalog(customerId: string): { readonly stale: boolean };
+declare function useCatalogQuery(customerId: string): { readonly stale: boolean };
 declare function useOnlineStatus(): boolean;
 
 // --- props ------------------------------------------------------------------
@@ -138,10 +138,16 @@ const Cart = define({
   ],
 
   // Called in render position with the current props. `props` needs no
-  // annotation — `Cart` already knows what it is.
+  // annotation — `Cart` already knows what it is. The `use` prefix on the
+  // function expression is what puts these inside `rules-of-hooks`; see the
+  // note on `HookSpec`.
   hooks: {
-    catalog: (props) => useCatalog(props.customerId),
-    online: () => useOnlineStatus(),
+    catalog: function useCatalog(props) {
+      return useCatalogQuery(props.customerId);
+    },
+    online: function useOnline() {
+      return useOnlineStatus();
+    },
   },
 });
 
@@ -156,147 +162,145 @@ export const initialState = Cart.initialState(() => ({
 }));
 
 export const reducer = Cart.reducer({
-    // Startup command. `restore` cannot fail, so a plain map is enough — this
-    // is what Elm calls `Task.perform`.
-    "@mounted": ({ props, state }) => [
-      state,
-      Stream.fromEffect(
-        Effect.map(
-          CartApi.use((api) => api.restore(props.customerId)),
-          (lines) => ({ _tag: "LinesRestored" as const, lines }),
-        ),
+  // Startup command. `restore` cannot fail, so a plain map is enough — this
+  // is what Elm calls `Task.perform`.
+  "@mounted": ({ props, state }) => [
+    state,
+    Stream.fromEffect(
+      Effect.map(
+        Effect.flatMap(CartApi, (api) => api.restore(props.customerId)),
+        (lines) => ({ _tag: "LinesRestored" as const, lines }),
       ),
-    ],
+    ),
+  ],
 
-    LinesRestored: (action, { state }) => ({ ...state, lines: action.lines }),
+  LinesRestored: (action, { state }) => ({ ...state, lines: action.lines }),
 
-    QuantityChanged: (action, { state }) => ({
-      ...state,
-      lines: state.lines.map((line) =>
-        line.sku === action.sku ? { ...line, quantity: action.quantity } : line,
-      ),
-    }),
+  QuantityChanged: (action, { state }) => ({
+    ...state,
+    lines: state.lines.map((line) =>
+      line.sku === action.sku ? { ...line, quantity: action.quantity } : line,
+    ),
+  }),
 
-    // Fallible one-shot, handled where it fails. `Effect.match` yields two
-    // *specific* actions — strictly better than one error funnel at the root.
-    // Reads an ambient hook value without copying it into state.
-    CouponSubmitted: (action, { state, hooks }) =>
-      hooks.online
-        ? [
-            state,
-            Stream.fromEffect(
-              Effect.match(
-                CartApi.use((api) => api.redeem(action.code)),
-                {
-                  onFailure: (error: CouponRejected) => ({
-                    _tag: "Failed" as const,
-                    reason: `Coupon ${error.code} was rejected.`,
-                  }),
-                  onSuccess: (discount) => ({
-                    _tag: "CouponAccepted" as const,
-                    discount,
-                  }),
-                },
-              ),
+  // Fallible one-shot, handled where it fails. `Effect.match` yields two
+  // *specific* actions — strictly better than one error funnel at the root.
+  // Reads an ambient hook value without copying it into state.
+  CouponSubmitted: (action, { state, hooks }) =>
+    hooks.online
+      ? [
+          state,
+          Stream.fromEffect(
+            Effect.match(
+              Effect.flatMap(CartApi, (api) => api.redeem(action.code)),
+              {
+                onFailure: (error: CouponRejected) => ({
+                  _tag: "Failed" as const,
+                  reason: `Coupon ${error.code} was rejected.`,
+                }),
+                onSuccess: (discount) => ({
+                  _tag: "CouponAccepted" as const,
+                  discount,
+                }),
+              },
             ),
-          ]
-        : { ...state, error: "You appear to be offline." },
+          ),
+        ]
+      : { ...state, error: "You appear to be offline." },
 
-    CouponAccepted: (action, { state }) => ({ ...state, discount: action.discount }),
+  CouponAccepted: (action, { state }) => ({ ...state, discount: action.discount }),
 
-    // Progressive emission: one command, many actions, one scope.
-    //
-    // Deliberately *not* `Effect.result`. Reifying the failure into a `Result`
-    // is right for a one-shot effect, but a stream would have to be collapsed
-    // to a single value first — which throws away the progressive emission that
-    // is the entire point. For a fallible stream, catch at the stream level.
-    //
-    CheckoutRequested: (_action, { state, props }) => [
-      { ...state, checkout: "reserving" as const, error: null },
-      Stream.flatMap(Stream.fromEffect(CartApi), (api) =>
-        api.checkout(props.customerId, state.lines),
-      ).pipe(
-        Stream.map(progressToAction),
-        Stream.catchTag("CheckoutFailed", (error) =>
-          Stream.succeed({ _tag: "Failed" as const, reason: error.reason }),
-        ),
+  // Progressive emission: one command, many actions, one scope.
+  //
+  // Deliberately *not* `Effect.result`. Reifying the failure into a `Result`
+  // is right for a one-shot effect, but a stream would have to be collapsed
+  // to a single value first — which throws away the progressive emission that
+  // is the entire point. For a fallible stream, catch at the stream level.
+  //
+  CheckoutRequested: (_action, { state, props }) => [
+    { ...state, checkout: "reserving" as const, error: null },
+    Stream.flatMap(Stream.fromEffect(CartApi), (api) =>
+      api.checkout(props.customerId, state.lines),
+    ).pipe(
+      Stream.map(progressToAction),
+      Stream.catchTag("CheckoutFailed", (error) =>
+        Stream.succeed({ _tag: "Failed" as const, reason: error.reason }),
       ),
-    ],
+    ),
+  ],
 
-    CheckoutAdvanced: (action, { state }) => ({ ...state, checkout: action.stage }),
+  CheckoutAdvanced: (action, { state }) => ({ ...state, checkout: action.stage }),
 
-    // Outbound: the escape hatch to the untyped parent is a command, so the
-    // state change stays pure and the side effect stays in the effect channel.
-    CheckoutCompleted: (action, { state, props }) => [
-      { ...state, checkout: "idle" as const },
-      Stream.drain(
-        Stream.fromEffect(Effect.sync(() => props.onCheckout(action.orderId))),
-      ),
-    ],
+  // Outbound: the escape hatch to the untyped parent is a command, so the
+  // state change stays pure and the side effect stays in the effect channel.
+  CheckoutCompleted: (action, { state, props }) => [
+    { ...state, checkout: "idle" as const },
+    Stream.drain(Stream.fromEffect(Effect.sync(() => props.onCheckout(action.orderId)))),
+  ],
 
-    Failed: (action, { state }) => ({
-      ...state,
-      checkout: "idle" as const,
-      error: action.reason,
-    }),
+  Failed: (action, { state }) => ({
+    ...state,
+    checkout: "idle" as const,
+    error: action.reason,
+  }),
 
-    // `currency` is read straight from props and never appears here.
-    "@propsChanged": (action, { state, initialState }) =>
-      action.next.customerId === action.previous.customerId ? state : initialState,
+  // `currency` is read straight from props and never appears here.
+  "@propsChanged": (action, { state, initialState }) =>
+    action.next.customerId === action.previous.customerId ? state : initialState,
 
-    // `action.hook` narrows `next` per key.
-    "@hookChanged": (action, { state }) => {
-      switch (action.hook) {
-        case "online":
-          return { ...state, error: action.next ? null : "Reconnecting…" };
-        case "catalog":
-          return state;
-      }
-    },
+  // `action.hook` narrows `next` per key.
+  "@hookChanged": (action, { state }) => {
+    switch (action.hook) {
+      case "online":
+        return { ...state, error: action.next ? null : "Reconnecting…" };
+      case "catalog":
+        return state;
+    }
+  },
 
-    // In-app resource release only. A server-side "abandon cart" belongs in a
-    // `pagehide` beacon, not here — React unmount does not fire on tab close.
-    "@unmounted": ({ props }) => CartApi.use((api) => api.release(props.customerId)),
+  // In-app resource release only. A server-side "abandon cart" belongs in a
+  // `pagehide` beacon, not here — React unmount does not fire on tab close.
+  "@unmounted": ({ props }) => Effect.flatMap(CartApi, (api) => api.release(props.customerId)),
 });
 
 export const render = Cart.render(({ state, props, hooks, dispatch }) => (
-    <section aria-busy={state.checkout !== "idle"}>
-      {hooks.catalog.stale && <p>Prices may be out of date.</p>}
-      {state.error && <p role="alert">{state.error}</p>}
+  <section aria-busy={state.checkout !== "idle"}>
+    {hooks.catalog.stale && <p>Prices may be out of date.</p>}
+    {state.error && <p role="alert">{state.error}</p>}
 
-      <ul>
-        {state.lines.map((line) => (
-          <li key={line.sku}>
-            {line.title}
-            <input
-              type="number"
-              value={line.quantity}
-              onChange={(event) =>
-                dispatch({
-                  _tag: "QuantityChanged",
-                  sku: line.sku,
-                  quantity: event.target.valueAsNumber,
-                })
-              }
-            />
-          </li>
-        ))}
-      </ul>
+    <ul>
+      {state.lines.map((line) => (
+        <li key={line.sku}>
+          {line.title}
+          <input
+            type="number"
+            value={line.quantity}
+            onChange={(event) =>
+              dispatch({
+                _tag: "QuantityChanged",
+                sku: line.sku,
+                quantity: event.target.valueAsNumber,
+              })
+            }
+          />
+        </li>
+      ))}
+    </ul>
 
-      <output>
-        {new Intl.NumberFormat(undefined, {
-          style: "currency",
-          currency: props.currency,
-        }).format(subtotal(state))}
-      </output>
+    <output>
+      {new Intl.NumberFormat(undefined, {
+        style: "currency",
+        currency: props.currency,
+      }).format(subtotal(state))}
+    </output>
 
-      <button
-        disabled={state.checkout !== "idle" || !hooks.online}
-        onClick={() => dispatch({ _tag: "CheckoutRequested" })}
-      >
-        {state.checkout === "idle" ? "Check out" : "Working…"}
-      </button>
-    </section>
+    <button
+      disabled={state.checkout !== "idle" || !hooks.online}
+      onClick={() => dispatch({ _tag: "CheckoutRequested" })}
+    >
+      {state.checkout === "idle" ? "Check out" : "Working…"}
+    </button>
+  </section>
 ));
 
 // --- assembled ---------------------------------------------------------------
