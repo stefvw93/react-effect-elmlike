@@ -99,6 +99,30 @@ export type NoTransform<P extends AnyPropsSchema> = [P["Encoded"]] extends [P["T
   : never;
 
 /**
+ * The annotation both helpers below attach, and the only thing that makes a
+ * props object serialisable after the fact.
+ *
+ * Encoding a props schema is *identity* — `Schema.declare` has `Encoded =
+ * Type`, and it must, because the validation pass is a decode. So a function
+ * prop survives encoding as a live reference, and what happens next depends
+ * entirely on the transport: `JSON.stringify` drops the key with no error,
+ * which reads as "the parent never passed it"; `structuredClone` — and so
+ * `postMessage` to any devtools panel, iframe or worker — throws outright.
+ *
+ * Neither failure is recoverable from the value alone: given a props object,
+ * nothing tells you which fields were *meant* to be opaque. The annotation is
+ * that record. A serialiser walks `PropsSchema.fields`, finds the entries whose
+ * `ast._tag` is `"Declaration"`, and substitutes a placeholder — which can say
+ * more than the type ever could, since at runtime it has the function's `name`
+ * and `length`.
+ *
+ * Optional fields need unwrapping: `Schema.optional(callback<F>())` is a
+ * `Union` of `[Declaration, Undefined]`, so the annotation sits on the member,
+ * not on the field.
+ */
+export type OpaqueAnnotation = { readonly tea: "callback" | "opaque" };
+
+/**
  * A function prop. Checked as `typeof === "function"` — the only thing any
  * runtime can check about a function — while the type argument carries the
  * full signature.
@@ -108,6 +132,12 @@ export declare const callback: <F extends (...args: never[]) => unknown>() => Sc
 /**
  * A React value with no runtime contract worth stating: `ReactNode`, an
  * element, a ref, a foreign store's handle. Type-only; the guard always passes.
+ *
+ * Serialisation matters here for the opposite reason to `callback`: a React
+ * element is a live object graph whose `$$typeof` symbol `JSON.stringify`
+ * silently drops, so what survives is a plausible object that is not the
+ * element. Failing loudly would be better; the annotation is what lets a
+ * serialiser do that.
  */
 export declare const opaque: <T>() => Schema.declare<T>;
 
@@ -563,8 +593,17 @@ export declare const define: <
 /**
  * Emitted for every state change in every mounted component. Loosely typed on
  * purpose — a root observer sees components it knows nothing about. Because
- * actions are schemas, they can be encoded from here for a devtools transport
- * or a replay log.
+ * actions and state are schemas, they can be encoded from here for a devtools
+ * transport or a replay log.
+ *
+ * **Props are the exception, and `JSON.stringify` on this event will lie about
+ * them.** Encoding a props schema is identity, so a `callback` field arrives
+ * here as a live function: JSON drops the key without complaint, and
+ * `structuredClone` — every `postMessage` transport — throws. Anything shipping
+ * these events off-thread needs a schema-aware serialiser that walks
+ * `PropsSchema.fields` and substitutes a placeholder for the entries carrying
+ * an `OpaqueAnnotation`. Only `@propsChanged` is affected; `action`, `previous`
+ * and `next` encode cleanly.
  */
 export interface DevtoolsEvent {
   readonly name: string;
