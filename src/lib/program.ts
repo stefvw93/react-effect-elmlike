@@ -1,5 +1,5 @@
-import { type ReactNode, type FC, useMemo, useRef, useState } from "react";
-import { Effect, Result, Schema } from "effect";
+import { type ReactNode, type FC } from "react";
+import { Effect, Schema } from "effect";
 import { Program } from ".";
 
 type GenericModel = Schema.Struct<any>;

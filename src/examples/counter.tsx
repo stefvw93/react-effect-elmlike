@@ -8,15 +8,15 @@
  */
 
 import { Schema } from "effect";
-import { define, Next } from "../lib/tea";
+import { action, define, Next } from "../lib/tea";
 
 const State = Schema.Struct({
   count: Schema.Number,
 });
 
-const Incremented = Schema.TaggedStruct("Incremented", {});
-const Decremented = Schema.TaggedStruct("Decremented", {});
-const Reset = Schema.TaggedStruct("Reset", {});
+const Incremented = action("Incremented", {});
+const Decremented = action("Decremented", {});
+const Reset = action("Reset", {});
 
 const Props = Schema.Struct({
   start: Schema.Number,
@@ -40,7 +40,7 @@ export const counter = Counter.create({
 
   render: ({ state, dispatch }) => (
     <div role="group" aria-label="counter">
-      <button onClick={() => dispatch({ _tag: "Decremented" })}>−</button>
+      <button onClick={() => dispatch({ _tag: "Decremented" })}>-</button>
       <output>{state.count}</output>
       <button onClick={() => dispatch({ _tag: "Incremented" })}>+</button>
       <button onClick={() => dispatch({ _tag: "Reset" })}>reset</button>
@@ -68,18 +68,14 @@ export const one = [
 
 /** A sequence, folded. This is the shape most real assertions want. */
 export const sequence = (
-  [
-    { _tag: "Incremented" },
-    { _tag: "Incremented" },
-    { _tag: "Decremented" },
-  ] as const
-).reduce(
-  (state, action) => Next.state(counter.reduce(action, { ...at(0), state })),
-  { count: 0 },
-); // { count: 5 }
+  [{ _tag: "Incremented" }, { _tag: "Incremented" }, { _tag: "Decremented" }] as const
+).reduce((state, action) => Next.state(counter.reduce(action, { ...at(0), state })), { count: 0 }); // { count: 5 }
 
 /** Lifecycle actions are ordinary inputs here too — no mounting to test them. */
 export const onPropsChange = counter.reduce(
-  { _tag: "@propsChanged", next: { start: 3, step: 5 }, previous: props },
+  { _tag: "PropsChanged", next: { start: 3, step: 5 }, previous: props },
   at(10),
 );
+
+/** Including teardown, now that it returns a `Next` like everything else. */
+export const onUnmount = Next.command(counter.reduce({ _tag: "Unmounted" }, at(10))); // undefined

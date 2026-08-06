@@ -30,7 +30,14 @@
  */
 
 import type { FC, ReactNode } from "react";
-import type { Cause, Effect, Layer, ManagedRuntime, Schema, Stream } from "effect";
+import {
+  Schema,
+  type Cause,
+  type Effect,
+  type Layer,
+  type ManagedRuntime,
+  type Stream,
+} from "effect";
 
 // ---------------------------------------------------------------------------
 // Actions
@@ -49,9 +56,51 @@ import type { Cause, Effect, Layer, ManagedRuntime, Schema, Stream } from "effec
  * encode/decode for free — which is what makes the devtools action stream in
  * `createRuntime` serialisable.
  */
-export type AnyActionSchema = Schema.TaggedStruct<any, any>;
+export type AnyActionSchema = Schema.TaggedStruct<Capitalize<string>, any>;
 
 export type ActionOf<Actions extends ReadonlyArray<AnyActionSchema>> = Actions[number]["Type"];
+
+export type ActionSchema<
+  Tag extends Capitalize<string>,
+  Fields extends Schema.Struct.Fields,
+> = Schema.TaggedStruct<Tag, Fields>;
+
+/**
+ * The tags the runtime raises, reserved so a declared action cannot take one.
+ *
+ * This is what pays for the lifecycle actions having no sigil. They live in the
+ * same namespace as yours now, so the namespace is policed rather than dodged —
+ * and policing it is also what keeps them *inbound-only*, since `dispatch`
+ * accepts only declared actions and `Mounted` can never be one.
+ *
+ * The hook variant is a prefix rather than a list, so the check needs to know
+ * nothing about `H`: it reserves `HookChanged_*` whatever the hooks turn out to
+ * be, which is a stronger guarantee than enumerating today's keys.
+ */
+export type LifecycleTag =
+  | "Mounted"
+  | "PropsChanged"
+  | "Error"
+  | "Unmounted"
+  | `HookChanged_${string}`;
+
+/** Guard for one tag, at `action`. See `define` for why it is an intersection. */
+export type NotLifecycleTag<Tag extends string> = Tag extends LifecycleTag ? never : unknown;
+
+/** The same guard over a declared list, for schemas that bypass `action`. */
+export type NoLifecycleTags<Actions extends ReadonlyArray<AnyActionSchema>> = [
+  Extract<ActionOf<Actions>["_tag"], LifecycleTag>,
+] extends [never]
+  ? unknown
+  : never;
+
+export const action = <
+  const Tag extends Capitalize<string>,
+  const Fields extends Schema.Struct.Fields,
+>(
+  tag: Tag & NotLifecycleTag<Tag>,
+  fields: Fields,
+): ActionSchema<Tag, Fields> => Schema.TaggedStruct(tag as Tag, fields);
 
 /**
  * State is a schema too, for the same reasons as the actions: it is the other
@@ -76,8 +125,28 @@ export type StateOf<S extends AnyStateSchema> = S["Type"];
  * is accepted by the compiler, by design. Cast-through spreads are how
  * components quietly acquire props nobody declared, and this is the only layer
  * that can see it.
+ *
+ * A `Struct`, then, and not a `Codec`: React hands a component exactly one
+ * object, so a props schema that is not a record describes something no parent
+ * can ever pass. `props: Schema.Number` satisfied the old constraint and failed
+ * at the boundary on every mount instead. It is also what the rest of the file
+ * already assumes — the excess-property check needs keys to find excessive, and
+ * a serialiser walks `PropsSchema.fields`, which is on `Struct` and not on
+ * `Codec`.
+ *
+ * `Schema.Record` and `Schema.StructWithRest` are records and are still out, for
+ * the same reason rather than by accident: their index signature accepts keys
+ * nobody declared, which is precisely what this layer exists to reject.
+ * `Schema.Struct.Fields` rather than the `any` that `AnyStateSchema` uses, so a
+ * props type that fails to infer degrades to `{ readonly [x: PropertyKey]:
+ * unknown }` — where a wrong read is an error — instead of to `any`.
+ *
+ * Strictness is untouched: `PropsSchema` is inferred from the value, so
+ * per-field optionality, nested schemas and `callback` fields survive as before,
+ * and so does a `.check(…)` refinement on the whole props object — `check`
+ * rebuilds to `Struct`.
  */
-export type AnyPropsSchema = Schema.Codec<any, any, any, any>;
+export type AnyPropsSchema = Schema.Struct<Schema.Struct.Fields>;
 
 export type PropsOf<P extends AnyPropsSchema> = P["Type"];
 
@@ -170,11 +239,7 @@ export declare const opaque: <T>() => Schema.declare<T>;
  * handlers' return types and unioning what it finds. A mapped type indexed by
  * `keyof` unions properly; only inference fails to.
  */
-type ServiceOf<T> = T extends readonly [any, Stream.Stream<any, any, infer R>]
-  ? R
-  : T extends Effect.Effect<any, any, infer R>
-    ? R
-    : never;
+type ServiceOf<T> = T extends readonly [any, Stream.Stream<any, any, infer R>] ? R : never;
 
 export type ServicesOf<U> = {
   [K in keyof U]: ServiceOf<ReturnType<Extract<U[K], (...args: any) => any>>>;
@@ -191,8 +256,8 @@ export type ServicesOf<U> = {
  * — so there is no dependency array, no cleanup function to keep in sync, and
  * the runtime owns its lifetime. Note the `never`: **commands cannot fail.**
  *
- * There is deliberately no `attempt`/`perform` helper, because Effect already
- * has them and anything added here would be a rename:
+ * What is excluded here is *renames*. There is deliberately no
+ * `attempt`/`perform`, because Effect already has them under better names:
  *
  *   - `Effect.match`  — two branches, two specific actions. (Elm's `attempt`.)
  *   - `Effect.result` — one action carrying a `Result<A, E>`.
@@ -201,12 +266,28 @@ export type ServicesOf<U> = {
  *
  * Batching is `Stream.merge`. Progressive emission over one scope is
  * `Stream.callback`. Neither needs wrapping either.
+ *
+ * *Compositions* are a different matter, and `effect` below is one: it names a
+ * two-combinator idiom that every fire-and-forget command would otherwise spell
+ * out by hand.
  */
 export type Command<Action, R = never> = Stream.Stream<Action, never, R>;
 
 export declare const Command: {
   /** An explicit no-op, for when a bare `state` return reads worse. */
   readonly none: Command<never>;
+
+  /**
+   * Run an effect for its effects; emit no action. `Stream.drain` of a
+   * `Stream.fromEffect`.
+   *
+   * `unknown` rather than `void` in the success channel, so an effect that
+   * happens to return something needs no `Effect.asVoid` at the call site;
+   * `never` in the error channel because commands cannot fail. The result is
+   * assignable wherever a `Command<Action, R>` is wanted — `Stream` is
+   * covariant in what it emits, and this one emits nothing.
+   */
+  readonly effect: <R>(effect: Effect.Effect<unknown, never, R>) => Command<never, R>;
 };
 
 /**
@@ -230,13 +311,18 @@ export type Policy =
   /** Let them race. The default. */
   | "parallel";
 
-export type Concurrency<Actions extends ReadonlyArray<AnyActionSchema>> = {
+/**
+ * `Unmounted` is absent on purpose. Its command is forked on the root scope and
+ * deliberately *not* tracked in the group map — the component that would own the
+ * group is already gone — so a policy here would be a lie rather than a setting.
+ */
+export type Concurrency<Actions extends ReadonlyArray<AnyActionSchema>, H extends AnyHooks> = {
   readonly [K in
     | ActionOf<Actions>["_tag"]
-    | "@mounted"
-    | "@propsChanged"
-    | "@hookChanged"
-    | "@error"]?: Policy;
+    | "Mounted"
+    | "PropsChanged"
+    | "Error"
+    | `HookChanged_${keyof H & string}`]?: Policy;
 };
 
 /**
@@ -286,7 +372,7 @@ export type AnyHooks = Record<string, unknown>;
  * `enabled` flags are routinely derived from component state, and a data layer
  * you cannot drive from state is not interop. It is the one deliberate cycle in
  * the design — a hook reading state can change its value, which raises
- * `@hookChanged`, which can change state again. That is the same footgun as a
+ * `HookChanged_…`, which can change state again. That is the same footgun as a
  * bad dependency array, and it is on you in the same way.
  *
  * **One function, named `use…`, returning the record:**
@@ -360,63 +446,73 @@ export type Render<Props, State, Action, H extends AnyHooks> = (
 // Lifecycle actions
 // ---------------------------------------------------------------------------
 
-/** One variant per hook key, so `hook` narrows `next` and `previous`. */
+/**
+ * One variant per hook key, and the tag *names* the hook.
+ *
+ * So a hook change is handled by its own entry in `reducer` rather than by one
+ * handler switching over every hook: narrowing becomes ordinary per-handler
+ * typing, and a hook you do not react to is a key you leave out instead of a
+ * `return state` branch written to satisfy exhaustiveness.
+ *
+ * `& string` because a template literal needs one — and it is also what makes
+ * this correctly produce nothing when a component declares no hooks at all.
+ */
 export type HookChanged<H extends AnyHooks> = {
-  [K in keyof H]: {
-    readonly _tag: "@hookChanged";
-    readonly hook: K;
+  [K in keyof H & string]: {
+    readonly _tag: `HookChanged_${K}`;
     readonly next: H[K];
     readonly previous: H[K];
   };
-}[keyof H];
+}[keyof H & string];
 
 /**
- * The lifecycle actions as values. `@unmounted` is absent on purpose: it is
- * teardown, not a state change, and it returns an `Effect` rather than state.
+ * The lifecycle actions as values, `Unmounted` among them — so `blueprint.reduce`
+ * can be handed one and teardown is testable without mounting anything.
  */
 export type LifecycleAction<Props, H extends AnyHooks> =
-  | { readonly _tag: "@mounted" }
+  | { readonly _tag: "Mounted" }
   | {
-      readonly _tag: "@propsChanged";
+      readonly _tag: "PropsChanged";
       readonly next: Props;
       readonly previous: Props;
     }
   | HookChanged<H>
   | {
-      readonly _tag: "@error";
+      readonly _tag: "Error";
       readonly error: unknown;
       readonly cause: Cause.Cause<never>;
-    };
+    }
+  | { readonly _tag: "Unmounted" };
 
 /**
- * Actions the runtime raises. All optional — most components ignore them.
- *
- * Ambient input arriving is an *event*, so it is an action and goes through
- * `reducer` like everything else. There is exactly one way state moves.
- *
- * They are inbound-only: they are not in the declared action list, so
- * `dispatch` will not accept them. Nobody should synthesise a prop change.
- * Tags are sigilled because a component is free to have its own `Mounted`.
+ * One handler, in the shape every other handler has. The action shape comes from
+ * `LifecycleAction`, so there is one place a lifecycle action is described.
  */
-export interface LifecycleHandlers<Props, State, Action, H extends AnyHooks, R = never> {
+type LifecycleHandler<Tag extends LifecycleTag, Props, State, Action, H extends AnyHooks, R> = (
+  action: Extract<LifecycleAction<Props, H>, { readonly _tag: Tag }>,
+  snapshot: Snapshot<Props, State, H>,
+) => Next<State, Action, R>;
+
+/**
+ * The fixed lifecycle keys. `HookChanged_*` is generated per hook and lives in
+ * `LifecycleHandlers` below.
+ */
+interface FixedLifecycleHandlers<Props, State, Action, H extends AnyHooks, R = never> {
   /** Fires once, after the initial state exists. Where startup commands live. */
-  readonly "@mounted"?: (snapshot: Snapshot<Props, State, H>) => Next<State, Action, R>;
+  readonly Mounted?: LifecycleHandler<"Mounted", Props, State, Action, H, R>;
 
   /**
    * Props are a fresh object every render, so this fires constantly. That is
    * fine: returning the *same state reference* is the no-op. It puts the "did
    * anything I care about change" decision in `reducer`, where it can see the
    * state.
+   *
+   * Whole-object, deliberately, where a hook change is per key: hooks are a
+   * short hand-written record of independently tracked values, while props are
+   * one object behind a schema that can be wide — and a handler per prop field
+   * would multiply reducer runs to say what one comparison already says.
    */
-  readonly "@propsChanged"?: (
-    action: { readonly next: Props; readonly previous: Props },
-    snapshot: Snapshot<Props, State, H>,
-  ) => Next<State, Action, R>;
-
-  readonly "@hookChanged"?: (
-    action: HookChanged<H>,
-    snapshot: Snapshot<Props, State, H>,
-  ) => Next<State, Action, R>;
+  readonly PropsChanged?: LifecycleHandler<"PropsChanged", Props, State, Action, H, R>;
 
   /**
    * Commands cannot fail, but they can still *die* — and a Layer can fail
@@ -429,19 +525,21 @@ export interface LifecycleHandlers<Props, State, Action, H extends AnyHooks, R =
    * `error` is the squashed cause, so the common handler never has to learn
    * `Cause`. `cause` is there for the ones that do.
    */
-  readonly "@error"?: (
-    action: { readonly error: unknown; readonly cause: Cause.Cause<never> },
-    snapshot: Snapshot<Props, State, H>,
-  ) => Next<State, Action, R>;
+  readonly Error?: LifecycleHandler<"Error", Props, State, Action, H, R>;
 
   /**
-   * Command-only, and typed that way: the component is gone, so returning
-   * state would be meaningless and an action would have nowhere to land.
+   * Uniform in shape and narrow in meaning: the component is gone, so the
+   * runtime reads `Next.command(…)` and discards the rest. A returned state has
+   * nowhere to go and an emitted action has nowhere to land — return
+   * `snapshot.state` and put the work in the command.
    *
-   * Forked with `Effect.forkIn` on the *root* scope, not `Effect.forkDetach`.
-   * It therefore outlives the component but still dies when the Provider
-   * unmounts, and its finalizers run on interruption. Detaching to the global
-   * scope would be unbounded, which is a leak surface with no upside.
+   * Uniformity is free here. `ManagedRuntime.make` sets
+   * `onFiberStart: Fiber.runIn(scope)`, so `runFork` already forks into the root
+   * scope: an unmount command takes the same path as any other command and
+   * differs only in not being tracked in the concurrency group map. It therefore
+   * outlives the component but still dies when the Provider unmounts, and its
+   * finalizers run on interruption. Detaching to the global scope would be
+   * unbounded, which is a leak surface with no upside.
    *
    * Scope this honestly: it releases **in-app** resources — drop a lock, cancel
    * a subscription, flush to localStorage. It is *not* guaranteed delivery to a
@@ -449,8 +547,50 @@ export interface LifecycleHandlers<Props, State, Action, H extends AnyHooks, R =
    * browser will not wait for a fiber. Anything requiring delivery wants
    * `navigator.sendBeacon` in a `pagehide` handler, which cannot be an Effect.
    */
-  readonly "@unmounted"?: (snapshot: Snapshot<Props, State, H>) => Effect.Effect<void, never, R>;
+  readonly Unmounted?: LifecycleHandler<"Unmounted", Props, State, Action, H, R>;
 }
+
+/**
+ * Actions the runtime raises. All optional — most components ignore them.
+ *
+ * Ambient input arriving is an *event*, so it is an action and goes through
+ * `reducer` like everything else, under a key that reads like every other key
+ * and a signature that matches every other signature. There is exactly one way
+ * state moves, and now it looks like one way.
+ *
+ * They stay inbound-only: they are not in the declared action list, so
+ * `dispatch` will not accept them and nobody can synthesise a prop change. What
+ * used to be a sigil keeping them out of your namespace is now `LifecycleTag`
+ * keeping you out of theirs — the same guarantee, checked rather than dodged.
+ *
+ * Every entry being optional means a mistyped key is a handler that silently
+ * never fires. `noImplicitAny` covers this in practice rather than by design:
+ * an unrecognised key gets no contextual type, so `HookChanged_online: (action,
+ * {state}) => …` fails on both parameters. Excess-property checking is *not*
+ * what catches it — that does not fire through `U extends Reducer<…>` — so the
+ * one spelling that stays silent is a handler which ignores both parameters:
+ *
+ *     HookChanged_online: () => ({ ...someState })   // accepted, never called
+ *
+ * Verified, not assumed. Worth knowing because the hook keys are spelled from
+ * whatever you named the hook, so they are the ones a rename can strand.
+ */
+export type LifecycleHandlers<
+  Props,
+  State,
+  Action,
+  H extends AnyHooks,
+  R = never,
+> = FixedLifecycleHandlers<Props, State, Action, H, R> & {
+  readonly [K in keyof H & string as `HookChanged_${K}`]?: LifecycleHandler<
+    `HookChanged_${K}`,
+    Props,
+    State,
+    Action,
+    H,
+    R
+  >;
+};
 
 // ---------------------------------------------------------------------------
 // Blueprints
@@ -470,20 +610,11 @@ export type Reducer<
   ) => Next<State, ActionOf<Actions>, R>;
 } & LifecycleHandlers<Props, State, ActionOf<Actions>, H, R>;
 
-declare const BlueprintTypeId: unique symbol;
-
 /**
  * A component's behaviour, before it is wired to a runtime. `component` turns
  * one into an `FC<Props>`; until then it is an inert value you can unit-test.
  */
-export interface Blueprint<Props, State, Action, H extends AnyHooks = {}, R = never> {
-  readonly [BlueprintTypeId]: {
-    readonly _Props: (_: Props) => void;
-    readonly _State: () => State;
-    readonly _Action: () => Action;
-    readonly _R: () => R;
-  };
-
+export interface Blueprint<in Props, State, Action, H extends AnyHooks = {}, out R = never> {
   /**
    * The whole reducer as one pure function — Elm's `Msg -> Model -> Model`,
    * with the snapshot standing in for the state.
@@ -532,11 +663,11 @@ export interface Definition<
 
   readonly create: <U extends Reducer<Props, State, Actions, H, any>>(parts: {
     /** A pure projection of props, evaluated lazily on mount. Startup
-     *  *commands* belong to `@mounted`; this is only the value. */
+     *  *commands* belong to `Mounted`; this is only the value. */
     readonly initialState: (props: Props) => State;
 
     /** Only the exceptions; anything unlisted is `"parallel"`. */
-    readonly concurrency?: Concurrency<Actions>;
+    readonly concurrency?: Concurrency<Actions, H>;
 
     readonly reducer: U;
     readonly render: Render<Props, State, ActionOf<Actions>, H>;
@@ -582,10 +713,11 @@ export declare const define: <
    * `PropsSchema` bare is the *inference site*. A conditional type is a
    * non-inferrable position, so `NoTransform<PropsSchema>` on its own would
    * leave nothing to infer from and `PropsSchema` would fall back to its
-   * constraint — props would silently become `any` throughout `hooks`,
-   * `reducer` and `render`. The guard would go with it:
-   * `NoTransform<Codec<any, any, any, any>>` is `unknown`, which accepts
-   * anything, including the transforming schema it exists to reject.
+   * constraint — props would become an anonymous record of `unknown`
+   * throughout `hooks`, `reducer` and `render`. The guard would go with it:
+   * `NoTransform<Struct<Struct.Fields>>` is `unknown`, since encoding a record
+   * of `unknown` is identity — so it accepts anything, including the
+   * transforming schema it exists to reject.
    *
    * `& NoTransform<PropsSchema>` is then checked against the inferred type and
    * reduces: `& unknown` is a no-op, `& never` leaves nothing assignable — so
@@ -593,8 +725,20 @@ export declare const define: <
    */
   readonly props: PropsSchema & NoTransform<PropsSchema>;
   readonly state: StateSchema;
-  readonly actions: Actions;
-  readonly hooks?: HookSpec<PropsOf<PropsSchema>, StateOf<StateSchema>, H>;
+
+  /**
+   * Same intersection, same two jobs, for the same reason — and here it is the
+   * backstop rather than the main gate. `action` rejects a reserved tag at the
+   * string literal itself, which is where the error reads best; this catches a
+   * bare `Schema.TaggedStruct` that never went through `action`.
+   *
+   * `AnyActionSchema` cannot carry the constraint on its own: its tag parameter
+   * is `Capitalize<string>`, and there is no literal there to exclude against.
+   * The check has to sit wherever a tag is actually known, which is these two
+   * places and nowhere else.
+   */
+  readonly actions: Actions & NoLifecycleTags<Actions>;
+  readonly useHooks?: HookSpec<PropsOf<PropsSchema>, StateOf<StateSchema>, H>;
 }) => Definition<PropsOf<PropsSchema>, StateOf<StateSchema>, Actions, H>;
 
 // ---------------------------------------------------------------------------
@@ -613,7 +757,7 @@ export declare const define: <
  * `structuredClone` — every `postMessage` transport — throws. Anything shipping
  * these events off-thread needs a schema-aware serialiser that walks
  * `PropsSchema.fields` and substitutes a placeholder for the entries carrying
- * an `OpaqueAnnotation`. Only `@propsChanged` is affected; `action`, `previous`
+ * an `OpaqueAnnotation`. Only `PropsChanged` is affected; `action`, `previous`
  * and `next` encode cleanly.
  */
 export interface DevtoolsEvent {

@@ -99,7 +99,7 @@ function ReleaseButton({ customerId }: { readonly customerId: string }): ReactNo
 
 function Checkout({ customerId }: { readonly customerId: string }): ReactNode {
   // Plain React state, driving a blueprint's props. Nothing special happens at
-  // the boundary — the component just re-renders, and `@propsChanged` decides
+  // the boundary — the component just re-renders, and `PropsChanged` decides
   // whether that means anything.
   const [currency, setCurrency] = useState<"EUR" | "USD">("EUR");
 

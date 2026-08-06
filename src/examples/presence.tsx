@@ -2,18 +2,18 @@
  * A long-lived external subscription — the other half of what commands are for.
  *
  * `Stream.callback` turns a push source into a command that emits many actions
- * over one scope. Started from `@mounted`, it lives exactly as long as the
+ * over one scope. Started from `Mounted`, it lives exactly as long as the
  * component does; React unmounting closes the scope, which runs the socket's
  * finalizers. No `useEffect` cleanup function, no dependency array, no
  * subscribe/unsubscribe pair to keep in sync.
  *
- * `@unmounted` is here for the part the scope cannot express: telling the
+ * `Unmounted` is here for the part the scope cannot express: telling the
  * *server* we left. It is honestly scoped — it fires on SPA navigation, not on
  * tab close.
  */
 
 import { Context, Effect, Queue, Schema, Scope, Stream } from "effect";
-import { define, type ActionOf } from "../lib/tea";
+import { action, Command, define, type ActionOf } from "../lib/tea";
 
 // --- domain -----------------------------------------------------------------
 
@@ -46,15 +46,15 @@ declare function usePageVisible(): boolean;
 
 // --- actions ----------------------------------------------------------------
 
-const RosterSynced = Schema.TaggedStruct("RosterSynced", {
+const RosterSynced = action("RosterSynced", {
   peers: Schema.Array(Schema.Struct({ id: Schema.String, name: Schema.String })),
 });
-const PeerEntered = Schema.TaggedStruct("PeerEntered", {
+const PeerEntered = action("PeerEntered", {
   peer: Schema.Struct({ id: Schema.String, name: Schema.String }),
 });
-const PeerExited = Schema.TaggedStruct("PeerExited", { peerId: Schema.String });
-const ConnectionDropped = Schema.TaggedStruct("ConnectionDropped", {});
-const VisibilityChanged = Schema.TaggedStruct("VisibilityChanged", {
+const PeerExited = action("PeerExited", { peerId: Schema.String });
+const ConnectionDropped = action("ConnectionDropped", {});
+const VisibilityChanged = action("VisibilityChanged", {
   visible: Schema.Boolean,
 });
 
@@ -98,7 +98,7 @@ const Presence = define({
   props: Props,
   state: State,
   actions,
-  hooks: function usePresenceHooks() {
+  useHooks() {
     return { visible: usePageVisible() };
   },
 });
@@ -112,7 +112,7 @@ export const presence = Presence.create({
 
   reducer: {
     // One command, one scope, many actions, for as long as the component lives.
-    "@mounted": ({ props, state }) => [
+    Mounted: (_action, { props, state }) => [
       { ...state, connected: true },
       Stream.callback<PresenceAction, never, PresenceSocket | Scope.Scope>((queue) =>
         Effect.flatMap(PresenceSocket, (socket) =>
@@ -148,25 +148,26 @@ export const presence = Presence.create({
     VisibilityChanged: (action, { state }) => ({ ...state, idle: !action.visible }),
 
     // A hook's value changing is an external event, so it is an action like any
-    // other. This one is forwarded into the domain vocabulary rather than
-    // handled inline, which keeps the state's story readable in a replay log.
-    "@hookChanged": (action, { state }) => {
-      switch (action.hook) {
-        case "visible":
-          return [
-            state,
-            Stream.succeed({
-              _tag: "VisibilityChanged" as const,
-              visible: action.next,
-            }),
-          ];
-      }
-    },
+    // other — including in how it is written. This one is forwarded into the
+    // domain vocabulary rather than handled inline, which keeps the state's
+    // story readable in a replay log.
+    HookChanged_visible: (action, { state }) => [
+      state,
+      Stream.succeed({
+        _tag: "VisibilityChanged" as const,
+        visible: action.next,
+      }),
+    ],
 
     // Tell the server. Runs on the root scope, so it survives this component
-    // being torn down — but not the tab being closed.
-    "@unmounted": ({ props }) =>
-      Effect.flatMap(PresenceSocket, (socket) => socket.announceLeave(props.roomId)),
+    // being torn down — but not the tab being closed. The returned state goes
+    // nowhere; the command is the whole point.
+    Unmounted: (_action, { state, props }) => [
+      state,
+      Command.effect(
+        Effect.flatMap(PresenceSocket, (socket) => socket.announceLeave(props.roomId)),
+      ),
+    ],
   },
 
   render: ({ state, props }) => (

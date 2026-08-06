@@ -118,7 +118,7 @@ export const search = Search.create({
     // handler, and because it is issued *as* `TextEdited` it lands in the same
     // concurrency group — so changing the filter interrupts a keystroke's
     // pending query instead of racing it.
-    "@propsChanged": (action, { state }) =>
+    PropsChanged: (action, { state }) =>
       action.next.filter === action.previous.filter || state.text.length === 0
         ? state
         : [state, Stream.succeed({ _tag: "TextEdited" as const, text: state.text })],

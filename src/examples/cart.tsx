@@ -13,7 +13,7 @@
  */
 
 import { Context, Effect, Schema, Stream } from "effect";
-import { callback, define } from "../lib/tea";
+import { callback, Command, define } from "../lib/tea";
 
 // --- domain -----------------------------------------------------------------
 
@@ -139,7 +139,7 @@ const Cart = define({
 
   // Called in render position with the current props. `props` needs no
   // annotation — `Cart` already knows what it is.
-  hooks: function useCartHooks(props) {
+  useHooks: function useCartHooks(props) {
     return {
       catalog: useCatalog(props.customerId),
       online: useOnlineStatus(),
@@ -160,7 +160,7 @@ export const initialState = Cart.initialState(() => ({
 export const reducer = Cart.reducer({
   // Startup command. `restore` cannot fail, so a plain map is enough — this
   // is what Elm calls `Task.perform`.
-  "@mounted": ({ props, state }) => [
+  Mounted: (_action, { props, state }) => [
     state,
     Stream.fromEffect(
       Effect.map(
@@ -231,7 +231,7 @@ export const reducer = Cart.reducer({
   // state change stays pure and the side effect stays in the effect channel.
   CheckoutCompleted: (action, { state, props }) => [
     { ...state, checkout: "idle" as const },
-    Stream.drain(Stream.fromEffect(Effect.sync(() => props.onCheckout(action.orderId)))),
+    Command.effect(Effect.sync(() => props.onCheckout(action.orderId))),
   ],
 
   Failed: (action, { state }) => ({
@@ -241,22 +241,27 @@ export const reducer = Cart.reducer({
   }),
 
   // `currency` is read straight from props and never appears here.
-  "@propsChanged": (action, { state, initialState }) =>
+  PropsChanged: (action, { state, initialState }) =>
     action.next.customerId === action.previous.customerId ? state : initialState,
 
-  // `action.hook` narrows `next` per key.
-  "@hookChanged": (action, { state }) => {
-    switch (action.hook) {
-      case "online":
-        return { ...state, error: action.next ? null : "Reconnecting…" };
-      case "catalog":
-        return state;
-    }
-  },
+  // One handler per hook, so `next` is already `boolean` here. `catalog` is
+  // tracked and read in `render`, but nothing in the model reacts to it — so it
+  // simply has no handler, rather than a branch that returns the state it was
+  // given.
+  HookChanged_online: (action, { state }) => ({
+    ...state,
+    error: action.next ? null : "Reconnecting…",
+  }),
 
   // In-app resource release only. A server-side "abandon cart" belongs in a
   // `pagehide` beacon, not here — React unmount does not fire on tab close.
-  "@unmounted": ({ props }) => Effect.flatMap(CartApi, (api) => api.release(props.customerId)),
+  //
+  // The state is returned because the signature has a slot for it, and dropped
+  // because there is nobody left to hand it to. Only the command runs.
+  Unmounted: (_action, { state, props }) => [
+    state,
+    Command.effect(Effect.flatMap(CartApi, (api) => api.release(props.customerId))),
+  ],
 });
 
 export const render = Cart.render(({ state, props, hooks, dispatch }) => (
