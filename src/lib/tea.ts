@@ -95,6 +95,25 @@ import type { FC, ReactNode } from "react";
 import type { Cause, Effect, Layer, ManagedRuntime, Schema, Stream } from "effect";
 
 // ---------------------------------------------------------------------------
+// Display
+// ---------------------------------------------------------------------------
+
+/**
+ * Collapse a type to a flat object literal, for hovers.
+ *
+ * Purely cosmetic and structurally identity, but the thing it fixes is not
+ * cosmetic: a component's props are the whole boundary, and until this existed
+ * hovering one showed `Props & OutputProps<Output & …>` — three type aliases and
+ * an intersection, with the actual prop names and callback signatures behind
+ * them. Every place a boundary type reaches a call site goes through here.
+ *
+ * The mapped type is homomorphic, so `readonly` and `?` survive; the `& {}`
+ * is what stops the compiler from printing the alias name instead of the
+ * members it just computed.
+ */
+export type Simplify<T> = { [K in keyof T]: T[K] } & {};
+
+// ---------------------------------------------------------------------------
 // The two vocabularies
 // ---------------------------------------------------------------------------
 
@@ -401,7 +420,7 @@ export type NoTransform<P extends AnyPropsSchema> = [P["Encoded"]] extends [P["T
  */
 export type OutputProps<Output extends { readonly _tag: string }> = {
   readonly [K in Output["_tag"] as `on${K}`]: (
-    payload: Omit<Extract<Output, { readonly _tag: K }>, "_tag">,
+    payload: Simplify<Omit<Extract<Output, { readonly _tag: K }>, "_tag">>,
   ) => void;
 };
 
@@ -1165,19 +1184,34 @@ export declare const createRuntime: <RootR, RootE>(
    * leave everything else for the schema to check.
    */
   readonly component: {
-    <Props, State, Action, Output, H extends AnyHooks, R extends RootR>(
+    <
+      Props,
+      State,
+      Action,
+      Output extends { readonly _tag: string },
+      H extends AnyHooks,
+      R extends RootR,
+    >(
       blueprint: Blueprint<Props, State, Action, Output, H, R>,
       options?: { readonly name?: string },
-    ): FC<Props & OutputProps<Output & { readonly _tag: string }>>;
+    ): FC<Simplify<Props & OutputProps<Output>>>;
 
     /** A feature may bring its own layer; the root must cover the residue. */
-    <Props, State, Action, Output, H extends AnyHooks, R, LayerError>(
+    <
+      Props,
+      State,
+      Action,
+      Output extends { readonly _tag: string },
+      H extends AnyHooks,
+      R,
+      LayerError,
+    >(
       blueprint: Blueprint<Props, State, Action, Output, H, R>,
       options: {
         readonly layer: Layer.Layer<Exclude<R, RootR>, LayerError, RootR>;
         readonly name?: string;
       },
-    ): FC<Props & OutputProps<Output & { readonly _tag: string }>>;
+    ): FC<Simplify<Props & OutputProps<Output>>>;
   };
 
   /**
