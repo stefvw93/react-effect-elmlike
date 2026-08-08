@@ -13,7 +13,7 @@
  */
 
 import { Context, Effect, Queue, Schema, Scope, Stream } from "effect";
-import { action, Command, define, type ActionOf } from "../lib/tea";
+import { Action, Command, define, type MemberOf } from "../lib/tea";
 
 // --- domain -----------------------------------------------------------------
 
@@ -46,27 +46,27 @@ declare function usePageVisible(): boolean;
 
 // --- actions ----------------------------------------------------------------
 
-const RosterSynced = action("RosterSynced", {
+const RosterSynced = Action("RosterSynced", {
   peers: Schema.Array(Schema.Struct({ id: Schema.String, name: Schema.String })),
 });
-const PeerEntered = action("PeerEntered", {
+const PeerEntered = Action("PeerEntered", {
   peer: Schema.Struct({ id: Schema.String, name: Schema.String }),
 });
-const PeerExited = action("PeerExited", { peerId: Schema.String });
-const ConnectionDropped = action("ConnectionDropped", {});
-const VisibilityChanged = action("VisibilityChanged", {
+const PeerExited = Action("PeerExited", { peerId: Schema.String });
+const ConnectionDropped = Action("ConnectionDropped", {});
+const VisibilityChanged = Action("VisibilityChanged", {
   visible: Schema.Boolean,
 });
 
-const actions = [
+const PresenceActions = Action.of([
   RosterSynced,
   PeerEntered,
   PeerExited,
   ConnectionDropped,
   VisibilityChanged,
-] as const;
+]);
 
-type PresenceAction = ActionOf<typeof actions>;
+type PresenceAction = MemberOf<typeof PresenceActions>;
 
 const eventToAction = (event: PresenceEvent): PresenceAction => {
   switch (event.kind) {
@@ -97,7 +97,7 @@ const State = Schema.Struct({
 const Presence = define({
   props: Props,
   state: State,
-  actions,
+  action: PresenceActions,
   useHooks() {
     return { visible: usePageVisible() };
   },

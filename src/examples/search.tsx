@@ -10,7 +10,7 @@
  */
 
 import { Context, Effect, Schema, Stream } from "effect";
-import { define } from "../lib/tea";
+import { Action, define } from "../lib/tea";
 
 // --- service ---------------------------------------------------------------
 
@@ -38,13 +38,13 @@ const State = Schema.Struct({
   error: Schema.NullOr(Schema.String),
 });
 
-const TextEdited = Schema.TaggedStruct("TextEdited", { text: Schema.String });
-const HitsArrived = Schema.TaggedStruct("HitsArrived", {
+const TextEdited = Action("TextEdited", { text: Schema.String });
+const HitsArrived = Action("HitsArrived", {
   for: Schema.String,
   hits: Schema.Array(Schema.String),
 });
-const QueryFailed = Schema.TaggedStruct("QueryFailed", { status: Schema.Number });
-const Cleared = Schema.TaggedStruct("Cleared", {});
+const QueryFailed = Action("QueryFailed", { status: Schema.Number });
+const Cleared = Action("Cleared", {});
 
 const Props = Schema.Struct({
   /** Changing this must re-run whatever is in the box. */
@@ -57,7 +57,7 @@ const Props = Schema.Struct({
 const Search = define({
   props: Props,
   state: State,
-  actions: [TextEdited, HitsArrived, QueryFailed, Cleared],
+  action: Action.of([TextEdited, HitsArrived, QueryFailed, Cleared]),
 });
 
 export const search = Search.create({

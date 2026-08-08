@@ -1,17 +1,16 @@
 /**
- * `cart.tsx`, rewritten against `lib/boundary.ts`. Additive — the original still
- * compiles, so the two can be diffed.
+ * The feature that motivated the outbound channel, and the one place the whole
+ * design is visible at once: props in, state accumulated, commands for effects,
+ * one announcement out.
  *
- * Everything about the *implementation* is unchanged: same state, same commands,
- * same policies, same reducer bodies. Exactly one thing changes.
+ * **`onCheckout` is not a prop.** It was outbound traffic wearing an inbound
+ * costume — a function in the props schema, invoked from inside a command,
+ * invisible to any transport. It is an output, and the parent gets a required
+ * `onOrderPlaced` derived from the declaration. Removing it is also what let the
+ * props schema drop its escape hatch entirely, so a devtools event no longer lies
+ * about its props.
  *
- * **`onCheckout` stops being a prop.** It was outbound traffic wearing an inbound
- * costume — `callback` in the props schema, invoked from inside a command,
- * invisible to any transport. It is now an output, and the parent gets a required
- * `onOrderPlaced` derived from the declaration.
- *
- * That is the whole diff, and the smallness is the point. Two things were sketched
- * on top of it and both were cut:
+ * Two things were sketched on top of that and both were cut:
  *
  *   - **`queries`** — `CheckoutRequested` was promoted so a sticky bar outside the
  *     cart could trigger checkout. Cut: the trigger belongs to the feature. The
@@ -29,8 +28,7 @@
 
 import { useState, type ReactNode } from "react";
 import { Context, Effect, Layer, Schema, Stream, Struct } from "effect";
-import { Command } from "../lib/tea";
-import { Action, createRuntime, define, Output } from "../lib/boundary";
+import { Action, Command, createRuntime, define, Output } from "../lib/tea";
 
 // --- domain (unchanged) -------------------------------------------------------
 
@@ -341,9 +339,8 @@ export const cart = Cart.create({
   reducer,
   render,
 
-  // Unchanged, and `tea.ts`'s `Concurrency` types it as-is. Cutting queries
-  // removed the reason `boundary.ts` had to redefine this at all: with one list
-  // there is no second place for a policy key to go quiet.
+  // Keyed off the vocabulary's `cases`, so cutting queries left one list and
+  // therefore no second place for a policy key to go quiet.
   concurrency: {
     CheckoutRequested: "ignore",
   },

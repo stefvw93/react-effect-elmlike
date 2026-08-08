@@ -1,1 +1,1 @@
-export * as Program from "./program";
+export * from "./tea";

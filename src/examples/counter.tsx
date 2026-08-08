@@ -8,15 +8,15 @@
  */
 
 import { Schema } from "effect";
-import { action, define, Next } from "../lib/tea";
+import { Action, define, Next } from "../lib/tea";
 
 const State = Schema.Struct({
   count: Schema.Number,
 });
 
-const Incremented = action("Incremented", {});
-const Decremented = action("Decremented", {});
-const Reset = action("Reset", {});
+const Incremented = Action("Incremented", {});
+const Decremented = Action("Decremented", {});
+const Reset = Action("Reset", {});
 
 const Props = Schema.Struct({
   start: Schema.Number,
@@ -26,7 +26,7 @@ const Props = Schema.Struct({
 const Counter = define({
   props: Props,
   state: State,
-  actions: [Incremented, Decremented, Reset],
+  action: Action.of([Incremented, Decremented, Reset]),
 });
 
 export const counter = Counter.create({

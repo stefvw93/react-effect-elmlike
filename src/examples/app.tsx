@@ -36,16 +36,17 @@ declare const PresenceLayer: Layer.Layer<PresenceSocket, never, Sockets>;
 
 // --- the root ---------------------------------------------------------------
 
-const actions: Array<unknown> = [];
+const events: Array<unknown> = [];
 
 export const { Provider, component, useRuntime } = createRuntime(AppLayer, {
-  // Every state change in every component, in order. Because actions are
-  // schemas, this is the hook a devtools transport or a replay log would attach
-  // to.
-  onAction: (event) => {
-    actions.push(event);
+  // Every state change in every feature, in order. Everything on the event is a
+  // schema, so this is the hook a devtools transport or a replay log would
+  // attach to — and `instance` plus `cause` are what make it a graph rather than
+  // a flat list once several features are mounted at once.
+  onEvent: (event) => {
+    events.push(event);
     if (import.meta.env.DEV) {
-      console.debug(`[${event.name}]`, event.action, event.previous, "→", event.next);
+      console.debug(`[${event.name}#${event.instance}]`, event.cause, event.action);
     }
   },
 });
@@ -110,10 +111,12 @@ function Checkout({ customerId }: { readonly customerId: string }): ReactNode {
         <option value="USD">USD</option>
       </select>
 
+      {/* Derived from `output`, and required — adding a second output breaks
+          this call site rather than quietly going unheard. */}
       <Cart
         customerId={customerId}
         currency={currency}
-        onCheckout={(orderId) => console.info("ordered", orderId)}
+        onOrderPlaced={({ orderId }) => console.info("ordered", orderId)}
       />
 
       <ReleaseButton customerId={customerId} />
