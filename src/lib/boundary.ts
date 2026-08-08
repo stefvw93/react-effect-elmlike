@@ -71,6 +71,7 @@ import type {
   Command,
   Dispatch,
   DevtoolsEvent,
+  Exhaustive,
   HookSpec,
   LifecycleAction,
   LifecycleHandlers,
@@ -195,10 +196,10 @@ export type MemberOf<V extends AnyVocabulary<Channel>> = V["Type"];
  * that needs `.check(…)`, or that is an existing schema, cannot be spelled at all.
  */
 export interface Vocabularies<Ch extends Channel> {
-  readonly make: <const Tag extends Capitalize<string>, const Fields extends Schema.Struct.Fields>(
+  <const Tag extends Capitalize<string>, const Fields extends Schema.Struct.Fields>(
     tag: Tag & NotLifecycleTag<Tag>,
     fields: Fields,
-  ) => Message<Tag, Fields, Ch>;
+  ): Message<Tag, Fields, Ch>;
 
   readonly of: <const Members extends ReadonlyArray<AnyMessage<Ch>>>(
     members: Members,
@@ -459,7 +460,14 @@ export interface Definition<
 > {
   readonly initialState: (initialState: (props: Props) => State) => (props: Props) => State;
 
-  readonly reducer: <U extends Reducer<Props, State, A, O, H, any>>(reducer: U) => U;
+  /**
+   * `Exhaustive` is `tea.ts`'s and unchanged — the hole it closes is in the
+   * handler return type, which the split does not touch. See it there for why the
+   * compiler's own excess-property check cannot do this job.
+   */
+  readonly reducer: <U extends Reducer<Props, State, A, O, H, any>>(
+    reducer: U & Exhaustive<U, State>,
+  ) => U;
 
   readonly render: (
     render: Render<Props, State, MemberOf<A>, H>,
@@ -471,7 +479,7 @@ export interface Definition<
     /** Only the exceptions; anything unlisted is `"parallel"`. */
     readonly concurrency?: Concurrency<A, H>;
 
-    readonly reducer: U;
+    readonly reducer: U & Exhaustive<U, State>;
     readonly render: Render<Props, State, MemberOf<A>, H>;
   }) => Blueprint<Props, State, MemberOf<A>, MemberOf<O>, H, ServicesOf<U>>;
 }
@@ -496,10 +504,10 @@ export declare const define: <
   readonly props: PropsSchema & NoTransform<PropsSchema>;
   readonly state: StateSchema;
 
-  readonly actions: A;
+  readonly action: A;
 
   /** What this feature announces. Never handled here. */
-  readonly outputs?: O & Disjoint<A, O> & NoPropCollision<PropsSchema, O>;
+  readonly output?: O & Disjoint<A, O> & NoPropCollision<PropsSchema, O>;
 
   readonly useHooks?: HookSpec<PropsOf<PropsSchema>, StateOf<StateSchema>, H>;
 }) => Definition<PropsOf<PropsSchema>, StateOf<StateSchema>, A, O, H>;

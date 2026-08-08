@@ -28,7 +28,7 @@
  */
 
 import { useState, type ReactNode } from "react";
-import { Context, Effect, Layer, Schema, Stream } from "effect";
+import { Context, Effect, Layer, Schema, Stream, Struct } from "effect";
 import { Command } from "../lib/tea";
 import { Action, createRuntime, define, Output } from "../lib/boundary";
 
@@ -79,12 +79,12 @@ declare function useOnlineStatus(): boolean;
  * it the last reason this schema needed an escape hatch — everything left
  * encodes, so a devtools event no longer lies about its props.
  */
-const Props = Schema.Struct({
+const CartProps = Schema.Struct({
   customerId: Schema.String,
   currency: Schema.Literals(["EUR", "USD"]),
 });
 
-export type CartProps = typeof Props.Type;
+export type CartProps = typeof CartProps.Type;
 
 // --- state --------------------------------------------------------------------
 
@@ -95,37 +95,37 @@ const LineSchema = Schema.Struct({
   quantity: Schema.Number,
 });
 
-const State = Schema.Struct({
+const CartState = Schema.Struct({
   lines: Schema.Array(LineSchema),
   discount: Schema.Number,
   checkout: Schema.Literals(["idle", "reserving", "charging"]),
   error: Schema.NullOr(Schema.String),
 });
 
-type CartState = typeof State.Type;
+type CartState = typeof CartState.Type;
 
 const subtotal = (state: CartState): number =>
   state.lines.reduce((sum, line) => sum + line.unitPrice * line.quantity, 0) - state.discount;
 
 // --- actions: internal, never cross the boundary ------------------------------
 
-const LinesRestored = Action.make("LinesRestored", {
+const LinesRestored = Action("LinesRestored", {
   lines: Schema.Array(LineSchema),
 });
-const QuantityChanged = Action.make("QuantityChanged", {
+const QuantityChanged = Action("QuantityChanged", {
   sku: Schema.String,
   quantity: Schema.Number,
 });
-const CouponSubmitted = Action.make("CouponSubmitted", { code: Schema.String });
-const CouponAccepted = Action.make("CouponAccepted", { discount: Schema.Number });
-const CheckoutRequested = Action.make("CheckoutRequested", {});
-const CheckoutAdvanced = Action.make("CheckoutAdvanced", {
+const CouponSubmitted = Action("CouponSubmitted", { code: Schema.String });
+const CouponAccepted = Action("CouponAccepted", { discount: Schema.Number });
+const CheckoutRequested = Action("CheckoutRequested", {});
+const CheckoutAdvanced = Action("CheckoutAdvanced", {
   stage: Schema.Literals(["reserving", "charging"]),
 });
-const CheckoutCompleted = Action.make("CheckoutCompleted", {
+const CheckoutCompleted = Action("CheckoutCompleted", {
   orderId: Schema.String,
 });
-const Failed = Action.make("Failed", { reason: Schema.String });
+const Failed = Action("Failed", { reason: Schema.String });
 
 /**
  * The vocabulary as one value. It is a `Schema.Union` underneath, so it encodes —
@@ -151,22 +151,22 @@ const CartActions = Action.of([
  * key set, so writing one is a compile error rather than a handler that silently
  * never fires.
  *
- * `Output.make` is `Action.make` with the other phantom on it, and that phantom is
+ * `Output` is `Action` with the other phantom on it, and that phantom is
  * the whole difference. Listing `OrderPlaced` in `Action.of([…])` is a type error,
  * and so is passing `CartOutputs` to `actions` — which is what the earlier
  * `action` / `output` pair only *looked* like it was doing.
  */
-const OrderPlaced = Output.make("OrderPlaced", { orderId: Schema.String });
+const OrderPlaced = Output("OrderPlaced", { orderId: Schema.String });
 
 const CartOutputs = Output.of([OrderPlaced]);
 
 // --- the interface, in one place ----------------------------------------------
 
 const Cart = define({
-  props: Props,
-  state: State,
-  actions: CartActions,
-  outputs: CartOutputs,
+  props: CartProps,
+  state: CartState,
+  action: CartActions,
+  output: CartOutputs,
 
   useHooks: function useCartHooks(props) {
     return {
@@ -207,14 +207,15 @@ export const reducer = Cart.reducer({
     ),
   ],
 
-  LinesRestored: (action, { state }) => ({ ...state, lines: action.lines }),
+  LinesRestored: (action, { state }) => Struct.assign(state, { lines: action.lines }),
 
-  QuantityChanged: (action, { state }) => ({
-    ...state,
-    lines: state.lines.map((line) =>
-      line.sku === action.sku ? { ...line, quantity: action.quantity } : line,
-    ),
-  }),
+  QuantityChanged: (action, { state }) =>
+    Struct.evolve(state, {
+      lines: (lines) =>
+        lines.map((line) =>
+          line.sku === action.sku ? Struct.assign(line, { quantity: action.quantity }) : line,
+        ),
+    }),
 
   CouponSubmitted: (action, { state, hooks }) =>
     hooks.online
@@ -224,12 +225,12 @@ export const reducer = Cart.reducer({
             Effect.match(
               Effect.flatMap(CartApi, (api) => api.redeem(action.code)),
               {
-                onFailure: (error: CouponRejected) => ({
-                  _tag: "Failed" as const,
+                onFailure: (error) => ({
+                  _tag: "Failed",
                   reason: `Coupon ${error.code} was rejected.`,
                 }),
                 onSuccess: (discount) => ({
-                  _tag: "CouponAccepted" as const,
+                  _tag: "CouponAccepted",
                   discount,
                 }),
               },

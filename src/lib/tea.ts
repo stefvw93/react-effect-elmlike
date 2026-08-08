@@ -596,6 +596,41 @@ export type LifecycleHandlers<
 // Blueprints
 // ---------------------------------------------------------------------------
 
+/**
+ * The excess-property backstop, and it has to run *after* inference rather than
+ * during it.
+ *
+ * TypeScript's own check does not fire here. A handler is written
+ * `(action, { state }) => ({ ...state, lmao: 5 })` with no return annotation, so
+ * the literal's type is *inferred* rather than compared against `Next<State, …>`
+ * — and freshness, which is what excess-property checking keys off, does not
+ * survive being inferred into a function's return type. The contextual type from
+ * the constraint is enough to type `action` and `state`, and not enough to reject
+ * a key that is not in the state. Annotating each handler restores it, but that
+ * is discipline rather than enforcement, and the annotation is the thing `define`
+ * exists to avoid writing.
+ *
+ * What does survive is the key itself: `lmao` is in `U`'s inferred handler return
+ * type, so the excess is recoverable from `U` once the argument has been
+ * inferred. This maps over the handlers and lands a string-literal type on the
+ * offending key, so the error names both the handler and the property.
+ *
+ * Intersected onto the parameter like every other guard in this codebase — bare
+ * `U` is the inference site and the intersection reduces afterwards, so the error
+ * lands on the argument rather than on the result.
+ */
+export type StatePart<N> = N extends readonly [infer S, unknown] ? S : N;
+
+export type Excess<N, State> = N extends unknown ? Exclude<keyof StatePart<N>, keyof State> : never;
+
+export type Exhaustive<U, State> = {
+  readonly [K in keyof U]: U[K] extends (...args: never) => infer N
+    ? [Excess<N, State>] extends [never]
+      ? unknown
+      : `Next<State> with excess property '${Excess<N, State> & string}'`
+    : unknown;
+};
+
 /** Exhaustive over the declared actions; lifecycle handlers are optional. */
 export type Reducer<
   Props,
@@ -655,7 +690,9 @@ export interface Definition<
 > {
   readonly initialState: (initialState: (props: Props) => State) => (props: Props) => State;
 
-  readonly reducer: <U extends Reducer<Props, State, Actions, H, any>>(reducer: U) => U;
+  readonly reducer: <U extends Reducer<Props, State, Actions, H, any>>(
+    reducer: U & Exhaustive<U, State>,
+  ) => U;
 
   readonly render: (
     render: Render<Props, State, ActionOf<Actions>, H>,
@@ -669,7 +706,7 @@ export interface Definition<
     /** Only the exceptions; anything unlisted is `"parallel"`. */
     readonly concurrency?: Concurrency<Actions, H>;
 
-    readonly reducer: U;
+    readonly reducer: U & Exhaustive<U, State>;
     readonly render: Render<Props, State, ActionOf<Actions>, H>;
   }) => Blueprint<Props, State, ActionOf<Actions>, H, ServicesOf<U>>;
 }
