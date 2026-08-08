@@ -383,7 +383,10 @@ export function Checkout({ customerId }: { readonly customerId: string }): React
 
   return (
     <Provider>
-      <select value={currency} onChange={(event) => setCurrency(event.target.value as "EUR")}>
+      <select
+        value={currency}
+        onChange={(event) => setCurrency(event.target.value as typeof currency)}
+      >
         <option value="EUR">EUR</option>
         <option value="USD">USD</option>
       </select>
