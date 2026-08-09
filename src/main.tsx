@@ -1,19 +1,51 @@
-/**
- * The dev shell, and nothing more.
- *
- * `lib/tea.ts` is a type surface — every value in it is `declare`d — so there is
- * no runtime to mount a blueprint against yet. `examples/app.tsx` is the wiring
- * this file will render once there is one; until then it typechecks and does not
- * run, which is the honest state of the project.
- */
+import { Schema, Stream } from "effect";
+import { Action, define } from "./lib";
 
-import { StrictMode } from "react";
-import { createRoot } from "react-dom/client";
-import App from "./App";
-import "./index.css";
+const Props = Schema.Struct({
+  start: Schema.Number,
+  step: Schema.Number,
+});
 
-createRoot(document.getElementById("root")!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-);
+const State = Schema.Struct({
+  count: Schema.Number,
+});
+
+// const Incremented = Action("Incremented", {});
+// const Decremented = Action("Decremented", {});
+const Hello = Action("Hello", {});
+const CounterAction = Action.of([Hello]);
+
+const CounterBlueprint = define({
+  props: Props,
+  state: State,
+  action: CounterAction,
+});
+
+const initialState = CounterBlueprint.initialState((props) => ({ count: props.start }));
+
+const reducer = CounterBlueprint.reducer({
+  Hello: (action, snapshot) => {
+    console.log("hello from Hello reducer", { action, snapshot });
+    return [snapshot.state, Stream.empty];
+  },
+});
+
+const render = CounterBlueprint.render(() => <></>);
+
+const counter = CounterBlueprint.create({
+  initialState,
+  reducer,
+  render,
+});
+
+console.log({ Counter: CounterBlueprint, created: counter });
+
+const props = { start: 0, step: 5 };
+const at = (count: number) => ({
+  state: { count },
+  props,
+  hooks: {},
+  initialState: { count: 0 },
+});
+
+export const one = [counter.reduce({ _tag: "Hello" }, at(10))];

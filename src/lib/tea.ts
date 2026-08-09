@@ -1,5 +1,14 @@
 import type { FC, ReactNode } from "react";
-import type { Cause, Effect, Layer, ManagedRuntime, Schema, Stream } from "effect";
+import {
+  Effect,
+  identity,
+  Match,
+  Schema,
+  type Cause,
+  type Layer,
+  type ManagedRuntime,
+  type Stream,
+} from "effect";
 
 // ---------------------------------------------------------------------------
 // Display
@@ -62,7 +71,7 @@ export type NotLifecycleTag<Tag extends string> = Tag extends LifecycleTag ? nev
  * the list unchecked. There is now no unbranded way in, so the guard on the
  * string literal in `Vocabularies` is the only gate that has to exist.
  */
-declare const channel: unique symbol;
+const channel: unique symbol = Symbol("@tea/channel");
 
 export type Channel = "internal" | "outbound";
 
@@ -161,8 +170,20 @@ export interface Vocabularies<Ch extends Channel> {
   ) => Vocabulary<Members, Ch>;
 }
 
+function defineVocabularies<Ch extends Channel>(ch: Ch): Vocabularies<Ch> {
+  return Object.assign(
+    function Action(tag: string, fields: Schema.Struct.Fields) {
+      return Object.assign(Schema.TaggedStruct(tag, fields), { [channel]: ch });
+    },
+    {
+      of: (members: ReadonlyArray<AnyMessage<Ch>>) =>
+        Object.assign(Schema.Union(members).pipe(Schema.toTaggedUnion("_tag")), { [channel]: ch }),
+    },
+  ) as Vocabularies<Ch>;
+}
+
 /** Handled here, never seen outside. */
-export declare const Action: Vocabularies<"internal">;
+export const Action = defineVocabularies("internal");
 
 /**
  * Announced, never handled here. An output has no reducer handler — its tag is
@@ -172,7 +193,7 @@ export declare const Action: Vocabularies<"internal">;
  *
  * Delivered as one `on<Tag>` prop per output — see `OutputProps`.
  */
-export declare const Output: Vocabularies<"outbound">;
+export const Output = defineVocabularies("outbound");
 
 /** The empty vocabulary, so a leaf feature declares nothing. `Type` is `never`. */
 export type NoOutputs = Vocabulary<readonly [], "outbound">;
@@ -875,7 +896,7 @@ export interface Definition<
  * ones. Prefer `Schema.optional` anyway — `Schema.optionalKey` is the cheap one
  * but rejects `prop={undefined}`, which ordinary React produces constantly.
  */
-export declare const define: <
+export const define: <
   PropsSchema extends AnyPropsSchema,
   StateSchema extends AnyStateSchema,
   A extends AnyVocabulary<"internal">,
@@ -912,7 +933,25 @@ export declare const define: <
   readonly output?: O & Disjoint<A, O> & NoPropCollision<PropsSchema, O>;
 
   readonly useHooks?: HookSpec<PropsOf<PropsSchema>, StateOf<StateSchema>, H>;
-}) => Definition<PropsOf<PropsSchema>, StateOf<StateSchema>, A, O, H>;
+}) => Definition<PropsOf<PropsSchema>, StateOf<StateSchema>, A, O, H> = (spec) => {
+  return {
+    initialState: (initialState) => (props) => initialState(props),
+    reducer: identity,
+    render: identity,
+    create: (parts) => {
+      return {
+        reduce: (action, snapshot) => {
+          const match = parts.reducer[action._tag];
+          const result = match(action, snapshot);
+          return result;
+        },
+        run: (actions, options) => {
+          return Effect.succeed({});
+        },
+      };
+    },
+  };
+};
 
 // ---------------------------------------------------------------------------
 // Root
