@@ -60,22 +60,24 @@ const Search = define({
   action: Action.of([TextEdited, HitsArrived, QueryFailed, Cleared]),
 });
 
+const getInitialSearchState = () => ({
+  text: "",
+  hits: [],
+  pending: false,
+  error: null,
+});
+
 export const search = Search.create({
-  initialState: () => ({
-    text: "",
-    hits: [],
-    pending: false,
-    error: null,
-  }),
+  initialState: () => getInitialSearchState(),
 
   concurrency: {
     TextEdited: "restart",
   },
 
   reducer: {
-    TextEdited: (action, { state, props, initialState }) =>
+    TextEdited: (action, { props, state }) =>
       action.text.length === 0
-        ? initialState
+        ? getInitialSearchState()
         : [
             { ...state, text: action.text, pending: true, error: null },
             Stream.fromEffect(
@@ -112,14 +114,14 @@ export const search = Search.create({
       error: `Search is unavailable (${action.status}).`,
     }),
 
-    Cleared: (_action, { initialState }) => initialState,
+    Cleared: getInitialSearchState,
 
     // Re-dispatch rather than re-issue. The command lives in exactly one
     // handler, and because it is issued *as* `TextEdited` it lands in the same
     // concurrency group — so changing the filter interrupts a keystroke's
     // pending query instead of racing it.
-    PropsChanged: (action, { state }) =>
-      action.next.filter === action.previous.filter || state.text.length === 0
+    PropsChanged: (action, { props, state }) =>
+      props.filter === action.previous.filter || state.text.length === 0
         ? state
         : [state, Stream.succeed({ _tag: "TextEdited" as const, text: state.text })],
   },

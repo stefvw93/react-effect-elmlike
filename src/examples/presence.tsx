@@ -151,11 +151,11 @@ export const presence = Presence.create({
     // other — including in how it is written. This one is forwarded into the
     // domain vocabulary rather than handled inline, which keeps the state's
     // story readable in a replay log.
-    HookChanged_visible: (action, { state }) => [
+    HookChanged_visible: (_action, { state, hooks }) => [
       state,
       Stream.succeed({
         _tag: "VisibilityChanged" as const,
-        visible: action.next,
+        visible: hooks.visible,
       }),
     ],
 

@@ -35,7 +35,7 @@ export const counter = Counter.create({
   reducer: {
     Incremented: (_action, { state, props }) => ({ count: state.count + props.step }),
     Decremented: (_action, { state, props }) => ({ count: state.count - props.step }),
-    Reset: (_action, { initialState }) => initialState,
+    Reset: (_action, { props }) => ({ count: props.start }),
   },
 
   render: ({ state, dispatch }) => (
@@ -72,10 +72,7 @@ export const sequence = (
 ).reduce((state, action) => Next.state(counter.reduce(action, { ...at(0), state })), { count: 0 }); // { count: 5 }
 
 /** Lifecycle actions are ordinary inputs here too — no mounting to test them. */
-export const onPropsChange = counter.reduce(
-  { _tag: "PropsChanged", next: { start: 3, step: 5 }, previous: props },
-  at(10),
-);
+export const onPropsChange = counter.reduce({ _tag: "PropsChanged", previous: props }, at(10));
 
 /** Including teardown, now that it returns a `Next` like everything else. */
 export const onUnmount = Next.command(counter.reduce({ _tag: "Unmounted" }, at(10))); // undefined

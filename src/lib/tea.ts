@@ -677,17 +677,6 @@ export interface Snapshot<Props, State, H extends AnyHooks> {
   readonly state: State;
   readonly props: Props;
   readonly hooks: H;
-
-  /**
-   * What `initialState` produced for the current props, computed once and
-   * reused.
-   *
-   * Here so that "reset to empty" is `({ initialState }) => initialState`
-   * rather than a module-level constant shared between `initialState` and half
-   * the handlers — which is both a second source of truth and eagerly built at
-   * import time.
-   */
-  readonly initialState: State;
 }
 
 export type Dispatch<Action> = (action: Action) => void;
@@ -724,7 +713,6 @@ export type Render<Props, State, Action, H extends AnyHooks> = (
 export type HookChanged<H extends AnyHooks> = {
   [K in keyof H & string]: {
     readonly _tag: `HookChanged_${K}`;
-    readonly next: H[K];
     readonly previous: H[K];
   };
 }[keyof H & string];
@@ -737,7 +725,6 @@ export type LifecycleAction<Props, H extends AnyHooks> =
   | { readonly _tag: "Mounted" }
   | {
       readonly _tag: "PropsChanged";
-      readonly next: Props;
       readonly previous: Props;
     }
   | HookChanged<H>

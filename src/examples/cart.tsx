@@ -274,12 +274,19 @@ export const reducer = Cart.reducer({
     error: action.reason,
   }),
 
-  PropsChanged: (action, { state, initialState }) =>
-    action.next.customerId === action.previous.customerId ? state : initialState,
+  PropsChanged: (action, { props, state }) =>
+    props.customerId === action.previous.customerId
+      ? state
+      : {
+          lines: [],
+          discount: 0,
+          checkout: "idle" as const,
+          error: null,
+        },
 
-  HookChanged_online: (action, { state }) => ({
+  HookChanged_online: (_action, { state, hooks }) => ({
     ...state,
-    error: action.next ? null : "Reconnecting…",
+    error: hooks.online ? null : "Reconnecting…",
   }),
 
   Unmounted: (_action, { state, props }) => [
