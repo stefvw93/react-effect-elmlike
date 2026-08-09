@@ -572,23 +572,6 @@ export type Policy =
   | "parallel";
 
 /**
- * Keyed off the vocabulary's `cases`, so a nested vocabulary's tags are policy
- * keys too and there is no second list for one to go quiet in.
- *
- * `Unmounted` is absent on purpose. Its command is forked on the root scope and
- * deliberately *not* tracked in the group map — the component that would own the
- * group is already gone — so a policy here would be a lie rather than a setting.
- */
-export type Concurrency<A extends AnyVocabulary<"internal">, H extends AnyHooks> = {
-  readonly [K in
-    | TagsOf<A>
-    | "Mounted"
-    | "PropsChanged"
-    | "Error"
-    | `HookChanged_${keyof H & string}`]?: Policy;
-};
-
-/**
  * What a reducer returns: the next state, optionally with a command.
  *
  * `next` is React's own word for it — `setState(prev => next)` — and it is the
@@ -786,8 +769,7 @@ interface FixedLifecycleHandlers<Props, State, Action, H extends AnyHooks, R = n
    *
    * Uniformity is free here. `ManagedRuntime.make` sets
    * `onFiberStart: Fiber.runIn(scope)`, so `runFork` already forks into the root
-   * scope: an unmount command takes the same path as any other command and
-   * differs only in not being tracked in the concurrency group map. It therefore
+   * scope: an unmount command takes the same path as any other command. It therefore
    * outlives the component but still dies when the Provider unmounts, and its
    * finalizers run on interruption. Detaching to the global scope would be
    * unbounded, which is a leak surface with no upside.
@@ -940,7 +922,7 @@ export interface Blueprint<
    * in, and report what left.
    *
    * Here rather than in userland because it has to agree with the runtime about
-   * `initialState`, concurrency policies, `Unmounted` discarding state, and
+   * `initialState`, `Unmounted` discarding state, and
    * which tags re-enter versus leave. Hand-written in a test file it is a
    * replica, and a replica drifts — a test that passes against a divergent
    * replica is worse than no test. The honest way to ship it is to factor the
@@ -1000,10 +982,6 @@ export interface Definition<
     /** A pure projection of props, evaluated lazily on mount. Startup
      *  *commands* belong to `Mounted`; this is only the value. */
     readonly initialState: (props: Props) => State;
-
-    /** Only the exceptions; anything unlisted is `"parallel"`. */
-    readonly concurrency?: Concurrency<A, H>;
-
     readonly reducer: U & Exhaustive<U, State>;
     readonly render: Render<Props, State, MemberOf<A>, H>;
   }) => Blueprint<Props, State, MemberOf<A>, MemberOf<O>, H, ServicesOf<U>>;
