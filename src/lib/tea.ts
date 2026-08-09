@@ -1,96 +1,3 @@
-/**
- * `useReducer`, grown up: state, actions, a pure reducer, a pure render — with
- * every side effect moved into a *value* the reducer returns, and a declared
- * boundary around the whole thing.
- *
- * TYPE SURFACE ONLY — every value here is `declare`d. Nothing runs.
- *
- * The shape, in one breath:
- *
- *   - A blueprint is a `State`, a *vocabulary* of `Action`s, a pure `reducer`,
- *     and a pure `render`. It mounts as a plain `FC<Props>`, so it drops into
- *     any React tree and can be adopted one component at a time.
- *   - State changes are synchronous. Every effect lives in a command.
- *   - Commands are `Stream<Action, never, R>` — they produce *actions, never
- *     state*, and they *cannot fail*. Converting an `E` into an action is
- *     userland work, done with Effect's own combinators.
- *   - Props and React hooks are *ambient inputs*: readable everywhere, never
- *     mirrored into state. They reach state only as actions, through the same
- *     `reducer` as everything else.
- *   - Props are a schema as well, and are **validated at the boundary**. A
- *     missing, mistyped or *excess* prop is a defect and throws. TypeScript
- *     cannot check excess properties through `{...spread}`, so this is the only
- *     layer that can.
- *   - `R` is declared per blueprint and discharged by a Layer at the root, so
- *     dependency injection is checked at compile time.
- *
- * The architecture is Elm's; the vocabulary is React's. `_tag` rather than
- * `type` is the one concession in the other direction — it is what Effect's
- * `Schema` and every `catchTag`-shaped combinator already speak, and you are
- * using Effect here anyway.
- *
- * ---------------------------------------------------------------------------
- *
- * **Two vocabularies, not one**, and that is the other half of the design.
- *
- * One list of actions does two unrelated jobs. `CheckoutAdvanced` is a thing a
- * command observed. `CheckoutCompleted` is a thing the *parent* needs to know
- * about. Only the second is anyone else's business, and if nothing distinguishes
- * them then the moment a store or a `useDispatch` exists the whole vocabulary is
- * public and ownership is gone. That is `useSelector` erosion, and it arrives
- * through the action list rather than through the state.
- *
- * The split is Halogen's, minus half of it. Halogen gives a component four
- * channels in four types: `input` (parent → child, resent every parent render),
- * `query` (parent commands child), `output` (child announces to parent), and
- * `action` (internal only, never crosses). Mapped onto React:
- *
- *              inbound              outbound
- *   continuous  props                render
- *   discrete    —                    outputs
- *
- * **`queries` were sketched and cut.** The inbound-discrete cell is empty on
- * purpose, and the reason is that React's is empty too: there is no parent →
- * child discrete channel in React outside of refs, and reaching for one is how
- * you get the `pendingCommand`-prop anti-pattern. What a ref-with-methods
- * actually bought was worse than it looked:
- *
- *   - `ref.current?.send(…)` makes "not mounted yet" a silent no-op;
- *   - nothing typed says a query may not be sent during render;
- *   - ordering against `Mounted` was undefined;
- *   - and worst, a query had no traceable origin, so `cause` — the whole point
- *     of the devtools story in `DevtoolsEvent` — would have had nothing to
- *     record but "outside".
- *
- * Halogen does not have those problems because a parent there never holds a
- * handle: it renders a child into a labelled *slot* and queries it by address
- * from inside its own reducer, so issuance is a returned value like everything
- * else. Porting that needs the runtime to track child slots, which is a real
- * build and not a type-level sketch. Until it exists, a parent that must trigger
- * a feature should own the trigger: move the button inside the feature's
- * `render`, and portal it if the DOM layout demands it.
- *
- * What is left is one sentence: **React, with callback props turned into
- * values.** That is the same move commands already make for effects, applied to
- * the outbound direction — and it is what removed the last escape hatch from the
- * props schema, so a devtools event no longer lies about its props.
- *
- * The rest of what the split buys:
- *
- *   - **A bus is unnecessary for the hierarchical case.** Two features under a
- *     common parent talk through outputs and props, which is React's own answer
- *     and stays visible in the tree. A shared service is then only for coupling
- *     that genuinely is not hierarchical — and needing one constantly becomes
- *     evidence the boundaries are wrong rather than a fact of life.
- *   - **Cross-feature causality becomes typed and loggable.** Outputs are
- *     schemas, so a transport sees `cart#3/OrderPlaced → presence#1/RosterSynced`
- *     as an edge. Bus traffic is opaque by construction.
- *   - **A store, if one is ever added, is no longer a boundary hole.** The
- *     subtree gets `dispatch` over the internal vocabulary — which it is
- *     entitled to, being inside the feature — and the outside world gets nothing
- *     but props in and outputs back.
- */
-
 import type { FC, ReactNode } from "react";
 import type { Cause, Effect, Layer, ManagedRuntime, Schema, Stream } from "effect";
 
@@ -114,7 +21,7 @@ import type { Cause, Effect, Layer, ManagedRuntime, Schema, Stream } from "effec
 export type Simplify<T> = { [K in keyof T]: T[K] } & {};
 
 // ---------------------------------------------------------------------------
-// The two vocabularies
+// Vocabularies
 // ---------------------------------------------------------------------------
 
 /**
@@ -124,17 +31,8 @@ export type Simplify<T> = { [K in keyof T]: T[K] } & {};
  * same namespace as yours now, so the namespace is policed rather than dodged —
  * and policing it is also what keeps them *inbound-only*, since `dispatch`
  * accepts only declared actions and `Mounted` can never be one.
- *
- * The hook variant is a prefix rather than a list, so the check needs to know
- * nothing about `H`: it reserves `HookChanged_*` whatever the hooks turn out to
- * be, which is a stronger guarantee than enumerating today's keys.
  */
-export type LifecycleTag =
-  | "Mounted"
-  | "PropsChanged"
-  | "Error"
-  | "Unmounted"
-  | `HookChanged_${string}`;
+export type LifecycleTag = "Mounted" | "PropsChanged" | "Error" | "Unmounted" | "HookChanged";
 
 /** Guard for one tag, at `Action`. See `define` for why it is an intersection. */
 export type NotLifecycleTag<Tag extends string> = Tag extends LifecycleTag ? never : unknown;
@@ -551,27 +449,6 @@ export declare const Command: {
 };
 
 /**
- * What happens when an action issues a command while an earlier command from
- * *the same action* is still running.
- *
- * Commands are grouped by the tag of the action that issued them, so there is
- * no key to invent and nothing to wrap — a command stays a plain `Stream`. If
- * an action is absent here it is `"parallel"`, which is Elm's only behaviour.
- *
- * To share a group, have one handler dispatch the other's action rather than
- * duplicating its command. That is usually what you meant anyway.
- */
-export type Policy =
-  /** Interrupt the one in flight and start this one. Typeahead. */
-  | "restart"
-  /** Keep the one in flight and discard this one. Submit buttons. */
-  | "ignore"
-  /** Start when the one in flight finishes. */
-  | "queue"
-  /** Let them race. The default. */
-  | "parallel";
-
-/**
  * What a reducer returns: the next state, optionally with a command.
  *
  * `next` is React's own word for it — `setState(prev => next)` — and it is the
@@ -618,7 +495,7 @@ export type AnyHooks = Record<string, unknown>;
  * `enabled` flags are routinely derived from component state, and a data layer
  * you cannot drive from state is not interop. It is the one deliberate cycle in
  * the design — a hook reading state can change its value, which raises
- * `HookChanged_…`, which can change state again. That is the same footgun as a
+ * `HookChanged`, which can change state again. That is the same footgun as a
  * bad dependency array, and it is on you in the same way.
  *
  * **One function, named `use…`, returning the record:**
@@ -683,22 +560,22 @@ export type Render<Props, State, Action, H extends AnyHooks> = (
 // ---------------------------------------------------------------------------
 
 /**
- * One variant per hook key, and the tag *names* the hook.
+ * One tag for every hook, whole-object like `PropsChanged`: `previous` is the
+ * last snapshot of `H`, and the handler decides what it cares about by
+ * comparing it against `hooks` on the snapshot — the same shape as every
+ * other whole-object comparison in this file.
  *
- * So a hook change is handled by its own entry in `reducer` rather than by one
- * handler switching over every hook: narrowing becomes ordinary per-handler
- * typing, and a hook you do not react to is a key you leave out instead of a
- * `return state` branch written to satisfy exhaustiveness.
- *
- * `& string` because a template literal needs one — and it is also what makes
- * this correctly produce nothing when a component declares no hooks at all.
+ * A variant per hook key was tried first and cut: hooks are a short
+ * hand-written record already, so a handler per key multiplied reducer runs
+ * to say what one comparison over the whole record already says — and it
+ * bought that at the cost of a mistyped key silently compiling to a handler
+ * that is never called (see `LifecycleHandlers`, which no longer generates
+ * these).
  */
 export type HookChanged<H extends AnyHooks> = {
-  [K in keyof H & string]: {
-    readonly _tag: `HookChanged_${K}`;
-    readonly previous: H[K];
-  };
-}[keyof H & string];
+  readonly _tag: "HookChanged";
+  readonly previous: H;
+};
 
 /**
  * The lifecycle actions as values, `Unmounted` among them — so `blueprint.reduce`
@@ -728,10 +605,19 @@ type LifecycleHandler<Tag extends LifecycleTag, Props, State, Action, H extends 
 ) => Next<State, Action, R>;
 
 /**
- * The fixed lifecycle keys. `HookChanged_*` is generated per hook and lives in
- * `LifecycleHandlers` below.
+ * Actions the runtime raises. All optional — most components ignore them.
+ *
+ * Ambient input arriving is an *event*, so it is an action and goes through
+ * `reducer` like everything else, under a key that reads like every other key
+ * and a signature that matches every other signature. There is exactly one way
+ * state moves, and now it looks like one way.
+ *
+ * They stay inbound-only: they are not in the declared vocabulary, so
+ * `dispatch` will not accept them and nobody can synthesise a prop change. What
+ * used to be a sigil keeping them out of your namespace is now `LifecycleTag`
+ * keeping you out of theirs — the same guarantee, checked rather than dodged.
  */
-interface FixedLifecycleHandlers<Props, State, Action, H extends AnyHooks, R = never> {
+export interface LifecycleHandlers<Props, State, Action, H extends AnyHooks, R = never> {
   /** Fires once, after the initial state exists. Where startup commands live. */
   readonly Mounted?: LifecycleHandler<"Mounted", Props, State, Action, H, R>;
 
@@ -741,12 +627,18 @@ interface FixedLifecycleHandlers<Props, State, Action, H extends AnyHooks, R = n
    * anything I care about change" decision in `reducer`, where it can see the
    * state.
    *
-   * Whole-object, deliberately, where a hook change is per key: hooks are a
-   * short hand-written record of independently tracked values, while props are
-   * one object behind a schema that can be wide — and a handler per prop field
-   * would multiply reducer runs to say what one comparison already says.
+   * Whole-object, deliberately: props are one object behind a schema that can
+   * be wide, and a handler per prop field would multiply reducer runs to say
+   * what one comparison already says.
    */
   readonly PropsChanged?: LifecycleHandler<"PropsChanged", Props, State, Action, H, R>;
+
+  /**
+   * Fires whenever any hook's value changes, whole-object like `PropsChanged`:
+   * `hooks` is a short hand-written record, and comparing it here — once — says
+   * what a handler per hook key needed one comparison each to say.
+   */
+  readonly HookChanged?: LifecycleHandler<"HookChanged", Props, State, Action, H, R>;
 
   /**
    * Commands cannot fail, but they can still *die* — and a Layer can fail
@@ -782,49 +674,6 @@ interface FixedLifecycleHandlers<Props, State, Action, H extends AnyHooks, R = n
    */
   readonly Unmounted?: LifecycleHandler<"Unmounted", Props, State, Action, H, R>;
 }
-
-/**
- * Actions the runtime raises. All optional — most components ignore them.
- *
- * Ambient input arriving is an *event*, so it is an action and goes through
- * `reducer` like everything else, under a key that reads like every other key
- * and a signature that matches every other signature. There is exactly one way
- * state moves, and now it looks like one way.
- *
- * They stay inbound-only: they are not in the declared vocabulary, so
- * `dispatch` will not accept them and nobody can synthesise a prop change. What
- * used to be a sigil keeping them out of your namespace is now `LifecycleTag`
- * keeping you out of theirs — the same guarantee, checked rather than dodged.
- *
- * Every entry being optional means a mistyped key is a handler that silently
- * never fires. `noImplicitAny` covers this in practice rather than by design:
- * an unrecognised key gets no contextual type, so `HookChanged_online: (action,
- * {state}) => …` fails on both parameters. Excess-property checking is *not*
- * what catches it — that does not fire through `U extends Reducer<…>`, which is
- * also why `Exhaustive` has to exist — so the one spelling that stays silent is
- * a handler which ignores both parameters:
- *
- *     HookChanged_online: () => ({ ...someState })   // accepted, never called
- *
- * Verified, not assumed. Worth knowing because the hook keys are spelled from
- * whatever you named the hook, so they are the ones a rename can strand.
- */
-export type LifecycleHandlers<
-  Props,
-  State,
-  Action,
-  H extends AnyHooks,
-  R = never,
-> = FixedLifecycleHandlers<Props, State, Action, H, R> & {
-  readonly [K in keyof H & string as `HookChanged_${K}`]?: LifecycleHandler<
-    `HookChanged_${K}`,
-    Props,
-    State,
-    Action,
-    H,
-    R
-  >;
-};
 
 // ---------------------------------------------------------------------------
 // Blueprints

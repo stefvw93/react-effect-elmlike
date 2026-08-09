@@ -70,10 +70,6 @@ const getInitialSearchState = () => ({
 export const search = Search.create({
   initialState: () => getInitialSearchState(),
 
-  concurrency: {
-    TextEdited: "restart",
-  },
-
   reducer: {
     TextEdited: (action, { props, state }) =>
       action.text.length === 0

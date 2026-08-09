@@ -284,10 +284,10 @@ export const reducer = Cart.reducer({
           error: null,
         },
 
-  HookChanged_online: (_action, { state, hooks }) => ({
-    ...state,
-    error: hooks.online ? null : "Reconnecting…",
-  }),
+  HookChanged: (action, { state, hooks }) =>
+    hooks.online === action.previous.online
+      ? state
+      : { ...state, error: hooks.online ? null : "Reconnecting…" },
 
   Unmounted: (_action, { state, props }) => [
     state,
@@ -345,12 +345,6 @@ export const cart = Cart.create({
   initialState,
   reducer,
   render,
-
-  // Keyed off the vocabulary's `cases`, so cutting queries left one list and
-  // therefore no second place for a policy key to go quiet.
-  concurrency: {
-    CheckoutRequested: "ignore",
-  },
 });
 
 /**

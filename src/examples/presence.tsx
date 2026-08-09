@@ -151,13 +151,10 @@ export const presence = Presence.create({
     // other — including in how it is written. This one is forwarded into the
     // domain vocabulary rather than handled inline, which keeps the state's
     // story readable in a replay log.
-    HookChanged_visible: (_action, { state, hooks }) => [
-      state,
-      Stream.succeed({
-        _tag: "VisibilityChanged" as const,
-        visible: hooks.visible,
-      }),
-    ],
+    HookChanged: (action, { state, hooks }) =>
+      hooks.visible === action.previous.visible
+        ? state
+        : [state, Stream.succeed({ _tag: "VisibilityChanged" as const, visible: hooks.visible })],
 
     // Tell the server. Runs on the root scope, so it survives this component
     // being torn down — but not the tab being closed. The returned state goes
