@@ -238,6 +238,9 @@ importers:
       '@vitejs/plugin-react':
         specifier: ^6.0.3
         version: 6.0.4(@voidzero-dev/vite-plus-core@0.2.5(@types/node@24.13.3)(typescript@7.0.2)(yaml@2.9.0))
+      tstyche:
+        specifier: ^7.2.2
+        version: 7.2.2(typescript@7.0.2)
       typescript:
         specifier: ~7.0.2
         version: 7.0.2
@@ -1333,6 +1336,16 @@ packages:
     resolution: {integrity: sha512-sf4i37nQ2LBx4m3wB74y+ubopq6W/dIzXg0FDGjsYnZHVa1Da8FH853wlL2gtUhg+xJXjfk3kUZS3BRoQeoQBQ==}
     engines: {node: '>=6'}
 
+  tstyche@7.2.2:
+    resolution: {integrity: sha512-pd0CZjwjzxCzRiBAH/SEx4IaMS6ti/KA8cWc22Bx1Wa5FF30JeFQa/zAfXpjWkrJNmFqaOJrTaZDF+ji3P2TmA==}
+    engines: {node: '>=22'}
+    hasBin: true
+    peerDependencies:
+      typescript: '>=5.4'
+    peerDependenciesMeta:
+      typescript:
+        optional: true
+
   typescript@7.0.2:
     resolution: {integrity: sha512-8FYau96o3NKOhbjKi/qNvG/W5jhzxkbdm5sj9AbZ/5T5sWqn3hJgLfGx27sRKZWTvyzCP8dLRBTf5tBTSRVUNA==}
     engines: {node: '>=16.20.0'}
@@ -2151,6 +2164,10 @@ snapshots:
   toml@4.3.0: {}
 
   totalist@3.0.1: {}
+
+  tstyche@7.2.2(typescript@7.0.2):
+    optionalDependencies:
+      typescript: 7.0.2
 
   typescript@7.0.2:
     optionalDependencies:

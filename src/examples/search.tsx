@@ -10,7 +10,7 @@
  */
 
 import { Context, Effect, Schema, Stream } from "effect";
-import { Action, define } from "../lib/tea";
+import { Action, Command, define } from "../lib/tea";
 
 // --- service ---------------------------------------------------------------
 
@@ -76,25 +76,27 @@ export const search = Search.create({
         ? getInitialSearchState()
         : [
             { ...state, text: action.text, pending: true, error: null },
-            Stream.fromEffect(
-              Effect.match(
-                // The delay sits inside the interruptible region, which is what
-                // turns "restart" into a debounce rather than just a cancel.
-                Effect.delay(
-                  Effect.flatMap(SearchApi, (api) => api.query(action.text, props.filter)),
-                  "300 millis",
+            Command.stream(
+              Stream.fromEffect(
+                Effect.match(
+                  // The delay sits inside the interruptible region, which is what
+                  // turns "restart" into a debounce rather than just a cancel.
+                  Effect.delay(
+                    Effect.flatMap(SearchApi, (api) => api.query(action.text, props.filter)),
+                    "300 millis",
+                  ),
+                  {
+                    onFailure: (error: Unreachable) => ({
+                      _tag: "QueryFailed" as const,
+                      status: error.status,
+                    }),
+                    onSuccess: (hits) => ({
+                      _tag: "HitsArrived" as const,
+                      for: action.text,
+                      hits,
+                    }),
+                  },
                 ),
-                {
-                  onFailure: (error: Unreachable) => ({
-                    _tag: "QueryFailed" as const,
-                    status: error.status,
-                  }),
-                  onSuccess: (hits) => ({
-                    _tag: "HitsArrived" as const,
-                    for: action.text,
-                    hits,
-                  }),
-                },
               ),
             ),
           ],
@@ -119,7 +121,10 @@ export const search = Search.create({
     PropsChanged: (action, { props, state }) =>
       props.filter === action.previous.filter || state.text.length === 0
         ? state
-        : [state, Stream.succeed({ _tag: "TextEdited" as const, text: state.text })],
+        : [
+            state,
+            Command.stream(Stream.succeed({ _tag: "TextEdited" as const, text: state.text })),
+          ],
   },
 
   render: ({ state, props, dispatch }) => (

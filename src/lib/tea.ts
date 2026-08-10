@@ -1,13 +1,16 @@
 import type { FC, ReactNode } from "react";
 import {
   Effect,
+  Fiber,
   identity,
-  Match,
+  Pipeable,
+  Queue,
+  Ref,
   Schema,
+  Stream,
   type Cause,
   type Layer,
   type ManagedRuntime,
-  type Stream,
 } from "effect";
 
 // ---------------------------------------------------------------------------
@@ -418,7 +421,7 @@ export type OwnershipRule = never;
  * handlers' return types and unioning what it finds. A mapped type indexed by
  * `keyof` unions properly; only inference fails to.
  */
-type ServiceOf<T> = T extends readonly [any, Stream.Stream<any, any, infer R>] ? R : never;
+type ServiceOf<T> = T extends readonly [any, Command<any, infer R>] ? R : never;
 
 export type ServicesOf<U> = {
   [K in keyof U]: ServiceOf<ReturnType<Extract<U[K], (...args: any) => any>>>;
@@ -429,44 +432,124 @@ export type ServicesOf<U> = {
 // ---------------------------------------------------------------------------
 
 /**
- * A command: the async work a state change kicks off.
+ * The async work a state change kicks off.
  *
- * Like the body of a `useEffect`, except you *return* it instead of running it
- * — so there is no dependency array, no cleanup function to keep in sync, and
- * the runtime owns its lifetime. Note the `never`: **commands cannot fail.**
+ * An ADT rather than a bare `Stream`, because a command carries two things the
+ * stream itself cannot: a concurrency policy, and the ability to *be* a
+ * cancellation rather than to perform one. Composition still happens on the
+ * `Stream` before it is wrapped, so nothing in Effect's vocabulary is lost —
+ * `Stream.merge`, `Stream.catchTag`, `Stream.callback` are all used as before,
+ * one `Command.stream(…)` from the end.
  *
- * What is excluded here is *renames*. There is deliberately no
- * `attempt`/`perform`, because Effect already has them under better names:
- *
- *   - `Effect.match`  — two branches, two specific actions. (Elm's `attempt`.)
- *   - `Effect.result` — one action carrying a `Result<A, E>`.
- *   - `Stream.catchTag` — for a *stream* command, where collapsing to a
- *     `Result` would destroy the progressive emission that is the point.
- *
- * Batching is `Stream.merge`. Progressive emission over one scope is
- * `Stream.callback`. Neither needs wrapping either.
- *
- * *Compositions* are a different matter, and `effect` below is one: it names a
- * two-combinator idiom that every fire-and-forget command would otherwise spell
- * out by hand.
+ * `Pipeable`, so a policy reads as a modifier chained onto the command it
+ * governs — see `Command.restart` / `.ignore` / `.queue`.
  */
-export type Command<Action, R = never> = Stream.Stream<Action, never, R>;
+export type Command<A, R = never> = Pipeable.Pipeable &
+  /** Explicit no-op, for when a bare `state` return reads worse. */
+  (
+    | { readonly _tag: "None" }
 
-export declare const Command: {
-  /** An explicit no-op, for when a bare `state` return reads worse. */
+    /** Run for effects; emit nothing. */
+    | { readonly _tag: "Effect"; readonly effect: Effect.Effect<unknown, never, R> }
+
+    /** Emit actions and outputs over time. Cannot fail — conversion is userland. */
+    | { readonly _tag: "Stream"; readonly stream: Stream.Stream<A, never, R> }
+
+    /**
+     * Several commands at once, each keeping its own policy. `Stream.merge`
+     * covers this only while both halves want the same group.
+     */
+    | { readonly _tag: "Batch"; readonly commands: ReadonlyArray<Command<A, R>> }
+
+    /**
+     * Interrupt a running group. A command in its own right, so a handler can
+     * invalidate work another action started — the cross-tag case no policy can
+     * express.
+     */
+    | { readonly _tag: "Cancel"; readonly target: Group }
+
+    /**
+     * Policy as a wrapper rather than a field, so it exists in exactly one place,
+     * the variants that fork nothing cannot carry a meaningless one, and nesting
+     * is answerable: the outermost wins.
+     */
+    | {
+        readonly _tag: "Guarded";
+        readonly policy: Policy;
+        /** Refines the group within the issuing action's tag. */
+        readonly key?: string;
+        readonly command: Command<A, R>;
+      }
+  );
+
+/**
+ * What a policy governs and what `Cancel` addresses. The tag is the issuing
+ * action's and is filled by the runtime, never written by hand; `key` refines
+ * within it, so `"restart"` on `QuantityChanged` can mean per-sku.
+ *
+ * An omitted `key` on `Cancel` targets every group under the tag.
+ */
+export interface Group {
+  readonly tag: string;
+  readonly key?: string;
+}
+
+export type Policy = "restart" | "ignore" | "queue" | "parallel";
+
+const pipeable = <T extends object>(value: T): T & Pipeable.Pipeable =>
+  Object.assign(value, {
+    pipe(this: T) {
+      return Pipeable.pipeArguments(this, arguments);
+    },
+  });
+
+export const Command: {
   readonly none: Command<never>;
 
-  /**
-   * Run an effect for its effects; emit no action. `Stream.drain` of a
-   * `Stream.fromEffect`.
-   *
-   * `unknown` rather than `void` in the success channel, so an effect that
-   * happens to return something needs no `Effect.asVoid` at the call site;
-   * `never` in the error channel because commands cannot fail. The result is
-   * assignable wherever a `Command<Action, R>` is wanted — `Stream` is
-   * covariant in what it emits, and this one emits nothing.
-   */
   readonly effect: <R>(effect: Effect.Effect<unknown, never, R>) => Command<never, R>;
+
+  readonly stream: <A, R>(stream: Stream.Stream<A, never, R>) => Command<A, R>;
+
+  readonly batch: <A, R>(...commands: ReadonlyArray<Command<A, R>>) => Command<A, R>;
+
+  readonly cancel: (target: Group | string) => Command<never>;
+
+  /**
+   * Outbound announcement. The phantom on `Message` does the work here: passing
+   * an internal message is a compile error, which is the first time the channel
+   * split is checked at the point of use rather than by which list a value was
+   * typed into.
+   */
+  readonly output: <Tag extends Capitalize<string>, Fields extends Schema.Struct.Fields>(
+    message: Message<Tag, Fields, "outbound">,
+    payload: Simplify<Omit<Schema.Struct<Fields>["Type"], "_tag">>,
+  ) => Command<{ readonly _tag: Tag } & Schema.Struct<Fields>["Type"]>;
+
+  /** Pipeable, so the policy reads as a modifier: `cmd.pipe(Command.restart())`. */
+  readonly restart: (key?: string) => <A, R>(command: Command<A, R>) => Command<A, R>;
+  readonly ignore: (key?: string) => <A, R>(command: Command<A, R>) => Command<A, R>;
+  readonly queue: (key?: string) => <A, R>(command: Command<A, R>) => Command<A, R>;
+} = {
+  none: pipeable({ _tag: "None" }),
+
+  effect: (effect) => pipeable({ _tag: "Effect", effect }),
+
+  stream: (stream) => pipeable({ _tag: "Stream", stream }),
+
+  batch: (...commands) => pipeable({ _tag: "Batch", commands }),
+
+  cancel: (target) =>
+    pipeable({
+      _tag: "Cancel",
+      target: typeof target === "string" ? { tag: target } : target,
+    }),
+
+  output: (message, payload) =>
+    Command.stream(Stream.succeed((message as any).make(payload))) as any,
+
+  restart: (key) => (command) => pipeable({ _tag: "Guarded", policy: "restart", key, command }),
+  ignore: (key) => (command) => pipeable({ _tag: "Guarded", policy: "ignore", key, command }),
+  queue: (key) => (command) => pipeable({ _tag: "Guarded", policy: "queue", key, command }),
 };
 
 /**
@@ -485,11 +568,14 @@ export type Next<State, Action, R = never> = State | readonly [State, Command<Ac
  * The tuple is unambiguous because `AnyStateSchema` is a `Schema.Struct`:
  * state is always an object, so an array is always a `[state, command]` pair.
  */
-export declare const Next: {
+export const Next: {
   readonly state: <State>(next: Next<State, any, any>) => State;
   readonly command: <State, Action, R>(
     next: Next<State, Action, R>,
   ) => Command<Action, R> | undefined;
+} = {
+  state: (next) => (Array.isArray(next) ? next[0] : next),
+  command: (next) => (Array.isArray(next) ? next[1] : undefined),
 };
 
 // ---------------------------------------------------------------------------
@@ -940,18 +1026,171 @@ export const define: <
     render: identity,
     create: (parts) => {
       return {
-        reduce: (action, snapshot) => {
-          const match = parts.reducer[action._tag];
-          const result = match(action, snapshot);
-          return result;
-        },
-        run: (actions, options) => {
-          return Effect.succeed({});
-        },
+        reduce: (action, snapshot) => parts.reducer[action._tag](action, snapshot),
+
+        run: (actions, options) =>
+          Effect.gen(function* () {
+            type Entry = {
+              readonly msg: { _tag: string };
+              readonly origin: "seed" | "command" | "settled";
+            };
+
+            type Ctx = { readonly tag: string; readonly key?: string; readonly policy?: Policy };
+
+            const queue = yield* Queue.unbounded<Entry>();
+            const inFlight = yield* Ref.make(0);
+            const groups = yield* Ref.make(new Map<string, ReadonlyArray<Fiber.Fiber<void>>>());
+            const emitted: { _tag: string }[] = [];
+            const outputs: { _tag: string }[] = [];
+            const snapshot = { ...options };
+            let state = parts.initialState(options.props);
+
+            for (const action of actions) {
+              yield* Queue.offer(queue, { msg: action, origin: "seed" });
+            }
+
+            const isOutput = (action: { _tag: string }): boolean => {
+              return spec.output?.cases ? action._tag in spec.output.cases : false;
+            };
+
+            const groupId = (target: Group): string => `${target.tag}::${target.key ?? ""}`;
+
+            const cancelGroup = (target: Group) =>
+              Effect.gen(function* () {
+                const map = yield* Ref.get(groups);
+                const ids =
+                  target.key !== undefined
+                    ? [groupId(target)]
+                    : Array.from(map.keys()).filter((id) => id.startsWith(`${target.tag}::`));
+
+                for (const id of ids) {
+                  for (const fiber of map.get(id) ?? []) yield* Fiber.interrupt(fiber);
+                }
+              });
+
+            const runGuarded = (ctx: Ctx, run: Effect.Effect<void, never, any>) =>
+              Effect.gen(function* () {
+                const policy = ctx.policy ?? "parallel";
+                const id = groupId(ctx);
+                const running = (yield* Ref.get(groups)).get(id) ?? [];
+
+                if (policy === "ignore" && running.length > 0) return;
+                if (policy === "restart")
+                  for (const fiber of running) yield* Fiber.interrupt(fiber);
+
+                const awaitPrior =
+                  policy === "queue" && running.length > 0
+                    ? Fiber.joinAll(running).pipe(Effect.asVoid)
+                    : Effect.void;
+
+                yield* Ref.update(inFlight, (n) => n + 1);
+
+                // A fiber `Fiber.interrupt`ed before the scheduler has started it never
+                // runs its own body — including an `Effect.ensuring` baked into that
+                // body — so cleanup can't live there. A separate watcher, waiting on
+                // `Fiber.await`, observes the Exit regardless of whether the fiber ever
+                // got to start.
+                const fiber: Fiber.Fiber<void> = yield* awaitPrior.pipe(
+                  Effect.andThen(run),
+                  Effect.forkChild,
+                );
+
+                yield* Ref.update(groups, (m) =>
+                  new Map(m).set(
+                    id,
+                    policy === "restart" ? [fiber] : [...(m.get(id) ?? []), fiber],
+                  ),
+                );
+
+                const cleanup = Effect.gen(function* () {
+                  yield* Ref.update(inFlight, (n) => n - 1);
+                  yield* Ref.update(groups, (m) => {
+                    const next = new Map(m);
+                    const remaining = (next.get(id) ?? []).filter((f) => f !== fiber);
+                    if (remaining.length > 0) next.set(id, remaining);
+                    else next.delete(id);
+                    return next;
+                  });
+                  // A command that settles without ever emitting (a `Command.effect`,
+                  // an interrupted/cancelled group) still has to wake the drain loop's
+                  // `Queue.take` — otherwise quiescence is reached but nothing is left
+                  // to unblock it. A no-op entry does that uniformly.
+                  yield* Queue.offer(queue, { msg: { _tag: "__settled__" }, origin: "settled" });
+                });
+
+                yield* Fiber.await(fiber).pipe(Effect.andThen(cleanup), Effect.forkChild);
+              });
+
+            const interpret = (
+              command: Command<any, any>,
+              ctx: Ctx,
+            ): Effect.Effect<void, never, any> =>
+              Effect.gen(function* () {
+                switch (command._tag) {
+                  case "None":
+                    return;
+                  case "Effect":
+                    return yield* runGuarded(ctx, Effect.asVoid(command.effect));
+                  case "Stream":
+                    return yield* runGuarded(
+                      ctx,
+                      Stream.runForEach(command.stream, (msg) =>
+                        Queue.offer(queue, { msg, origin: "command" }),
+                      ),
+                    );
+                  case "Batch":
+                    for (const member of command.commands) yield* interpret(member, ctx);
+                    return;
+                  case "Cancel":
+                    return yield* cancelGroup(command.target);
+                  case "Guarded": {
+                    const next: Ctx =
+                      ctx.policy === undefined
+                        ? { tag: ctx.tag, key: command.key, policy: command.policy }
+                        : ctx;
+                    return yield* interpret(command.command, next);
+                  }
+                }
+              });
+
+            const step = ({ msg: action, origin }: Entry) =>
+              Effect.gen(function* () {
+                if (origin === "settled") return;
+
+                yield* Effect.log("step", action);
+
+                if (isOutput(action)) return void outputs.push(action);
+
+                const handler = parts.reducer[action._tag];
+                // if (!handler) return; // unhandled lifecycle: no-op
+
+                const next = handler(action, { ...snapshot, state });
+                const command = Next.command(next);
+                if (action._tag !== "Unmounted") state = Next.state(next);
+                if (command) yield* interpret(command, { tag: action._tag });
+              });
+
+            // drain until quiescent: nothing queued and nothing running
+            while (true) {
+              const queueSize = yield* Queue.size(queue);
+              const inFlightCount = yield* Ref.get(inFlight);
+              if (queueSize === 0 && inFlightCount === 0) break;
+              const entry = yield* Queue.take(queue);
+              if (entry.origin === "command" && !isOutput(entry.msg)) emitted.push(entry.msg);
+              yield* step(entry);
+            }
+
+            return { state, emitted, outputs };
+          }).pipe(Effect.provide(options.layer)),
       };
     },
   };
 };
+
+/** A sequence, folded. This is the shape most real assertions want. */
+// export const sequence = (
+//   [{ _tag: "Incremented" }, { _tag: "Incremented" }, { _tag: "Decremented" }] as const
+// ).reduce((state, action) => Next.state(counter.reduce(action, { ...at(0), state })), { count: 0 }); // { count: 5 }
 
 // ---------------------------------------------------------------------------
 // Root

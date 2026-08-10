@@ -1,4 +1,4 @@
-import { Schema, Stream } from "effect";
+import { Effect, Layer, Schema } from "effect";
 import { Action, define } from "./lib";
 
 const Props = Schema.Struct({
@@ -10,10 +10,9 @@ const State = Schema.Struct({
   count: Schema.Number,
 });
 
-// const Incremented = Action("Incremented", {});
-// const Decremented = Action("Decremented", {});
-const Hello = Action("Hello", {});
-const CounterAction = Action.of([Hello]);
+const Incremented = Action("Incremented", {});
+const Decremented = Action("Decremented", {});
+const CounterAction = Action.of([Incremented, Decremented]);
 
 const CounterBlueprint = define({
   props: Props,
@@ -24,10 +23,8 @@ const CounterBlueprint = define({
 const initialState = CounterBlueprint.initialState((props) => ({ count: props.start }));
 
 const reducer = CounterBlueprint.reducer({
-  Hello: (action, snapshot) => {
-    console.log("hello from Hello reducer", { action, snapshot });
-    return [snapshot.state, Stream.empty];
-  },
+  Incremented: (_action, { state, props }) => ({ count: state.count + props.step }),
+  Decremented: (_action, { state, props }) => ({ count: state.count - props.step }),
 });
 
 const render = CounterBlueprint.render(() => <></>);
@@ -48,4 +45,20 @@ const at = (count: number) => ({
   initialState: { count: 0 },
 });
 
-export const one = [counter.reduce({ _tag: "Hello" }, at(10))];
+export const one = [counter.reduce({ _tag: "Incremented" }, at(10))];
+
+void Effect.runPromise(
+  counter.run(
+    [
+      { _tag: "Incremented" },
+      { _tag: "Incremented" },
+      { _tag: "Incremented" },
+      { _tag: "Incremented" },
+    ],
+    {
+      props: { start: 0, step: 5 },
+      hooks: {},
+      layer: Layer.empty,
+    },
+  ),
+).then(console.log);

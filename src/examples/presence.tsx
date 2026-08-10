@@ -114,11 +114,13 @@ export const presence = Presence.create({
     // One command, one scope, many actions, for as long as the component lives.
     Mounted: (_action, { props, state }) => [
       { ...state, connected: true },
-      Stream.callback<PresenceAction, never, PresenceSocket | Scope.Scope>((queue) =>
-        Effect.flatMap(PresenceSocket, (socket) =>
-          socket.join(props.roomId, (event) => {
-            Queue.offerUnsafe(queue, eventToAction(event));
-          }),
+      Command.stream(
+        Stream.callback<PresenceAction, never, PresenceSocket | Scope.Scope>((queue) =>
+          Effect.flatMap(PresenceSocket, (socket) =>
+            socket.join(props.roomId, (event) => {
+              Queue.offerUnsafe(queue, eventToAction(event));
+            }),
+          ),
         ),
       ),
     ],
@@ -154,7 +156,12 @@ export const presence = Presence.create({
     HookChanged: (action, { state, hooks }) =>
       hooks.visible === action.previous.visible
         ? state
-        : [state, Stream.succeed({ _tag: "VisibilityChanged" as const, visible: hooks.visible })],
+        : [
+            state,
+            Command.stream(
+              Stream.succeed({ _tag: "VisibilityChanged" as const, visible: hooks.visible }),
+            ),
+          ],
 
     // Tell the server. Runs on the root scope, so it survives this component
     // being torn down — but not the tab being closed. The returned state goes
