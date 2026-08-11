@@ -5,6 +5,7 @@ import {
   type AnyVocabulary,
   type ChannelOf,
   Command,
+  define,
   type Disjoint,
   type Exhaustive,
   type MemberOf,
@@ -161,6 +162,26 @@ test("`Disjoint` rejects an action/output tag collision", () => {
 
   expect<Disjoint<typeof Actions, typeof NonCollidingOutputs>>().type.toBe<unknown>();
   expect<Disjoint<typeof Actions, typeof CollidingOutputs>>().type.toBe<never>();
+
+  // Computing to `never` is only half of it — the guard has to be *wired* to
+  // `define`'s `output` property. Intersected onto the wrong one, or dropped,
+  // the two assertions above stay green while a colliding pair compiles.
+  const props = Schema.Struct({});
+  const state = Schema.Struct({});
+
+  expect(define).type.toBeCallableWith({ props, state, action: Actions });
+  expect(define).type.toBeCallableWith({
+    props,
+    state,
+    action: Actions,
+    output: NonCollidingOutputs,
+  });
+  expect(define).type.not.toBeCallableWith({
+    props,
+    state,
+    action: Actions,
+    output: CollidingOutputs,
+  });
 });
 
 // ---------------------------------------------------------------------------
