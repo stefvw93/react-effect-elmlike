@@ -42,7 +42,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 
 ### `Command` ADT and constructors
 
-- [ ] `Command.none` is the `{ _tag: "None" }` no-op.
+- [x] `Command.none` is the `{ _tag: "None" }` no-op.
 - [ ] `Command.effect(effect)` wraps an `Effect` that runs for effects and emits nothing.
 - [ ] `Command.stream(stream)` wraps a `Stream` whose emissions feed back into the reducer (or leave as outputs).
 - [ ] `Command.batch(...commands)` runs each member independently, each keeping its own policy.

@@ -121,8 +121,11 @@ describe("vocabularies", () => {
 // ---------------------------------------------------------------------------
 
 describe("Command", () => {
-  it("none is the no-op tag", () => {
+  it("none is the no-op tag, carrying nothing to interpret", () => {
     expect(Command.none).toMatchObject({ _tag: "None" });
+    // The tag and `pipe`, and nothing else — every other variant carries a
+    // payload `interpret` has to read, and this one is defined by having none.
+    expect(Object.keys(Command.none).sort()).toEqual(["_tag", "pipe"]);
   });
 
   it("effect wraps an Effect", () => {
@@ -633,6 +636,26 @@ describe("Blueprint.run", () => {
 
     const log = await Effect.runPromise(Ref.get(ref));
     expect(log).toEqual(["via-layer"]);
+  });
+
+  it("Command.none is interpreted as a no-op and does not hold up quiescence", async () => {
+    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      // The explicit no-op, as opposed to the bare-state return: the state
+      // change must still land, nothing must be emitted, and `run` must settle
+      // — `interpret` returns without forking, so `inFlight` is never touched.
+      reducer: { Bump: (_action, { state }) => [{ count: state.count + 1 }, Command.none] },
+      render: () => null,
+    });
+
+    const { state, emitted, outputs } = await Effect.runPromise(
+      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer: Layer.empty }),
+    );
+
+    expect(state).toEqual({ count: 1 });
+    expect(emitted).toEqual([]);
+    expect(outputs).toEqual([]);
   });
 
   it("resolves only once quiescent, including a settle with no emission", async () => {
