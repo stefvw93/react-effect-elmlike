@@ -266,6 +266,42 @@ describe("Blueprint.reduce", () => {
     expect(Next.state(next)).toEqual({ count: 15 });
   });
 
+  it("routes by _tag — declared and lifecycle alike — and returns the whole Next", () => {
+    const Up = Action("Up", {});
+    const Down = Action("Down", {});
+    const TwoWay = define({
+      props: CounterProps,
+      state: CounterState,
+      action: Action.of([Up, Down]),
+    });
+    const mountCommand = Command.effect(Effect.void);
+    const twoWay = TwoWay.create({
+      initialState: (props) => ({ count: props.start }),
+      reducer: {
+        Up: (_action, { state }) => ({ count: state.count + 1 }),
+        Down: (_action, { state }) => ({ count: state.count - 1 }),
+        Mounted: (_action, { state }) => [state, mountCommand] as const,
+      },
+      render: () => null,
+    });
+
+    const snapshot = at(10);
+
+    // Two declared tags with opposite effects: a single-action vocabulary
+    // cannot show that routing discriminates, only that *some* handler ran.
+    expect(Next.state(twoWay.reduce({ _tag: "Up" }, snapshot))).toEqual({ count: 11 });
+    expect(Next.state(twoWay.reduce({ _tag: "Down" }, snapshot))).toEqual({ count: 9 });
+
+    // A lifecycle action routes through the same lookup — that is the whole
+    // point of them living in the reducer's key space rather than beside it.
+    const mounted = twoWay.reduce({ _tag: "Mounted" }, snapshot);
+
+    // And the handler's `Next` comes back intact, command included. Reading
+    // only the state would hide a `reduce` that dropped the command.
+    expect(Next.state(mounted)).toBe(snapshot.state);
+    expect(Next.command(mounted)).toBe(mountCommand);
+  });
+
   it("an unhandled lifecycle action leaves state unchanged and does not throw", () => {
     // PropsChanged has no handler on `counter` above.
     expect(() =>
