@@ -158,7 +158,7 @@ state"), so no behavior is untested — only the criterion's wording is wrong.
 - [x] `NoPropCollision<PropsSchema, O>` is a compile error when a declared prop name collides with a derived `on<OutputTag>` name.
 - [x] `NoTransform<PropsSchema>` is a compile error when a props schema's `Encoded` differs from its `Type` (a transforming/decoding props schema).
 - [x] `Exhaustive<U, State>` / `Excess<N, State>` catch a reducer handler returning a state object with a key not present in the declared state schema.
-- [ ] `ServiceOf`/`ServicesOf` union services across multiple reducer handlers' return types without collapsing to `never` (the exact regression this type exists to prevent).
+- [x] `ServiceOf`/`ServicesOf` union services across multiple reducer handlers' return types without collapsing to `never` (the exact regression this type exists to prevent).
 - [ ] `OutputProps<Output>` derives one required `on<Tag>` prop per output case, with `_tag` stripped from the payload type.
 - [ ] `Command`'s `Pipeable` typing: `cmd.pipe(Command.restart())` preserves the command's `A` and `R` type parameters.
 

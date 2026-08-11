@@ -1,4 +1,4 @@
-import { Schema } from "effect";
+import { Effect, Layer, Schema } from "effect";
 import { expect, test } from "tstyche";
 import {
   Action,
@@ -302,14 +302,17 @@ test("`Exhaustive` catches a reducer handler returning an unknown state key", ()
 // ServicesOf — the regression this type exists to prevent
 // ---------------------------------------------------------------------------
 
-test("`ServicesOf` unions services across handlers instead of collapsing to `never`", () => {
-  interface FooService {
-    readonly _foo: unique symbol;
-  }
-  interface BarService {
-    readonly _bar: unique symbol;
-  }
+interface FooService {
+  readonly _foo: unique symbol;
+}
+interface BarService {
+  readonly _bar: unique symbol;
+}
 
+declare const fooEffect: Effect.Effect<void, never, FooService>;
+declare const barEffect: Effect.Effect<void, never, BarService>;
+
+test("`ServicesOf` unions services across handlers instead of collapsing to `never`", () => {
   type Handlers = {
     readonly A: (
       action: any,
@@ -325,6 +328,34 @@ test("`ServicesOf` unions services across handlers instead of collapsing to `nev
   };
 
   expect<ServicesOf<Handlers>>().type.toBe<FooService | BarService>();
+
+  // Through a real `create`, which is where the regression actually lives.
+  // `R` cannot be inferred directly — candidates gathered from separate
+  // properties of a mapped type do not accumulate into a union — so `create`
+  // infers the reducer *record* and `ServicesOf` walks it afterwards. A
+  // version that inferred `R` the naive way silently drops services, and the
+  // synthetic assertion above keeps passing while it does.
+  const Defined = define({
+    props: Schema.Struct({}),
+    state: Schema.Struct({ count: Schema.Number }),
+    action: Action.of([Action("A", {}), Action("B", {}), Action("C", {})]),
+  });
+
+  const blueprint = Defined.create({
+    initialState: () => ({ count: 0 }),
+    reducer: {
+      A: () => [{ count: 1 }, Command.effect(fooEffect)] as const,
+      B: () => [{ count: 1 }, Command.effect(barEffect)] as const,
+      // Contributes no service, and must not collapse the union to `never`.
+      C: () => ({ count: 1 }),
+    },
+    render: () => null,
+  });
+
+  // `run` is where `R` becomes observable: it demands a layer providing it.
+  expect<Parameters<typeof blueprint.run>[1]["layer"]>().type.toBe<
+    Layer.Layer<FooService | BarService>
+  >();
 });
 
 // ---------------------------------------------------------------------------
