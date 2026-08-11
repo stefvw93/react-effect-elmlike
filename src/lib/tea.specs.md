@@ -72,7 +72,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 - [x] `Command.batch` members run independently — each keeps its own concurrency group/policy.
 - [x] `Command.cancel({ tag })` (no `key`) interrupts every running group under that tag; `Command.cancel({ tag, key })` interrupts only that specific group.
 - [x] Policy `"restart"`: a new dispatch into the same group interrupts the prior in-flight fiber.
-- [ ] Policy `"ignore"`: a new dispatch into the same group is dropped while one is already in-flight.
+- [x] Policy `"ignore"`: a new dispatch into the same group is dropped while one is already in-flight.
 - [ ] Policy `"queue"`: a new dispatch into the same group waits for the prior to settle before running; both eventually complete.
 - [ ] Policy `"parallel"` (the default, i.e. no `Guarded` wrapper): concurrent dispatches into the same group all run concurrently and all complete.
 - [ ] Services requested by a command's effect/stream (`R`) are satisfied from `options.layer` via `Effect.provide`.

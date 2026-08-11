@@ -890,15 +890,30 @@ describe("Blueprint.run", () => {
 
   it('policy "ignore" drops a new dispatch while one is in-flight', async () => {
     const { ref, layer } = makeLogLayer();
-    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Go]) });
+    const Arm = Action("Arm", { delay: Schema.Number, id: Schema.String });
+    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Go, Arm]) });
     const feature = Feature.create({
       initialState: () => ({ count: 0 }),
       reducer: {
         Go: (action) => [
           { count: 0 },
           Command.effect(
-            Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
+            Effect.andThen(
+              push(`${action.id}:start`),
+              Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
+            ),
           ).pipe(Command.ignore("group")),
+        ],
+        Arm: (action) => [
+          { count: 0 },
+          Command.stream(
+            Stream.fromEffect(
+              Effect.andThen(
+                Effect.sleep(`${action.delay} millis`),
+                Effect.succeed({ _tag: "Go" as const, ms: 0, id: action.id }),
+              ),
+            ),
+          ),
         ],
       },
       render: () => null,
@@ -907,16 +922,24 @@ describe("Blueprint.run", () => {
     await Effect.runPromise(
       feature.run(
         [
-          { _tag: "Go", ms: 20, id: "first" },
-          { _tag: "Go", ms: 0, id: "second" },
+          { _tag: "Go", ms: 60, id: "first" },
+          // Lands while `first` is running — dropped.
+          { _tag: "Arm", delay: 20, id: "second" },
+          // Lands well after `first` has settled — must be admitted. Nothing
+          // previously distinguished "ignore while busy" from "ignore
+          // forever": a group that never reopened passed the old test.
+          { _tag: "Arm", delay: 200, id: "third" },
         ],
         { props: {}, hooks: {}, layer },
       ),
     );
 
     const log = await Effect.runPromise(Ref.get(ref));
+    expect(log).toContain("first:start");
     expect(log).toContain("first:done");
+    expect(log).not.toContain("second:start");
     expect(log).not.toContain("second:done");
+    expect(log).toContain("third:done");
   });
 
   it('policy "queue" defers a new dispatch until the prior settles; both complete', async () => {
