@@ -80,6 +80,11 @@ test("`.of` reads its channel off the members rather than being told", () => {
   expect(Internal).type.not.toBeAssignableTo<AnyVocabulary<"outbound">>();
   expect(Outbound).type.toBeAssignableTo<AnyVocabulary<"outbound">>();
   expect(Outbound).type.not.toBeAssignableTo<AnyVocabulary<"internal">>();
+
+  // And there is no per-channel `of` to disagree with the brand: the outbound
+  // constructor is a bare `MessageConstructor`, call signature and nothing
+  // else, so `Action.output.of` cannot be written.
+  expect<keyof typeof Action.output>().type.toBe<never>();
 });
 
 test("`.of` rejects a member list that straddles both channels", () => {

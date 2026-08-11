@@ -14,6 +14,17 @@ import { Action, Command, define, Next } from "./tea";
 // Vocabularies (Action, Action.output, Action.of)
 // ---------------------------------------------------------------------------
 
+/**
+ * The channel brand is module-private, so it is located by description. Used to
+ * assert the value-level half of what `ChannelOf` asserts at the type level.
+ */
+const channelOf = (branded: object): unknown => {
+  const brand = Object.getOwnPropertySymbols(branded).find(
+    (symbol) => symbol.description === "@tea/channel",
+  );
+  return brand === undefined ? undefined : (branded as Record<symbol, unknown>)[brand];
+};
+
 describe("vocabularies", () => {
   it("constructs a single message branded with its channel", () => {
     const Foo = Action("Foo", { id: Schema.String });
@@ -29,14 +40,6 @@ describe("vocabularies", () => {
     // The channel brand is a real runtime property, not only a phantom:
     // `Action.of` reads it off member zero to brand the vocabulary, so the
     // value-level half has to be there for the type-level half to be honest.
-    // The symbol is module-private, so it is found by description.
-    const channelOf = (message: object): unknown => {
-      const brand = Object.getOwnPropertySymbols(message).find(
-        (symbol) => symbol.description === "@tea/channel",
-      );
-      return brand === undefined ? undefined : (message as Record<symbol, unknown>)[brand];
-    };
-
     expect(channelOf(Foo)).toBe("internal");
     expect(channelOf(OutboundFoo)).toBe("outbound");
   });
@@ -68,6 +71,21 @@ describe("vocabularies", () => {
       _tag: "Failed",
       reason: "boom",
     });
+  });
+
+  it("`.of` reads its channel off the members rather than being told", () => {
+    const Internal = Action.of([Action("Foo", {})]);
+    const Outbound = Action.of([Action.output("Bar", {})]);
+
+    // One `of`, two channels: the vocabulary's brand comes from member zero,
+    // which is the value-level counterpart of `ChannelOf`.
+    expect(channelOf(Internal)).toBe("internal");
+    expect(channelOf(Outbound)).toBe("outbound");
+
+    // ...and there is no per-channel `of` to disagree with it. Asking the
+    // caller to name a channel the members already carry would be a second
+    // source of truth. (The type-level half is in tea.tst.ts.)
+    expect("of" in Action.output).toBe(false);
   });
 
   it("a vocabulary built with `.of` nests, flattening the outer `cases`", () => {
