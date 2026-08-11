@@ -61,7 +61,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 - [x] `reduce` dispatches by `_tag` to the matching reducer handler (declared action or lifecycle action) and returns its `Next`.
 - [x] **Unhandled _lifecycle_ actions leave state unchanged and do not throw.** (Bug fix — see below.)
 - [x] A missing handler for anything that is _not_ a lifecycle tag (reachable only by bypassing the typed `dispatch`/`reduce` surface, e.g. a bad cast) still throws — the no-op is specific to `LifecycleTag`, not "any missing handler." (Caught during `/review-step`: an earlier version of the fix no-opped unconditionally, silently swallowing this case too.) **Also covers inherited `Object.prototype` keys — see below.**
-- [!] Dispatching `{ _tag: "Unmounted" }` runs the `Unmounted` handler if declared but the _returned state_ is discarded — only its command matters. (Testable directly via `reduce`, no mounting required.) — **Not true of `reduce`:** it returns the handler's `Next` verbatim (verified: `{ count: 999 }`, not the snapshot's state); only `run`'s `step` discards, via `if (action._tag !== "Unmounted")`. Needs a decision — see below.
+- [x] Dispatching `{ _tag: "Unmounted" }` runs the `Unmounted` handler if declared but the _returned state_ is discarded — only its command matters. (Testable directly via `reduce`, no mounting required.) Discarded by `reduce` and by `run` alike, including when the handler returns a bare state with no command — see _Resolved: `reduce` discards `Unmounted`'s state_ below.
 
 ### `define(...).create(...)` → `Blueprint.run`
 
@@ -77,6 +77,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 - [x] Policy `"parallel"` (the default, i.e. no `Guarded` wrapper): concurrent dispatches into the same group all run concurrently and all complete.
 - [x] Services requested by a command's effect/stream (`R`) are satisfied from `options.layer` via `Effect.provide`.
 - [x] `run` resolves only once quiescent: nothing queued and nothing in flight (including fibers that settle without ever emitting, e.g. a bare `Command.effect` or an interrupted group).
+- [ ] **`run` does not terminate on a never-completing command.** Suspected, not yet confirmed: `runGuarded` increments `inFlight` and only decrements after `Fiber.await` settles, so a stream that never completes pins it at 1, the quiescence break (`queueSize === 0 && inFlightCount === 0`) is never taken, and the loop blocks on `Queue.take` — or spins, if the stream emits periodically. Pin it with a test carrying an explicit timeout: a plain `it` hangs the suite rather than failing it. Write it against the **current `Stream` leaf**, before the leaf redesign, so the behavior is recorded rather than silently changed. The test asserts today's behavior; the fix is the deferred `Cmd`/`Sub` split — see _Design decisions_, §3.
 
 ### Known bug fixed by this pass
 
@@ -119,38 +120,64 @@ lookup in this file is keyed by an attacker- or replay-supplied `_tag` against
 an object literal, and every one of them inherits `Object.prototype`. Any new
 tag-keyed lookup wants `Object.hasOwn` from the start.
 
-### Open decision: `reduce` and `run` disagree about `Unmounted`
+### Resolved: `reduce` discards `Unmounted`'s state
 
-`run`'s `step` discards the state an `Unmounted` handler returns; `reduce`
-returns it. Both are in this library, so this is not a userland replica
-drifting — it is the library disagreeing with itself about the one action
+`run`'s `step` discarded the state an `Unmounted` handler returns; `reduce`
+returned it. Both are in this library, so this was not a userland replica
+drifting — it was the library disagreeing with itself about the one action
 whose contract is "the state has nowhere to go".
 
-That matters because `reduce`'s own JSDoc sells it as the way to test teardown
-"without mounting anything". A test that folds `Unmounted` through `reduce`
-sees `{ count: 999 }`; the same feature under `run` sees the state before it.
-Whichever is right, the two should not answer differently.
+That mattered because `reduce`'s own JSDoc sells it as the way to test teardown
+"without mounting anything". A test that folded `Unmounted` through `reduce`
+saw `{ count: 999 }`; the same feature under `run` saw the state before it, and
+the disagreement was silent in both directions.
 
-Two ways out, and it is a design call rather than a bug fix:
+**Resolved as option 1: `reduce` discards too.** It returns
+`[snapshot.state, command]` for `Unmounted`, or bare `snapshot.state` when the
+handler attached no command — so the criterion above is true as written and
+`reduce` is a faithful model of the runtime.
 
-1. **`reduce` discards too** — returns `[snapshot.state, command]` for
-   `Unmounted`. Makes the criterion true as written and makes `reduce` a
-   faithful model of the runtime. Costs: `reduce` stops being a plain
-   "look up the handler and return what it said", and the handler's returned
-   state becomes unobservable anywhere.
-2. **Drop the parenthetical** — the discard is a _runtime_ fact, and `reduce`
-   is documented as returning the handler's `Next` verbatim (which is what the
-   `reduce` routing criterion above now asserts for `Mounted`). Costs: the
-   library keeps two answers, and callers have to know which one they are in.
+Costs, accepted: `reduce` stops being a plain "look up the handler and return
+what it said", and the handler's returned state is unobservable anywhere. The
+second is the point rather than a loss — it is already unobservable under `run`,
+so observing it in `reduce` only ever meant asserting a value production cannot
+produce.
 
-Option 2 is the smaller change and matches the existing test's comment, which
-already says the runtime is what discards. Option 1 is the one that removes a
-whole class of "my unit test disagreed with the runtime" bugs. Not decided
-here — flagged for the author.
+The option not taken was to drop the criterion's parenthetical and document the
+discard as a _runtime_ fact. Smaller change, but it left the library with two
+answers and callers having to know which one they were in.
 
-Coverage as it stands: the command half is asserted via `reduce`, and the
-discard is asserted via `run` ("Blueprint.run discards Unmounted's returned
-state"), so no behavior is untested — only the criterion's wording is wrong.
+A third option was raised and not taken: type `Unmounted`'s handler to return
+`Command<Action, R> | void` rather than `Next<State, Action, R>`, so a state
+cannot be returned at all. It dissolves the question instead of picking a
+winner, but it breaks the "uniform in shape" property `LifecycleHandlers`
+deliberately holds, and it is a wider change than the discard. Worth revisiting
+if the command-leaf redesign churns this area anyway.
+
+Coverage: the tuple case ("Unmounted discards the handler's returned state;
+only its command matters"), the bare-state case ("…even with no command
+attached" — the shape a tuple-only discard would miss), and the `run`
+counterpart ("Blueprint.run discards Unmounted's returned state").
+
+### Open bugs, found by review and not yet fixed
+
+Neither is reachable through the documented surface, and neither breaks a
+criterion above — which is why they are here rather than in the two
+bug sections. Both are one-line fixes with a test each.
+
+- [ ] `run`'s snapshot leaks `layer` into every handler. `const snapshot = { ...options }` spreads `options` whole — `{ props, hooks, layer }` — so `{ ...snapshot, state }` hands each handler a `Snapshot` carrying a fourth key. Invisible to the type (excess-property checking does not fire on a non-fresh spread) and harmless to read, but it puts a `Layer` on the one object this file elsewhere claims is entirely encodable, and a cast reaches it from userland. Should be `{ props: options.props, hooks: options.hooks }`. Test: a handler's snapshot has exactly `state`/`props`/`hooks` as own keys.
+- [ ] Stray `Effect.log("step", action)` in `run`'s `step`. Debug leftover — every action folded through `run` writes a log line, so any suite using `run` is noisy and the default logger runs work nobody asked for. Remove it. No test; its absence is the assertion, and the suite's own output is the tell.
+
+### Command leaf redesign (decided in _Design decisions_ below, not yet implemented)
+
+Sequenced **after** the non-termination test above, so the current leaf's
+behavior is pinned before it moves. Three boxes rather than one: each is
+independently completable, and the first two are separate commits with a
+working tree in between.
+
+- [ ] The leaf is an `Effect` handed a `dispatch`: `Command.effect((dispatch) => Effect<unknown, never, R>)`, with `dispatch: (action: Emit<A, O>) => Effect<void>` offering into `run`'s queue. The `Stream` variant and `Command.stream` are removed; a long-lived stream becomes `Stream.runForEach(source, dispatch)` inside the effect. `None`/`Batch`/`Cancel`/`Guarded` are untouched — policy, group and cancellation have nowhere to attach on a bare `Effect`. Blast radius is `interpret`'s `"Stream"` case and the constructor. The previous `Command.effect` (runs for effects, emits nothing) is the same constructor with an unused parameter, so its criterion survives verbatim.
+- [ ] `Command.output` is removed, including its compile-error-on-an-internal-message criterion. Outbound messages go through the same `dispatch`, routed by `_tag` against `spec.output.cases` — which is already how routing works, and already `Object.hasOwn`-checked. The channel brand keeps its declaration-time jobs (`ChannelOf`, `SameChannel`, `define({ action: … })`, `Disjoint`, `OutputProps`); it simply stops being checked at the command call site, where it never affected routing anyway.
+- [ ] Type-level: `Command<Narrow>` stays assignable to `Command<Wide>` under the callback encoding, and `Command.none: Command<never>` stays the bottom. `Dispatch<A>` is contravariant in `A` and sits in the callback's parameter position — contravariant again — so the two compose to covariant. The existing covariance test must pass unchanged against the new leaf; that is the point of having written it first.
 
 ### Type-level guards (exercised via TSTyche, not vitest)
 

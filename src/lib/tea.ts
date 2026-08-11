@@ -883,6 +883,9 @@ export interface LifecycleHandlers<Props, State, Action, H extends AnyHooks, R =
    * nowhere to go and an emitted action has nowhere to land — return
    * `snapshot.state` and put the work in the command.
    *
+   * `blueprint.reduce` discards it identically, so a teardown test folded
+   * through `reduce` and the same feature under the runtime cannot disagree.
+   *
    * Uniformity is free here. `ManagedRuntime.make` sets
    * `onFiberStart: Fiber.runIn(scope)`, so `runFork` already forks into the root
    * scope: an unmount command takes the same path as any other command. It therefore
@@ -982,7 +985,10 @@ export interface Blueprint<
    * from, and that degradation is silent. Takes lifecycle actions too, so
    * "what happens when this prop changes" is a direct call rather than a
    * mounted component. Unhandled lifecycle actions return the state unchanged —
-   * every `LifecycleHandlers` entry is optional by design. Nothing else is:
+   * every `LifecycleHandlers` entry is optional by design. `Unmounted` is the
+   * one handled action whose returned state is dropped rather than returned,
+   * matching what the runtime does with it; only its command survives. Nothing
+   * else is optional:
    * `action`'s type requires a handler for every declared tag, so a missing one
    * outside the lifecycle set means the value reaching `reduce` didn't come
    * from the typed surface, and that throws rather than swallowing the defect.
@@ -1158,7 +1164,32 @@ export const define: <
          */
         reduce: (action, snapshot) => {
           const handler = handlerFor(parts.reducer, action._tag);
-          if (handler) return handler(action, snapshot);
+          if (handler) {
+            const next = handler(action, snapshot);
+            if (action._tag !== "Unmounted") return next;
+
+            /**
+             * `Unmounted`'s returned state is discarded here for the same
+             * reason `run`'s `step` discards it: the component is gone, so the
+             * state has nowhere to go. Only the command survives.
+             *
+             * The alternative — returning the handler's `Next` verbatim and
+             * leaving the discard to the runtime — made the library answer the
+             * same question two ways. That matters because `reduce` is sold, a
+             * few lines up, as the way to test teardown *without mounting
+             * anything*: a test folding `Unmounted` through `reduce` saw
+             * `{ count: 999 }` while the same feature under `run` saw the state
+             * before it, and the disagreement was silent in both directions.
+             *
+             * The cost is that `reduce` is no longer a plain "look up the
+             * handler and return what it said", and that a handler's returned
+             * state becomes unobservable. Both are the point: it is already
+             * unobservable in the runtime, so being able to observe it here
+             * only ever meant asserting a value production can never produce.
+             */
+            const command = Next.command(next);
+            return command === undefined ? snapshot.state : [snapshot.state, command];
+          }
           if (isLifecycleTag(action._tag)) return snapshot.state;
           throw new TypeError(`No reducer handler for action "${action._tag}"`);
         },

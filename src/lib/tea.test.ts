@@ -364,8 +364,29 @@ describe("Blueprint.reduce", () => {
     const next = WithUnmount.reduce({ _tag: "Unmounted" }, at(10));
     // The command is still reachable...
     expect(Next.command(next)).toMatchObject({ _tag: "Effect" });
-    // ...but callers must not read `Next.state(next)` as the new state — the
-    // runtime (and `run`, below) is what actually discards it.
+    // ...and the returned state is discarded here too, not only by the runtime.
+    // `reduce` is documented as the way to test teardown without mounting, so
+    // it has to give the same answer `run` does — see the `run` counterpart
+    // below. A handler's `{ count: 999 }` is unobservable in both.
+    expect(Next.state(next)).toEqual({ count: 10 });
+  });
+
+  it("Unmounted discards the returned state even with no command attached", () => {
+    // The bare-state return is the shape that would otherwise slip through: it
+    // is not a tuple, so a discard implemented only on the tuple branch would
+    // still hand back the handler's state.
+    const WithUnmount = Counter.create({
+      initialState: (props) => ({ count: props.start }),
+      reducer: {
+        Incremented: (_action, { state, props }) => ({ count: state.count + props.step }),
+        Unmounted: () => ({ count: 999 }),
+      },
+      render: () => null,
+    });
+
+    const next = WithUnmount.reduce({ _tag: "Unmounted" }, at(10));
+    expect(Next.state(next)).toEqual({ count: 10 });
+    expect(Next.command(next)).toBeUndefined();
   });
 });
 
