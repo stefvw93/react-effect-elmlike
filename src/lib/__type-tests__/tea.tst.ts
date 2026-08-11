@@ -88,6 +88,11 @@ test("`.of` reads its channel off the members rather than being told", () => {
 });
 
 test("`.of` rejects a member list that straddles both channels", () => {
+  // Positive control: without it the rejection below passes vacuously for any
+  // reason `.of` might be uncallable, rather than because of `SameChannel`.
+  expect(Action.of).type.toBeCallableWith([Action("Foo", {}), Action("Baz", {})]);
+  expect(Action.of).type.toBeCallableWith([Action.output("Bar", {}), Action.output("Qux", {})]);
+
   expect(Action.of).type.not.toBeCallableWith([Action("Foo", {}), Action.output("Bar", {})]);
 
   // Empty is the one ambiguous list: it satisfies both guards, so the channel
