@@ -67,7 +67,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 
 - [x] Seeded actions (from the `actions` iterable passed to `run`) are processed but are not themselves recorded in `emitted`.
 - [x] Actions/outputs a command's effect/stream emits during the run are fed back into the reducer loop.
-- [ ] `emitted` collects every non-output action that arrived via a command (not seed actions, not outputs).
+- [x] `emitted` collects every non-output action that arrived via a command (not seed actions, not outputs).
 - [ ] `outputs` collects every message whose tag is in the declared output vocabulary's `cases`; an output never re-enters the reducer and never appears in `emitted`.
 - [ ] `Command.batch` members run independently — each keeps its own concurrency group/policy.
 - [ ] `Command.cancel({ tag })` (no `key`) interrupts every running group under that tag; `Command.cancel({ tag, key })` interrupts only that specific group.

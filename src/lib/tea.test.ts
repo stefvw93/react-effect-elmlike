@@ -491,6 +491,38 @@ describe("Blueprint.run", () => {
     expect(emitted).toEqual([{ _tag: "Echo" }, { _tag: "Done" }]);
   });
 
+  it("`emitted` records every emission, including repeats of the same action", async () => {
+    const Tick = Action("Tick", {});
+    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump, Tick]) });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Bump: (_action, { state }) => [
+          { count: state.count + 1 },
+          Command.stream(
+            Stream.fromIterable([
+              { _tag: "Tick" as const },
+              { _tag: "Tick" as const },
+              { _tag: "Tick" as const },
+            ]),
+          ),
+        ],
+        Tick: (_action, { state }) => ({ count: state.count + 10 }),
+      },
+      render: () => null,
+    });
+
+    const { state, emitted } = await Effect.runPromise(
+      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer: Layer.empty }),
+    );
+
+    // Every other test emits distinct actions exactly once, so a `Set`-backed
+    // or first-only `emitted` would look correct in all of them. Three
+    // identical actions separate "every" from "each distinct one".
+    expect(state).toEqual({ count: 31 });
+    expect(emitted).toEqual([{ _tag: "Tick" }, { _tag: "Tick" }, { _tag: "Tick" }]);
+  });
+
   it("outputs land in `outputs`, never in `emitted`, and never re-enter the reducer", async () => {
     const Feature = define({
       props: RunProps,
