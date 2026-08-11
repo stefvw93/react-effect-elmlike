@@ -229,6 +229,25 @@ test("`NoTransform` rejects a props schema whose `Encoded` differs from its `Typ
 
   expect<NoTransform<typeof PlainProps>>().type.toBe<unknown>();
   expect<NoTransform<typeof TransformingProps>>().type.toBe<never>();
+
+  const state = Schema.Struct({});
+  const Actions = Action.of([Action("Bar", {})]);
+
+  expect(define).type.toBeCallableWith({ props: PlainProps, state, action: Actions });
+  expect(define).type.not.toBeCallableWith({ props: TransformingProps, state, action: Actions });
+
+  // The intersection has to keep bare `PropsSchema` as the inference site. If
+  // `NoTransform<PropsSchema>` stood alone as the parameter type there would
+  // be nothing to infer from, `PropsSchema` would fall back to its constraint,
+  // and props would degrade to a record of `unknown` downstream — taking the
+  // guard with it, since `NoTransform<Struct<Struct.Fields>>` is `unknown` and
+  // accepts the very schema it exists to reject. Both assertions above survive
+  // that; this one does not.
+  const Defined = define({ props: PlainProps, state, action: Actions });
+
+  expect<Parameters<Parameters<typeof Defined.initialState>[0]>[0]>().type.toBe<{
+    readonly id: string;
+  }>();
 });
 
 // ---------------------------------------------------------------------------
