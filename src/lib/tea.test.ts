@@ -951,7 +951,10 @@ describe("Blueprint.run", () => {
         Go: (action) => [
           { count: 0 },
           Command.effect(
-            Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
+            Effect.andThen(
+              push(`${action.id}:start`),
+              Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
+            ),
           ).pipe(Command.queue("group")),
         ],
       },
@@ -961,7 +964,7 @@ describe("Blueprint.run", () => {
     await Effect.runPromise(
       feature.run(
         [
-          { _tag: "Go", ms: 20, id: "first" },
+          { _tag: "Go", ms: 40, id: "first" },
           { _tag: "Go", ms: 0, id: "second" },
         ],
         { props: {}, hooks: {}, layer },
@@ -969,7 +972,12 @@ describe("Blueprint.run", () => {
     );
 
     const log = await Effect.runPromise(Ref.get(ref));
-    expect(log).toEqual(["first:done", "second:done"]);
+    // The criterion says the newcomer waits *before running*, which completion
+    // order alone cannot show — a second command that started immediately and
+    // happened to finish later would produce the same two `:done` entries in
+    // the same order. Interleaving the starts pins it: under "parallel" this
+    // reads first:start, second:start, second:done, first:done.
+    expect(log).toEqual(["first:start", "first:done", "second:start", "second:done"]);
   });
 
   it('policy "parallel" (the default) runs concurrent dispatches concurrently; both complete', async () => {
