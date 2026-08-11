@@ -6,7 +6,7 @@
  * covered here.
  */
 
-import { Context, Effect, Layer, Ref, Schema, Stream } from "effect";
+import { Cause, Context, Effect, Layer, Ref, Schema, Stream } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 import { Action, Command, define, Next } from "./tea";
 
@@ -303,12 +303,30 @@ describe("Blueprint.reduce", () => {
   });
 
   it("an unhandled lifecycle action leaves state unchanged and does not throw", () => {
-    // PropsChanged has no handler on `counter` above.
-    expect(() =>
-      counter.reduce({ _tag: "PropsChanged", previous: at(10).props }, at(10)),
-    ).not.toThrow();
-    const next = counter.reduce({ _tag: "PropsChanged", previous: at(10).props }, at(10));
-    expect(Next.state(next)).toEqual({ count: 10 });
+    const snapshot = at(10);
+
+    // Every lifecycle tag `counter` declares no handler for — it declares only
+    // `Mounted`. One tag is not a sweep: `HookChanged` is the newest member of
+    // `LifecycleTag` and the likeliest to be missed, and `Unmounted` reaches
+    // this branch on teardown of any feature that ignores it, which is most.
+    const unhandled: ReadonlyArray<Parameters<typeof counter.reduce>[0]> = [
+      { _tag: "PropsChanged", previous: snapshot.props },
+      { _tag: "HookChanged", previous: {} },
+      { _tag: "Error", error: new Error("boom"), cause: Cause.die(new Error("boom")) },
+      { _tag: "Unmounted" },
+    ];
+
+    for (const action of unhandled) {
+      expect(() => counter.reduce(action, snapshot)).not.toThrow();
+
+      const next = counter.reduce(action, snapshot);
+      // The same reference, not an equal object. A copy would make every
+      // ignored lifecycle action read as a state change downstream — and
+      // `PropsChanged` fires on every ancestor-driven render.
+      expect(Next.state(next)).toBe(snapshot.state);
+      // No command either: the no-op has to be total, not merely state-shaped.
+      expect(Next.command(next)).toBeUndefined();
+    }
   });
 
   it("a genuinely unhandled tag (not a lifecycle tag) throws rather than silently no-opping", () => {
