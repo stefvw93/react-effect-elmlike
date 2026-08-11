@@ -396,19 +396,40 @@ const Announced = Action.output("Announced", { id: Schema.String });
 
 describe("Blueprint.run", () => {
   it("seeded actions are processed but not recorded in `emitted`", async () => {
-    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
+    const Echo = Action("Echo", {});
+    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump, Echo]) });
     const feature = Feature.create({
       initialState: () => ({ count: 0 }),
-      reducer: { Bump: (_action, { state }) => ({ count: state.count + 1 }) },
+      reducer: {
+        // The second seed emits `Echo`, so `emitted` ends up non-empty. With
+        // no command anywhere, `emitted` would be `[]` whether or not seeds
+        // were excluded from it — the assertion could not fail for the reason
+        // the criterion states.
+        Bump: (_action, { state }) => {
+          const count = state.count + 1;
+          return count === 2
+            ? [{ count }, Command.stream(Stream.succeed({ _tag: "Echo" as const }))]
+            : { count };
+        },
+        Echo: (_action, { state }) => ({ count: state.count + 10 }),
+      },
       render: () => null,
     });
 
     const { state, emitted } = await Effect.runPromise(
-      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer: Layer.empty }),
+      feature.run([{ _tag: "Bump" }, { _tag: "Bump" }], {
+        props: {},
+        hooks: {},
+        layer: Layer.empty,
+      }),
     );
 
-    expect(state).toEqual({ count: 1 });
-    expect(emitted).toEqual([]);
+    // 1 + 1 from the two seeds, then +10 from the echoed action: both seeds
+    // were processed, and in order.
+    expect(state).toEqual({ count: 12 });
+    // Only the command-borne action is recorded. Two `Bump` seeds went through
+    // the reducer and neither appears.
+    expect(emitted).toEqual([{ _tag: "Echo" }]);
   });
 
   it("a command's emissions feed back into the reducer and land in `emitted`", async () => {
