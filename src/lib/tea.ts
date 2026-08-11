@@ -50,6 +50,29 @@ export type LifecycleTag = "Mounted" | "PropsChanged" | "Error" | "Unmounted" | 
 export type NotLifecycleTag<Tag extends string> = Tag extends LifecycleTag ? never : unknown;
 
 /**
+ * The runtime counterpart of `LifecycleTag`, kept exhaustive by the compiler:
+ * a `Record` literal missing (or misspelling) a key fails to satisfy the
+ * `Record<LifecycleTag, true>` annotation.
+ *
+ * What this exists to prevent: `reduce`/`step` treat a missing handler as a
+ * no-op only for *lifecycle* actions — every `LifecycleHandlers` entry is
+ * optional by design. A missing handler for a *declared* action is a
+ * different thing entirely — the `Reducer` type requires one for every tag in
+ * `A["cases"]`, so reaching this branch for one means the action arrived
+ * without going through the typed `dispatch`/`reduce` surface (a bad cast, a
+ * malformed devtools replay). That case still throws, on purpose.
+ */
+const LifecycleTags: Record<LifecycleTag, true> = {
+  Mounted: true,
+  PropsChanged: true,
+  Error: true,
+  Unmounted: true,
+  HookChanged: true,
+};
+
+const isLifecycleTag = (tag: string): tag is LifecycleTag => tag in LifecycleTags;
+
+/**
  * A message is a tagged struct and nothing more, in both directions. The
  * difference between the two vocabularies is *where a message may go*, which is
  * a fact about the boundary and not about the payload — so they are one type
@@ -73,6 +96,10 @@ export type NotLifecycleTag<Tag extends string> = Tag extends LifecycleTag ? nev
  * because a bare `Schema.TaggedStruct` could bypass the constructor and land in
  * the list unchecked. There is now no unbranded way in, so the guard on the
  * string literal in `Vocabularies` is the only gate that has to exist.
+ *
+ * The brand is load-bearing a third way now: `Action.of` reads the channel off
+ * its members rather than being told, so the phantom is an *inference site* and
+ * not only a check. See `ChannelOf`.
  */
 const channel: unique symbol = Symbol("@tea/channel");
 
@@ -111,9 +138,48 @@ export type AnyMessage<Ch extends Channel> = Schema.Codec<any, any> & {
  * devtools transport.
  */
 export type Vocabulary<
-  Members extends ReadonlyArray<AnyMessage<Ch>>,
+  Members extends ReadonlyArray<AnyMessage<Channel>>,
   Ch extends Channel,
 > = Schema.toTaggedUnion<"_tag", Members> & { readonly [channel]: Ch };
+
+/**
+ * The channel a member list belongs to, read off the members' own brand.
+ *
+ * This is what lets `of` be written once for both channels instead of being
+ * instantiated per channel — the members already say where they go, so asking
+ * the caller to say it again is a second source of truth and a second place to
+ * get it wrong.
+ *
+ * Both guards test *assignability of the whole tuple*, which is elementwise, so
+ * a mixed list satisfies neither and lands on `never`. The empty list satisfies
+ * both, which is the one genuinely ambiguous case: it also resolves to `never`,
+ * so `Action.of([])` fails at `define` rather than picking a channel by coin
+ * toss. Nobody writes it — `output` defaults to `NoOutputs` — and the failure is
+ * loud if they do.
+ */
+export type ChannelOf<Members extends ReadonlyArray<AnyMessage<Channel>>> =
+  Members extends ReadonlyArray<AnyMessage<"internal">>
+    ? Members extends ReadonlyArray<AnyMessage<"outbound">>
+      ? never
+      : "internal"
+    : "outbound";
+
+/**
+ * Rejects a member list that straddles both channels, at the `of` call rather
+ * than wherever the resulting vocabulary is used.
+ *
+ * Without it a mixed list still fails — `ChannelOf` gives `"outbound"`, and the
+ * internal members make the vocabulary wrong in a way `define` eventually
+ * notices — but it fails one hop away from the mistake, naming the vocabulary
+ * instead of the member that does not belong. Intersected onto the parameter
+ * like every other guard here, so bare `Members` stays the inference site.
+ */
+export type SameChannel<Members extends ReadonlyArray<AnyMessage<Channel>>> =
+  Members extends ReadonlyArray<AnyMessage<"internal">>
+    ? unknown
+    : Members extends ReadonlyArray<AnyMessage<"outbound">>
+      ? unknown
+      : never;
 
 /**
  * The constraint everything downstream is written against, and it is structural
@@ -137,19 +203,38 @@ export type TagsOf<V extends AnyVocabulary<Channel>> = keyof V["cases"] & string
 export type MemberOf<V extends AnyVocabulary<Channel>> = V["Type"];
 
 /**
- * One primitive, two channels — written once and instantiated twice, so the
- * claim that an output is *an action with an external destination* is a line of
- * code rather than a comment.
+ * The thin wrapper on `Schema.TaggedStruct` that everything else in this file is
+ * built from. Its only addition is the reserved-tag guard, which lands on the
+ * string literal where the error reads best.
+ */
+export interface MessageConstructor<Ch extends Channel> {
+  <const Tag extends Capitalize<string>, const Fields extends Schema.Struct.Fields>(
+    tag: Tag & NotLifecycleTag<Tag>,
+    fields: Fields,
+  ): Message<Tag, Fields, Ch>;
+}
+
+/**
+ * One primitive, two channels, **one namespace** — so the claim that an output
+ * is *an action with an external destination* is the shape of the API rather
+ * than a comment attached to two sibling constants.
  *
- * The call signature is the thin wrapper on `Schema.TaggedStruct` that
- * everything else in this file is built from; its only addition is the
- * reserved-tag guard, which lands on the string literal where the error reads
- * best. `of` is `Schema.Union(members).pipe(Schema.toTaggedUnion("_tag"))`,
- * which takes messages and vocabularies interchangeably and flattens the nested
- * ones:
+ * `Action` and `Output` as peers said the opposite: two names, equal weight,
+ * and nothing in the surface admitting they were the same constructor called
+ * twice. Nesting the rarer one states the relationship and prices it correctly —
+ * internal is unqualified because it is almost everything, outbound pays one
+ * segment.
+ *
+ * `of` is channel-*polymorphic*, not duplicated per channel: the members carry
+ * the brand, so `ChannelOf` reads it back and `SameChannel` rejects a mixed
+ * list. That is the whole reason there is no `Action.output.of` — it would be
+ * asking for a fact the argument already contains. It is
+ * `Schema.Union(members).pipe(Schema.toTaggedUnion("_tag"))`, which takes
+ * messages and vocabularies interchangeably and flattens the nested ones:
  *
  *     const Async = Action.of([Started, Failed])            // shared, its own module
  *     const CartActions = Action.of([Async, CheckoutRequested, CheckoutCompleted])
+ *     const CartOutputs = Action.of([Action.output("OrderPlaced", { orderId: Schema.String })])
  *
  * The reducer for `CartActions` then requires all four keys. A record-of-fields
  * constructor was tried first and dropped here: it reads well and composes only
@@ -162,41 +247,45 @@ export type MemberOf<V extends AnyVocabulary<Channel>> = V["Type"];
  * site — so the action union can never be recovered from `reducer`. It would
  * collapse to `{_tag: string}` and every handler parameter would become `never`.
  */
-export interface Vocabularies<Ch extends Channel> {
-  <const Tag extends Capitalize<string>, const Fields extends Schema.Struct.Fields>(
-    tag: Tag & NotLifecycleTag<Tag>,
-    fields: Fields,
-  ): Message<Tag, Fields, Ch>;
+export interface Vocabularies extends MessageConstructor<"internal"> {
+  /**
+   * Announced, never handled here. An output has no reducer handler — its tag is
+   * not in the reducer's key set — and it is not in `dispatch`'s union, so it
+   * cannot be sent by hand: the structural trick `LifecycleTag` uses for
+   * inbound-only lifecycle actions, run in the other direction.
+   *
+   * Delivered as one `on<Tag>` prop per output — see `OutputProps`.
+   */
+  readonly output: MessageConstructor<"outbound">;
 
-  readonly of: <const Members extends ReadonlyArray<AnyMessage<Ch>>>(
-    members: Members,
-  ) => Vocabulary<Members, Ch>;
+  readonly of: <const Members extends ReadonlyArray<AnyMessage<Channel>>>(
+    members: Members & SameChannel<Members>,
+  ) => Vocabulary<Members, ChannelOf<Members>>;
 }
 
-function defineVocabularies<Ch extends Channel>(ch: Ch): Vocabularies<Ch> {
-  return Object.assign(
-    function Action(tag: string, fields: Schema.Struct.Fields) {
-      return Object.assign(Schema.TaggedStruct(tag, fields), { [channel]: ch });
-    },
-    {
-      of: (members: ReadonlyArray<AnyMessage<Ch>>) =>
-        Object.assign(Schema.Union(members).pipe(Schema.toTaggedUnion("_tag")), { [channel]: ch }),
-    },
-  ) as Vocabularies<Ch>;
-}
-
-/** Handled here, never seen outside. */
-export const Action = defineVocabularies("internal");
+const messages = <Ch extends Channel>(ch: Ch) =>
+  function message(tag: string, fields: Schema.Struct.Fields) {
+    return Object.assign(Schema.TaggedStruct(tag, fields), { [channel]: ch });
+  };
 
 /**
- * Announced, never handled here. An output has no reducer handler — its tag is
- * not in the reducer's key set — and it is not in `dispatch`'s union, so it
- * cannot be sent by hand: the structural trick `LifecycleTag` uses for
- * inbound-only lifecycle actions, run in the other direction.
- *
- * Delivered as one `on<Tag>` prop per output — see `OutputProps`.
+ * Declared vocabularies. `Action(…)` is handled here and never seen outside;
+ * `Action.output(…)` is the reverse.
  */
-export const Output = defineVocabularies("outbound");
+export const Action: Vocabularies = Object.assign(messages("internal"), {
+  output: messages("outbound"),
+
+  /**
+   * The runtime brand comes off the first member rather than from an argument,
+   * which is the value-level half of what `ChannelOf` does in the type. Both
+   * halves are safe on the same premise — `SameChannel` has already rejected a
+   * list whose members disagree, so member zero speaks for all of them.
+   */
+  of: (members: ReadonlyArray<AnyMessage<Channel>>) =>
+    Object.assign(Schema.Union(members).pipe(Schema.toTaggedUnion("_tag")), {
+      [channel]: members[0]?.[channel],
+    }),
+}) as unknown as Vocabularies;
 
 /** The empty vocabulary, so a leaf feature declares nothing. `Type` is `never`. */
 export type NoOutputs = Vocabulary<readonly [], "outbound">;
@@ -502,6 +591,14 @@ const pipeable = <T extends object>(value: T): T & Pipeable.Pipeable =>
       return Pipeable.pipeArguments(this, arguments);
     },
   });
+
+/**
+ * Discharges only the `R` channel of an effect, keeping its success type
+ * exactly as inferred. Used once, by `run` — see the call site for why `R`
+ * specifically cannot be verified in that scope.
+ */
+const discharge = <T>(effect: Effect.Effect<T, never, any>): Effect.Effect<T, never, never> =>
+  effect as Effect.Effect<T, never, never>;
 
 export const Command: {
   readonly none: Command<never>;
@@ -864,7 +961,11 @@ export interface Blueprint<
    * constant; annotating it would replace the literal type that `R` is computed
    * from, and that degradation is silent. Takes lifecycle actions too, so
    * "what happens when this prop changes" is a direct call rather than a
-   * mounted component. Unhandled lifecycle actions return the state unchanged.
+   * mounted component. Unhandled lifecycle actions return the state unchanged —
+   * every `LifecycleHandlers` entry is optional by design. Nothing else is:
+   * `action`'s type requires a handler for every declared tag, so a missing one
+   * outside the lifecycle set means the value reaching `reduce` didn't come
+   * from the typed surface, and that throws rather than swallowing the defect.
    *
    * No React, no runtime, no mounting.
    */
@@ -954,7 +1055,7 @@ export interface Definition<
  *       props: Props,
  *       state: State,
  *       action: Action.of([…]),
- *       output: Output.of([OrderPlaced]),
+ *       output: Action.of([OrderPlaced]),
  *       useHooks: …,
  *     })
  *
@@ -1026,162 +1127,192 @@ export const define: <
     render: identity,
     create: (parts) => {
       return {
-        reduce: (action, snapshot) => parts.reducer[action._tag](action, snapshot),
+        /**
+         * A missing handler is the documented no-op only for a *lifecycle*
+         * tag — every `LifecycleHandlers` entry is optional by design. A
+         * missing handler for anything else is a defect: `Reducer` requires
+         * one for every declared action tag, so reaching this branch means
+         * the action arrived without going through the typed surface (a bad
+         * cast, a malformed devtools replay) — that case still throws, same
+         * as calling `undefined` always did.
+         */
+        reduce: (action, snapshot) => {
+          const handler = parts.reducer[action._tag];
+          if (handler) return handler(action, snapshot);
+          if (isLifecycleTag(action._tag)) return snapshot.state;
+          throw new TypeError(`No reducer handler for action "${action._tag}"`);
+        },
 
         run: (actions, options) =>
-          Effect.gen(function* () {
-            type Entry = {
-              readonly msg: { _tag: string };
-              readonly origin: "seed" | "command" | "settled";
-            };
+          discharge(
+            Effect.gen(function* () {
+              type Entry = {
+                readonly msg: { _tag: string };
+                readonly origin: "seed" | "command" | "settled";
+              };
 
-            type Ctx = { readonly tag: string; readonly key?: string; readonly policy?: Policy };
+              type Ctx = { readonly tag: string; readonly key?: string; readonly policy?: Policy };
 
-            const queue = yield* Queue.unbounded<Entry>();
-            const inFlight = yield* Ref.make(0);
-            const groups = yield* Ref.make(new Map<string, ReadonlyArray<Fiber.Fiber<void>>>());
-            const emitted: { _tag: string }[] = [];
-            const outputs: { _tag: string }[] = [];
-            const snapshot = { ...options };
-            let state = parts.initialState(options.props);
+              const queue = yield* Queue.unbounded<Entry>();
+              const inFlight = yield* Ref.make(0);
+              const groups = yield* Ref.make(new Map<string, ReadonlyArray<Fiber.Fiber<void>>>());
+              const emitted: { _tag: string }[] = [];
+              const outputs: { _tag: string }[] = [];
+              const snapshot = { ...options };
+              let state = parts.initialState(options.props);
 
-            for (const action of actions) {
-              yield* Queue.offer(queue, { msg: action, origin: "seed" });
-            }
+              for (const action of actions) {
+                yield* Queue.offer(queue, { msg: action, origin: "seed" });
+              }
 
-            const isOutput = (action: { _tag: string }): boolean => {
-              return spec.output?.cases ? action._tag in spec.output.cases : false;
-            };
+              const isOutput = (action: { _tag: string }): boolean => {
+                return spec.output?.cases ? action._tag in spec.output.cases : false;
+              };
 
-            const groupId = (target: Group): string => `${target.tag}::${target.key ?? ""}`;
+              const groupId = (target: Group): string => `${target.tag}::${target.key ?? ""}`;
 
-            const cancelGroup = (target: Group) =>
-              Effect.gen(function* () {
-                const map = yield* Ref.get(groups);
-                const ids =
-                  target.key !== undefined
-                    ? [groupId(target)]
-                    : Array.from(map.keys()).filter((id) => id.startsWith(`${target.tag}::`));
+              const cancelGroup = (target: Group) =>
+                Effect.gen(function* () {
+                  const map = yield* Ref.get(groups);
+                  const ids =
+                    target.key !== undefined
+                      ? [groupId(target)]
+                      : Array.from(map.keys()).filter((id) => id.startsWith(`${target.tag}::`));
 
-                for (const id of ids) {
-                  for (const fiber of map.get(id) ?? []) yield* Fiber.interrupt(fiber);
-                }
-              });
-
-            const runGuarded = (ctx: Ctx, run: Effect.Effect<void, never, any>) =>
-              Effect.gen(function* () {
-                const policy = ctx.policy ?? "parallel";
-                const id = groupId(ctx);
-                const running = (yield* Ref.get(groups)).get(id) ?? [];
-
-                if (policy === "ignore" && running.length > 0) return;
-                if (policy === "restart")
-                  for (const fiber of running) yield* Fiber.interrupt(fiber);
-
-                const awaitPrior =
-                  policy === "queue" && running.length > 0
-                    ? Fiber.joinAll(running).pipe(Effect.asVoid)
-                    : Effect.void;
-
-                yield* Ref.update(inFlight, (n) => n + 1);
-
-                // A fiber `Fiber.interrupt`ed before the scheduler has started it never
-                // runs its own body — including an `Effect.ensuring` baked into that
-                // body — so cleanup can't live there. A separate watcher, waiting on
-                // `Fiber.await`, observes the Exit regardless of whether the fiber ever
-                // got to start.
-                const fiber: Fiber.Fiber<void> = yield* awaitPrior.pipe(
-                  Effect.andThen(run),
-                  Effect.forkChild,
-                );
-
-                yield* Ref.update(groups, (m) =>
-                  new Map(m).set(
-                    id,
-                    policy === "restart" ? [fiber] : [...(m.get(id) ?? []), fiber],
-                  ),
-                );
-
-                const cleanup = Effect.gen(function* () {
-                  yield* Ref.update(inFlight, (n) => n - 1);
-                  yield* Ref.update(groups, (m) => {
-                    const next = new Map(m);
-                    const remaining = (next.get(id) ?? []).filter((f) => f !== fiber);
-                    if (remaining.length > 0) next.set(id, remaining);
-                    else next.delete(id);
-                    return next;
-                  });
-                  // A command that settles without ever emitting (a `Command.effect`,
-                  // an interrupted/cancelled group) still has to wake the drain loop's
-                  // `Queue.take` — otherwise quiescence is reached but nothing is left
-                  // to unblock it. A no-op entry does that uniformly.
-                  yield* Queue.offer(queue, { msg: { _tag: "__settled__" }, origin: "settled" });
+                  for (const id of ids) {
+                    for (const fiber of map.get(id) ?? []) yield* Fiber.interrupt(fiber);
+                  }
                 });
 
-                yield* Fiber.await(fiber).pipe(Effect.andThen(cleanup), Effect.forkChild);
-              });
+              const runGuarded = (ctx: Ctx, run: Effect.Effect<void, never, any>) =>
+                Effect.gen(function* () {
+                  const policy = ctx.policy ?? "parallel";
+                  const id = groupId(ctx);
+                  const running = (yield* Ref.get(groups)).get(id) ?? [];
 
-            const interpret = (
-              command: Command<any, any>,
-              ctx: Ctx,
-            ): Effect.Effect<void, never, any> =>
-              Effect.gen(function* () {
-                switch (command._tag) {
-                  case "None":
-                    return;
-                  case "Effect":
-                    return yield* runGuarded(ctx, Effect.asVoid(command.effect));
-                  case "Stream":
-                    return yield* runGuarded(
-                      ctx,
-                      Stream.runForEach(command.stream, (msg) =>
-                        Queue.offer(queue, { msg, origin: "command" }),
-                      ),
-                    );
-                  case "Batch":
-                    for (const member of command.commands) yield* interpret(member, ctx);
-                    return;
-                  case "Cancel":
-                    return yield* cancelGroup(command.target);
-                  case "Guarded": {
-                    const next: Ctx =
-                      ctx.policy === undefined
-                        ? { tag: ctx.tag, key: command.key, policy: command.policy }
-                        : ctx;
-                    return yield* interpret(command.command, next);
+                  if (policy === "ignore" && running.length > 0) return;
+                  if (policy === "restart")
+                    for (const fiber of running) yield* Fiber.interrupt(fiber);
+
+                  const awaitPrior =
+                    policy === "queue" && running.length > 0
+                      ? Fiber.joinAll(running).pipe(Effect.asVoid)
+                      : Effect.void;
+
+                  yield* Ref.update(inFlight, (n) => n + 1);
+
+                  // A fiber `Fiber.interrupt`ed before the scheduler has started it never
+                  // runs its own body — including an `Effect.ensuring` baked into that
+                  // body — so cleanup can't live there. A separate watcher, waiting on
+                  // `Fiber.await`, observes the Exit regardless of whether the fiber ever
+                  // got to start.
+                  const fiber: Fiber.Fiber<void> = yield* awaitPrior.pipe(
+                    Effect.andThen(run),
+                    Effect.forkChild,
+                  );
+
+                  yield* Ref.update(groups, (m) =>
+                    new Map(m).set(
+                      id,
+                      policy === "restart" ? [fiber] : [...(m.get(id) ?? []), fiber],
+                    ),
+                  );
+
+                  const cleanup = Effect.gen(function* () {
+                    yield* Ref.update(inFlight, (n) => n - 1);
+                    yield* Ref.update(groups, (m) => {
+                      const next = new Map(m);
+                      const remaining = (next.get(id) ?? []).filter((f) => f !== fiber);
+                      if (remaining.length > 0) next.set(id, remaining);
+                      else next.delete(id);
+                      return next;
+                    });
+                    // A command that settles without ever emitting (a `Command.effect`,
+                    // an interrupted/cancelled group) still has to wake the drain loop's
+                    // `Queue.take` — otherwise quiescence is reached but nothing is left
+                    // to unblock it. A no-op entry does that uniformly.
+                    yield* Queue.offer(queue, { msg: { _tag: "__settled__" }, origin: "settled" });
+                  });
+
+                  yield* Fiber.await(fiber).pipe(Effect.andThen(cleanup), Effect.forkChild);
+                });
+
+              const interpret = (
+                command: Command<any, any>,
+                ctx: Ctx,
+              ): Effect.Effect<void, never, any> =>
+                Effect.gen(function* () {
+                  switch (command._tag) {
+                    case "None":
+                      return;
+                    case "Effect":
+                      return yield* runGuarded(ctx, Effect.asVoid(command.effect));
+                    case "Stream":
+                      return yield* runGuarded(
+                        ctx,
+                        Stream.runForEach(command.stream, (msg) =>
+                          Queue.offer(queue, { msg, origin: "command" }),
+                        ),
+                      );
+                    case "Batch":
+                      for (const member of command.commands) yield* interpret(member, ctx);
+                      return;
+                    case "Cancel":
+                      return yield* cancelGroup(command.target);
+                    case "Guarded": {
+                      const next: Ctx =
+                        ctx.policy === undefined
+                          ? { tag: ctx.tag, key: command.key, policy: command.policy }
+                          : ctx;
+                      return yield* interpret(command.command, next);
+                    }
                   }
-                }
-              });
+                });
 
-            const step = ({ msg: action, origin }: Entry) =>
-              Effect.gen(function* () {
-                if (origin === "settled") return;
+              const step = ({ msg: action, origin }: Entry) =>
+                Effect.gen(function* () {
+                  if (origin === "settled") return;
 
-                yield* Effect.log("step", action);
+                  yield* Effect.log("step", action);
 
-                if (isOutput(action)) return void outputs.push(action);
+                  if (isOutput(action)) return void outputs.push(action);
 
-                const handler = parts.reducer[action._tag];
-                // if (!handler) return; // unhandled lifecycle: no-op
+                  const handler = parts.reducer[action._tag];
+                  if (!handler) {
+                    if (isLifecycleTag(action._tag)) return;
+                    throw new TypeError(`No reducer handler for action "${action._tag}"`);
+                  }
 
-                const next = handler(action, { ...snapshot, state });
-                const command = Next.command(next);
-                if (action._tag !== "Unmounted") state = Next.state(next);
-                if (command) yield* interpret(command, { tag: action._tag });
-              });
+                  const next = handler(action, { ...snapshot, state });
+                  const command = Next.command(next);
+                  if (action._tag !== "Unmounted") state = Next.state(next);
+                  if (command) yield* interpret(command, { tag: action._tag });
+                });
 
-            // drain until quiescent: nothing queued and nothing running
-            while (true) {
-              const queueSize = yield* Queue.size(queue);
-              const inFlightCount = yield* Ref.get(inFlight);
-              if (queueSize === 0 && inFlightCount === 0) break;
-              const entry = yield* Queue.take(queue);
-              if (entry.origin === "command" && !isOutput(entry.msg)) emitted.push(entry.msg);
-              yield* step(entry);
-            }
+              // drain until quiescent: nothing queued and nothing running
+              while (true) {
+                const queueSize = yield* Queue.size(queue);
+                const inFlightCount = yield* Ref.get(inFlight);
+                if (queueSize === 0 && inFlightCount === 0) break;
+                const entry = yield* Queue.take(queue);
+                if (entry.origin === "command" && !isOutput(entry.msg)) emitted.push(entry.msg);
+                yield* step(entry);
+              }
 
-            return { state, emitted, outputs };
-          }).pipe(Effect.provide(options.layer)),
+              return { state, emitted, outputs };
+            }).pipe(Effect.provide(options.layer)),
+            /**
+             * Only `R` needs discharging here, not the success value.
+             *
+             * `interpret`/`runGuarded` type every command's requirement `any`
+             * internally, because the real `R` is computed the same way
+             * `ServicesOf<U>` is — by walking handler return types this scope
+             * cannot name (see `ServiceOf`) — so TS can't see that
+             * `options.layer` (typed `Layer.Layer<R>` by the caller) actually
+             * discharges it. `discharge` asserts exactly that one channel;
+             * `state`/`emitted`/`outputs` stay inferred and checked.
+             */
+          ),
       };
     },
   };

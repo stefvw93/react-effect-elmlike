@@ -28,7 +28,7 @@
 
 import { useState, type ReactNode } from "react";
 import { Context, Effect, Layer, Schema, Stream, Struct } from "effect";
-import { Action, Command, createRuntime, define, Output } from "../lib/tea";
+import { Action, Command, createRuntime, define } from "../lib/tea";
 
 // --- domain (unchanged) -------------------------------------------------------
 
@@ -149,14 +149,18 @@ const CartActions = Action.of([
  * key set, so writing one is a compile error rather than a handler that silently
  * never fires.
  *
- * `Output` is `Action` with the other phantom on it, and that phantom is
- * the whole difference. Listing `OrderPlaced` in `Action.of([…])` is a type error,
- * and so is passing `CartOutputs` to `actions` — which is what the earlier
- * `action` / `output` pair only *looked* like it was doing.
+ * `Action.output` is `Action` with the other phantom on it, and that phantom is
+ * the whole difference. Mixing `OrderPlaced` into the `Action.of([…])` that
+ * builds `CartActions` is a type error, and so is passing `CartOutputs` to
+ * `action` — which is what the earlier `action` / `output` pair only *looked*
+ * like it was doing.
+ *
+ * `.of` is shared rather than per-channel: the members carry the brand, so it
+ * reads the channel back off them instead of being told twice.
  */
-const OrderPlaced = Output("OrderPlaced", { orderId: Schema.String });
+const OrderPlaced = Action.output("OrderPlaced", { orderId: Schema.String });
 
-const CartOutputs = Output.of([OrderPlaced]);
+const CartOutputs = Action.of([OrderPlaced]);
 
 // --- the interface, in one place ----------------------------------------------
 
