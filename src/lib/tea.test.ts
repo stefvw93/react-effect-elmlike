@@ -17,8 +17,28 @@ import { Action, Command, define, Next } from "./tea";
 describe("vocabularies", () => {
   it("constructs a single message branded with its channel", () => {
     const Foo = Action("Foo", { id: Schema.String });
-    const value = Foo.make({ id: "x" });
-    expect(value).toEqual({ _tag: "Foo", id: "x" });
+    const OutboundFoo = Action.output("Foo", { id: Schema.String });
+
+    expect(Foo.make({ id: "x" })).toEqual({ _tag: "Foo", id: "x" });
+
+    // A `TaggedStruct`, so `_tag` is part of the *schema*, not only of the
+    // value `make` happens to produce — that is what makes the message
+    // encodable and what `toTaggedUnion` discriminates on.
+    expect(Object.keys(Foo.fields).sort()).toEqual(["_tag", "id"]);
+
+    // The channel brand is a real runtime property, not only a phantom:
+    // `Action.of` reads it off member zero to brand the vocabulary, so the
+    // value-level half has to be there for the type-level half to be honest.
+    // The symbol is module-private, so it is found by description.
+    const channelOf = (message: object): unknown => {
+      const brand = Object.getOwnPropertySymbols(message).find(
+        (symbol) => symbol.description === "@tea/channel",
+      );
+      return brand === undefined ? undefined : (message as Record<symbol, unknown>)[brand];
+    };
+
+    expect(channelOf(Foo)).toBe("internal");
+    expect(channelOf(OutboundFoo)).toBe("outbound");
   });
 
   it("`.of` builds a tagged union exposing cases, guards, and match", () => {

@@ -32,7 +32,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 
 ### Vocabularies (`Action`, `Action.output`, `Action.of`)
 
-- [ ] A single message (`Action("Tag", fields)` / `Action.output("Tag", fields)`) constructs a `Schema.TaggedStruct` branded with its channel (`"internal"` vs `"outbound"`).
+- [x] A single message (`Action("Tag", fields)` / `Action.output("Tag", fields)`) constructs a `Schema.TaggedStruct` branded with its channel (`"internal"` vs `"outbound"`).
 - [x] `Action.of([...])` builds a branded tagged union (`Schema.toTaggedUnion`) exposing `cases`, `guards`, `match`, `mapMembers`, and a `make` constructor per case.
 - [ ] `Action.of` infers the vocabulary's channel from its members' brand (`ChannelOf`) — there is no per-channel `of`.
 - [ ] `Action.of` rejects a member list mixing internal and outbound messages (`SameChannel`), at the call rather than at `define`.
