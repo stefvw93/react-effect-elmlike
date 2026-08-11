@@ -643,6 +643,65 @@ describe("Blueprint.run", () => {
     expect(log).toContain("second:free");
   });
 
+  it("Batch members occupy their own groups — cancelling one leaves its sibling running", async () => {
+    const { ref, layer } = makeLogLayer();
+    const Feature = define({
+      props: RunProps,
+      state: RunState,
+      action: Action.of([Go, Action("Stop", {}), Action("Arm", {})]),
+    });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Go: () => [
+          { count: 0 },
+          // Two members under the same tag but different keys. If a batch
+          // shared one group across its members, cancelling "a" would take
+          // "b" with it — the policy test above cannot see that, since it
+          // only distinguishes which member's *policy* applied.
+          Command.batch(
+            Command.effect(
+              Effect.andThen(
+                push("a:start"),
+                Effect.andThen(Effect.sleep("200 millis"), push("a:done")),
+              ),
+            ).pipe(Command.queue("a")),
+            Command.effect(
+              Effect.andThen(
+                push("b:start"),
+                Effect.andThen(Effect.sleep("60 millis"), push("b:done")),
+              ),
+            ).pipe(Command.queue("b")),
+          ),
+        ],
+        Arm: () => [
+          { count: 0 },
+          Command.stream(
+            Stream.fromEffect(
+              Effect.andThen(Effect.sleep("20 millis"), Effect.succeed({ _tag: "Stop" as const })),
+            ),
+          ),
+        ],
+        Stop: () => [{ count: 0 }, Command.cancel({ tag: "Go", key: "a" })],
+      },
+      render: () => null,
+    });
+
+    await Effect.runPromise(
+      feature.run([{ _tag: "Go", ms: 0, id: "x" }, { _tag: "Arm" }], {
+        props: {},
+        hooks: {},
+        layer,
+      }),
+    );
+
+    const log = await Effect.runPromise(Ref.get(ref));
+    expect(log).toContain("a:start");
+    expect(log).toContain("b:start");
+    expect(log).not.toContain("a:done");
+    expect(log).toContain("b:done");
+  });
+
   it("Cancel by tag only interrupts every group under that tag", async () => {
     const { ref, layer } = makeLogLayer();
     const Feature = define({
