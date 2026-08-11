@@ -1,0 +1,4 @@
+{
+  "$schema": "https://tstyche.org/schemas/tstyche.schema.json",
+  "testFileMatch": ["src/**/__type-tests__/*.tst.ts"]
+}
