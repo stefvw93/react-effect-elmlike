@@ -137,9 +137,12 @@ describe("Command", () => {
     expect(cmd.effect).toBe(inner);
   });
 
-  it("stream wraps a Stream", () => {
-    const cmd = Command.stream(Stream.empty);
+  it("stream wraps the Stream it was given", () => {
+    const inner = Stream.empty;
+    const cmd = Command.stream(inner);
     expect(cmd).toMatchObject({ _tag: "Stream" });
+    if (cmd._tag !== "Stream") throw new TypeError("expected Stream");
+    expect(cmd.stream).toBe(inner);
   });
 
   it("batch collects members, each independent", () => {
@@ -640,6 +643,50 @@ describe("Blueprint.run", () => {
 
     const log = await Effect.runPromise(Ref.get(ref));
     expect(log).toEqual(["via-layer"]);
+  });
+
+  it("one stream's emissions are routed per element — actions to the reducer, outputs out", async () => {
+    const Feature = define({
+      props: RunProps,
+      state: RunState,
+      action: Action.of([Bump]),
+      output: Action.of([Announced]),
+    });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        // Routing is by `_tag` and nothing else, so a single stream carrying
+        // both kinds is the case that proves it: the destination is a property
+        // of each element, not of the command that produced them.
+        Bump: (_action, { state }) =>
+          state.count === 0
+            ? [
+                { count: 1 },
+                Command.stream(
+                  Stream.fromIterable([
+                    { _tag: "Announced" as const, id: "a1" },
+                    { _tag: "Bump" as const },
+                    { _tag: "Announced" as const, id: "a2" },
+                  ]),
+                ),
+              ]
+            : { count: state.count + 1 },
+      },
+      render: () => null,
+    });
+
+    const { state, emitted, outputs } = await Effect.runPromise(
+      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer: Layer.empty }),
+    );
+
+    // Seed `Bump` took count to 1; the streamed `Bump` re-entered and took it
+    // to 2. The two outputs never reached the reducer.
+    expect(state).toEqual({ count: 2 });
+    expect(emitted).toEqual([{ _tag: "Bump" }]);
+    expect(outputs).toEqual([
+      { _tag: "Announced", id: "a1" },
+      { _tag: "Announced", id: "a2" },
+    ]);
   });
 
   it("Command.effect runs for effects and emits nothing, even when it succeeds with an action", async () => {

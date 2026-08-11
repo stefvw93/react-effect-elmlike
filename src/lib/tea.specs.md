@@ -44,7 +44,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 
 - [x] `Command.none` is the `{ _tag: "None" }` no-op.
 - [x] `Command.effect(effect)` wraps an `Effect` that runs for effects and emits nothing.
-- [ ] `Command.stream(stream)` wraps a `Stream` whose emissions feed back into the reducer (or leave as outputs).
+- [x] `Command.stream(stream)` wraps a `Stream` whose emissions feed back into the reducer (or leave as outputs). _(Criterion is superseded by the pending command-leaf redesign — see below. Covered now so the routing behavior is pinned before the leaf changes.)_
 - [ ] `Command.batch(...commands)` runs each member independently, each keeping its own policy.
 - [ ] `Command.cancel(target)` interrupts a running group, addressed by tag only or by `{ tag, key }`.
 - [ ] `Command.output(message, payload)` emits an outbound message as a one-shot stream; passing an internal message is a compile error.
