@@ -396,6 +396,47 @@ describe("Blueprint.run", () => {
     expect(log).toContain("x:other");
   });
 
+  it("Batch members keep their own policies — one guarded member does not govern the others", async () => {
+    const { ref, layer } = makeLogLayer();
+    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Go]) });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Go: (action) => [
+          { count: 0 },
+          Command.batch(
+            // Guarded by "ignore": still in flight when the second Go lands,
+            // so that one is dropped.
+            Command.effect(
+              Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:guarded`)),
+            ).pipe(Command.ignore("g")),
+            // Unguarded sibling: must run on *both* dispatches. If a batch
+            // applied one member's policy to the whole node, this would be
+            // dropped too and the assertion below would catch it.
+            Command.effect(push(`${action.id}:free`)),
+          ),
+        ],
+      },
+      render: () => null,
+    });
+
+    await Effect.runPromise(
+      feature.run(
+        [
+          { _tag: "Go", ms: 20, id: "first" },
+          { _tag: "Go", ms: 0, id: "second" },
+        ],
+        { props: {}, hooks: {}, layer },
+      ),
+    );
+
+    const log = await Effect.runPromise(Ref.get(ref));
+    expect(log).toContain("first:guarded");
+    expect(log).not.toContain("second:guarded");
+    expect(log).toContain("first:free");
+    expect(log).toContain("second:free");
+  });
+
   it("Cancel by tag only interrupts every group under that tag", async () => {
     const { ref, layer } = makeLogLayer();
     const Feature = define({
