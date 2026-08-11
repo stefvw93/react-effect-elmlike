@@ -8,6 +8,7 @@ import {
   type Disjoint,
   type Exhaustive,
   type MemberOf,
+  type Message,
   type NoPropCollision,
   type NoTransform,
   type OutputProps,
@@ -23,8 +24,24 @@ test("the channel brand keeps internal and outbound messages mutually unassignab
   const ActionFoo = Action("Foo", { id: Schema.String });
   const OutputFoo = Action.output("Foo", { id: Schema.String });
 
+  // Positive control: same tag, same fields, same channel stays assignable, so
+  // the two rejections below are attributable to the brand rather than to some
+  // unrelated structural difference between the two constructors.
+  const ActionFooAgain = Action("Foo", { id: Schema.String });
+  expect(ActionFoo).type.toBeAssignableTo<typeof ActionFooAgain>();
+
   expect(ActionFoo).type.not.toBeAssignableTo<typeof OutputFoo>();
   expect(OutputFoo).type.not.toBeAssignableTo<typeof ActionFoo>();
+
+  // Stated on `Message` directly, since that is what the criterion is about:
+  // the phantom, not the constructor that happened to apply it.
+  type Fields = { readonly id: typeof Schema.String };
+  expect<Message<"Foo", Fields, "internal">>().type.not.toBeAssignableTo<
+    Message<"Foo", Fields, "outbound">
+  >();
+  expect<Message<"Foo", Fields, "outbound">>().type.not.toBeAssignableTo<
+    Message<"Foo", Fields, "internal">
+  >();
 });
 
 test("a reserved lifecycle tag cannot be declared as an action or output", () => {
