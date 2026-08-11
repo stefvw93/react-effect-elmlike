@@ -38,7 +38,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 - [x] `Action.of` rejects a member list mixing internal and outbound messages (`SameChannel`), at the call rather than at `define`.
 - [x] A vocabulary built with `.of` can be nested inside another `.of` call, and the outer vocabulary's `cases` include the flattened inner tags.
 - [x] The two channels are not mutually assignable: a `Message<Tag, Fields, "internal">` is not assignable where `Message<Tag, Fields, "outbound">` is expected, and vice versa (channel brand is load-bearing, not just cosmetic).
-- [ ] Constructing a message with a reserved `LifecycleTag` (`"Mounted" | "PropsChanged" | "Error" | "Unmounted" | "HookChanged"`) is a compile error.
+- [x] Constructing a message with a reserved `LifecycleTag` (`"Mounted" | "PropsChanged" | "Error" | "Unmounted" | "HookChanged"`) is a compile error.
 
 ### `Command` ADT and constructors
 

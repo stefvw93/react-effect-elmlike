@@ -45,12 +45,32 @@ test("the channel brand keeps internal and outbound messages mutually unassignab
 });
 
 test("a reserved lifecycle tag cannot be declared as an action or output", () => {
-  // Reserved tag: LifecycleTag narrows the guard to `never`, so the literal
-  // argument can no longer satisfy the parameter.
+  // Reserved tag: `NotLifecycleTag` narrows the guard to `never`, so the
+  // literal argument can no longer satisfy the parameter.
   // @ts-expect-error is not assignable to parameter of type 'never'
   Action("Mounted", {});
   // @ts-expect-error is not assignable to parameter of type 'never'
   Action.output("Unmounted", {});
+
+  // Every reserved tag, on both constructors. Two spot checks left three tags
+  // unpinned — `HookChanged` most of all, being the newest member of
+  // `LifecycleTag` and so the likeliest to be dropped by a refactor.
+  expect(Action).type.not.toBeCallableWith("Mounted", {});
+  expect(Action).type.not.toBeCallableWith("PropsChanged", {});
+  expect(Action).type.not.toBeCallableWith("HookChanged", {});
+  expect(Action).type.not.toBeCallableWith("Error", {});
+  expect(Action).type.not.toBeCallableWith("Unmounted", {});
+
+  expect(Action.output).type.not.toBeCallableWith("Mounted", {});
+  expect(Action.output).type.not.toBeCallableWith("PropsChanged", {});
+  expect(Action.output).type.not.toBeCallableWith("HookChanged", {});
+  expect(Action.output).type.not.toBeCallableWith("Error", {});
+  expect(Action.output).type.not.toBeCallableWith("Unmounted", {});
+
+  // Control: an unreserved capitalised tag is still accepted, so the ten
+  // rejections above are `NotLifecycleTag` and not a broken signature.
+  expect(Action).type.toBeCallableWith("Mount", {});
+  expect(Action.output).type.toBeCallableWith("Unmount", {});
 });
 
 // ---------------------------------------------------------------------------
