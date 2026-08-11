@@ -1185,9 +1185,14 @@ export const define: <
                 yield* Queue.offer(queue, { msg: action, origin: "seed" });
               }
 
-              const isOutput = (action: { _tag: string }): boolean => {
-                return spec.output?.cases ? action._tag in spec.output.cases : false;
-              };
+              // `Object.hasOwn`, for the reason given on `isLifecycleTag`:
+              // `cases` inherits from `Object.prototype`, so `in` reports
+              // `"constructor"`/`"toString"` as declared outputs. Routing an
+              // unknown tag outbound is worse than the lifecycle case — it
+              // leaves the feature through an `on<Tag>` prop instead of
+              // reaching the throw.
+              const isOutput = (action: { _tag: string }): boolean =>
+                spec.output?.cases !== undefined && Object.hasOwn(spec.output.cases, action._tag);
 
               const groupId = (target: Group): string => `${target.tag}::${target.key ?? ""}`;
 

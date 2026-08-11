@@ -68,7 +68,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 - [x] Seeded actions (from the `actions` iterable passed to `run`) are processed but are not themselves recorded in `emitted`.
 - [x] Actions/outputs a command's effect/stream emits during the run are fed back into the reducer loop.
 - [x] `emitted` collects every non-output action that arrived via a command (not seed actions, not outputs).
-- [ ] `outputs` collects every message whose tag is in the declared output vocabulary's `cases`; an output never re-enters the reducer and never appears in `emitted`.
+- [x] `outputs` collects every message whose tag is in the declared output vocabulary's `cases`; an output never re-enters the reducer and never appears in `emitted`. **`cases` is checked with `Object.hasOwn` — see the prototype-chain note below.**
 - [ ] `Command.batch` members run independently — each keeps its own concurrency group/policy.
 - [ ] `Command.cancel({ tag })` (no `key`) interrupts every running group under that tag; `Command.cancel({ tag, key })` interrupts only that specific group.
 - [ ] Policy `"restart"`: a new dispatch into the same group interrupts the prior in-flight fiber.
@@ -106,6 +106,18 @@ Fixed with `Object.hasOwn` at both sites (`isLifecycleTag`, and a shared
 `handlerFor` used by `reduce` and `run`'s `step`). Only reachable by bypassing
 the typed surface — a bad cast, a malformed devtools replay — which is exactly
 what that branch exists to catch, and where failing loudly matters most.
+
+**A third site had the same hole:** `run`'s `isOutput` asked
+`action._tag in spec.output.cases`, so `{ _tag: "constructor" }` was classified
+as a declared output and collected into `outputs` rather than reaching the
+throw. That one is the worst of the three — an unknown tag does not merely
+no-op, it _leaves the feature_ through an `on<Tag>` prop and reaches the
+parent. Also fixed with `Object.hasOwn`.
+
+Worth noting as a pattern rather than three incidents: every `in` / index
+lookup in this file is keyed by an attacker- or replay-supplied `_tag` against
+an object literal, and every one of them inherits `Object.prototype`. Any new
+tag-keyed lookup wants `Object.hasOwn` from the start.
 
 ### Open decision: `reduce` and `run` disagree about `Unmounted`
 

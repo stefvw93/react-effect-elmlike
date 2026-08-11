@@ -550,6 +550,30 @@ describe("Blueprint.run", () => {
     expect(outputs).toEqual([{ _tag: "Announced", id: "a1" }]);
   });
 
+  it("a prototype-chain tag is not an output either — it still throws", async () => {
+    const Feature = define({
+      props: RunProps,
+      state: RunState,
+      action: Action.of([Bump]),
+      output: Action.of([Announced]),
+    });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: { Bump: (_action, { state }) => ({ count: state.count + 1 }) },
+      render: () => null,
+    });
+
+    // `isOutput` asks `_tag in spec.output.cases`, and `cases` inherits from
+    // `Object.prototype` like everything else. `"constructor"` is not a
+    // declared output, so classifying it as one would route an unknown action
+    // into `outputs` and out to the parent instead of reaching the throw.
+    const bogus = { _tag: "constructor" } as unknown as Parameters<typeof feature.reduce>[0];
+
+    await expect(
+      Effect.runPromise(feature.run([bogus], { props: {}, hooks: {}, layer: Layer.empty })),
+    ).rejects.toThrow(/No reducer handler/);
+  });
+
   it("Batch runs members independently, each keeping its own policy", async () => {
     const { ref, layer } = makeLogLayer();
     const Feature = define({ props: RunProps, state: RunState, action: Action.of([Go]) });
