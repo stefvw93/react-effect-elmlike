@@ -1241,18 +1241,37 @@ describe("Blueprint.run", () => {
   });
 
   it("resolves only once quiescent, including a settle with no emission", async () => {
+    const { ref, layer } = makeLogLayer();
     const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
     const feature = Feature.create({
       initialState: () => ({ count: 0 }),
-      // A bare Command.effect that emits nothing must still let `run` settle.
-      reducer: { Bump: () => [{ count: 1 }, Command.effect(Effect.sleep("5 millis"))] },
+      // A bare Command.effect that emits nothing must still let `run` settle —
+      // and must be waited for. It emits nothing, so the queue is empty the
+      // whole time it runs; only the `inFlight` half of the quiescence test
+      // keeps `run` from returning early.
+      reducer: {
+        Bump: () => [
+          { count: 1 },
+          Command.effect(Effect.andThen(Effect.sleep("50 millis"), push("late"))),
+        ],
+      },
       render: () => null,
     });
 
     const { state } = await Effect.runPromise(
-      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer: Layer.empty }),
+      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer }),
     );
+
     expect(state).toEqual({ count: 1 });
+
+    // The state above is set synchronously by the reducer, so it reads the
+    // same whether `run` waited for the fiber or returned the moment the queue
+    // drained. The delayed write is the part that can only exist if it waited.
+    //
+    // (The interrupted-group half of the criterion is covered by the cancel
+    // tests: those runs resolve at all only because a cancelled group still
+    // wakes the drain loop.)
+    expect(await Effect.runPromise(Ref.get(ref))).toEqual(["late"]);
   });
 
   it("Blueprint.run discards Unmounted's returned state (matches reduce)", async () => {

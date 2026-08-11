@@ -76,7 +76,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 - [x] Policy `"queue"`: a new dispatch into the same group waits for the prior to settle before running; both eventually complete.
 - [x] Policy `"parallel"` (the default, i.e. no `Guarded` wrapper): concurrent dispatches into the same group all run concurrently and all complete.
 - [x] Services requested by a command's effect/stream (`R`) are satisfied from `options.layer` via `Effect.provide`.
-- [ ] `run` resolves only once quiescent: nothing queued and nothing in flight (including fibers that settle without ever emitting, e.g. a bare `Command.effect` or an interrupted group).
+- [x] `run` resolves only once quiescent: nothing queued and nothing in flight (including fibers that settle without ever emitting, e.g. a bare `Command.effect` or an interrupted group).
 
 ### Known bug fixed by this pass
 
