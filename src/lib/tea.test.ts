@@ -830,7 +830,11 @@ describe("Blueprint.run", () => {
 
   it('policy "restart" interrupts the prior in-flight fiber in the same group', async () => {
     const { ref, layer } = makeLogLayer();
-    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Go]) });
+    const Feature = define({
+      props: RunProps,
+      state: RunState,
+      action: Action.of([Go, Action("Arm", {})]),
+    });
     const feature = Feature.create({
       initialState: () => ({ count: 0 }),
       reducer: {
@@ -838,27 +842,49 @@ describe("Blueprint.run", () => {
           { count: 0 },
           Command.effect(
             Effect.ensuring(
-              Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
+              Effect.andThen(
+                push(`${action.id}:start`),
+                Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
+              ),
               push(`${action.id}:ensuring`),
             ),
           ).pipe(Command.restart("group")),
+        ],
+        // The second dispatch arrives late, so the first is genuinely
+        // *in-flight* when it lands. Seeded back-to-back, both would be
+        // handled in one drain pass and the "prior" fiber would be interrupted
+        // before the scheduler ever started it — which is not what the
+        // criterion says restart does.
+        Arm: () => [
+          { count: 0 },
+          Command.stream(
+            Stream.fromEffect(
+              Effect.andThen(
+                Effect.sleep("20 millis"),
+                Effect.succeed({ _tag: "Go" as const, ms: 0, id: "second" }),
+              ),
+            ),
+          ),
         ],
       },
       render: () => null,
     });
 
     await Effect.runPromise(
-      feature.run(
-        [
-          { _tag: "Go", ms: 50, id: "first" },
-          { _tag: "Go", ms: 0, id: "second" },
-        ],
-        { props: {}, hooks: {}, layer },
-      ),
+      feature.run([{ _tag: "Go", ms: 200, id: "first" }, { _tag: "Arm" }], {
+        props: {},
+        hooks: {},
+        layer,
+      }),
     );
 
     const log = await Effect.runPromise(Ref.get(ref));
+    // The first was running...
+    expect(log).toContain("first:start");
+    // ...was interrupted rather than allowed to finish...
     expect(log).not.toContain("first:done");
+    expect(log).toContain("first:ensuring");
+    // ...and the restarting dispatch ran in its place.
     expect(log).toContain("second:done");
   });
 
