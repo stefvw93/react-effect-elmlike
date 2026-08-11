@@ -83,6 +83,19 @@ test("`Command.output` rejects an internal message, accepts an outbound one", ()
 
   expect(Command.output).type.not.toBeCallableWith(InternalFoo, {});
   expect(Command.output).type.toBeCallableWith(OutboundFoo, {});
+
+  // The payload is the message's fields minus `_tag`, so the discriminant
+  // comes from the message and never from the caller. Without these, the
+  // channel is checked but the thing being announced is not.
+  const OrderPlaced = Action.output("OrderPlaced", { orderId: Schema.String });
+
+  expect(Command.output).type.toBeCallableWith(OrderPlaced, { orderId: "order_1" });
+  expect(Command.output).type.not.toBeCallableWith(OrderPlaced, {});
+  expect(Command.output).type.not.toBeCallableWith(OrderPlaced, { orderId: 1 });
+  expect(Command.output).type.not.toBeCallableWith(OrderPlaced, {
+    _tag: "OrderPlaced",
+    orderId: "order_1",
+  });
 });
 
 // ---------------------------------------------------------------------------
