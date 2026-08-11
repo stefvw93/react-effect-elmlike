@@ -70,7 +70,27 @@ const LifecycleTags: Record<LifecycleTag, true> = {
   HookChanged: true,
 };
 
-const isLifecycleTag = (tag: string): tag is LifecycleTag => tag in LifecycleTags;
+/**
+ * `Object.hasOwn` rather than `in`, and the same for the reducer lookup at both
+ * call sites — because both objects inherit from `Object.prototype` and both
+ * lookups would otherwise resolve keys nobody declared.
+ *
+ * `"toString" in LifecycleTags` is `true`, so an action tagged `"toString"`
+ * would be treated as a lifecycle action and silently no-op. Worse,
+ * `reducer["constructor"]` resolves to `Object`, which is truthy, so it would
+ * be *called* as a handler and its return value used as the next state.
+ * Neither is a declared handler and neither is a `LifecycleTag`, so both have
+ * to reach the throw.
+ *
+ * Only reachable by bypassing the typed surface — a bad cast, a malformed
+ * devtools replay — which is exactly the case that branch exists to catch, and
+ * the case where failing loudly matters most.
+ */
+const isLifecycleTag = (tag: string): tag is LifecycleTag => Object.hasOwn(LifecycleTags, tag);
+
+/** Own properties only. See `isLifecycleTag` for why. */
+const handlerFor = <Handler>(handlers: Record<string, Handler>, tag: string): Handler | undefined =>
+  Object.hasOwn(handlers, tag) ? handlers[tag] : undefined;
 
 /**
  * A message is a tagged struct and nothing more, in both directions. The
@@ -1137,7 +1157,7 @@ export const define: <
          * as calling `undefined` always did.
          */
         reduce: (action, snapshot) => {
-          const handler = parts.reducer[action._tag];
+          const handler = handlerFor(parts.reducer, action._tag);
           if (handler) return handler(action, snapshot);
           if (isLifecycleTag(action._tag)) return snapshot.state;
           throw new TypeError(`No reducer handler for action "${action._tag}"`);
@@ -1277,7 +1297,7 @@ export const define: <
 
                   if (isOutput(action)) return void outputs.push(action);
 
-                  const handler = parts.reducer[action._tag];
+                  const handler = handlerFor(parts.reducer, action._tag);
                   if (!handler) {
                     if (isLifecycleTag(action._tag)) return;
                     throw new TypeError(`No reducer handler for action "${action._tag}"`);

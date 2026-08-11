@@ -60,7 +60,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 
 - [x] `reduce` dispatches by `_tag` to the matching reducer handler (declared action or lifecycle action) and returns its `Next`.
 - [x] **Unhandled _lifecycle_ actions leave state unchanged and do not throw.** (Bug fix — see below.)
-- [ ] A missing handler for anything that is _not_ a lifecycle tag (reachable only by bypassing the typed `dispatch`/`reduce` surface, e.g. a bad cast) still throws — the no-op is specific to `LifecycleTag`, not "any missing handler." (Caught during `/review-step`: an earlier version of the fix no-opped unconditionally, silently swallowing this case too.)
+- [x] A missing handler for anything that is _not_ a lifecycle tag (reachable only by bypassing the typed `dispatch`/`reduce` surface, e.g. a bad cast) still throws — the no-op is specific to `LifecycleTag`, not "any missing handler." (Caught during `/review-step`: an earlier version of the fix no-opped unconditionally, silently swallowing this case too.) **Also covers inherited `Object.prototype` keys — see below.**
 - [ ] Dispatching `{ _tag: "Unmounted" }` runs the `Unmounted` handler if declared but the _returned state_ is discarded — only its command matters. (Testable directly via `reduce`, no mounting required.)
 
 ### `define(...).create(...)` → `Blueprint.run`
@@ -91,6 +91,21 @@ widening it. A missing handler for anything else still throws, exactly as it
 did before: every declared action tag is required in `reducer` by `Reducer`'s
 type, so reaching that branch means the action bypassed the typed surface,
 and swallowing it silently would trade one bug for a harder-to-find one.
+
+### Second bug found by this pass: prototype-chain tags bypassed the throw
+
+Both lookups on the missing-handler path walked the prototype chain.
+`parts.reducer[action._tag]` resolved `"constructor"` to `Object` — truthy, so
+it was _called_ as a handler and its return value used as the next state — and
+`isLifecycleTag`'s `tag in LifecycleTags` was `true` for `"toString"`,
+`"valueOf"` and every other `Object.prototype` key, so those silently no-opped
+instead of throwing. Either way the documented "this still throws" branch was
+unreachable for that whole family of tags.
+
+Fixed with `Object.hasOwn` at both sites (`isLifecycleTag`, and a shared
+`handlerFor` used by `reduce` and `run`'s `step`). Only reachable by bypassing
+the typed surface — a bad cast, a malformed devtools replay — which is exactly
+what that branch exists to catch, and where failing loudly matters most.
 
 ### Type-level guards (exercised via TSTyche, not vitest)
 

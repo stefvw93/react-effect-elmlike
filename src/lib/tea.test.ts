@@ -337,6 +337,20 @@ describe("Blueprint.reduce", () => {
     expect(() => counter.reduce(bogus, at(10))).toThrow(/No reducer handler/);
   });
 
+  it("a tag inherited from Object.prototype is still a missing handler, and throws", () => {
+    // `Object.prototype` keys are the adversarial case for both lookups in
+    // `reduce`: `parts.reducer[tag]` resolves `constructor`/`toString` to
+    // inherited functions, and `tag in LifecycleTags` is true for them too.
+    // Neither is a declared handler and none is a `LifecycleTag`, so each has
+    // to reach the throw — this is exactly the "bypassed the typed surface"
+    // case the criterion is about, and the shape a malformed devtools replay
+    // would take.
+    for (const tag of ["constructor", "toString", "valueOf", "hasOwnProperty"]) {
+      const bogus = { _tag: tag } as unknown as Parameters<typeof counter.reduce>[0];
+      expect(() => counter.reduce(bogus, at(10))).toThrow(/No reducer handler/);
+    }
+  });
+
   it("Unmounted discards the handler's returned state; only its command matters", () => {
     const WithUnmount = Counter.create({
       initialState: (props) => ({ count: props.start }),
