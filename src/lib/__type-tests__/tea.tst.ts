@@ -268,6 +268,34 @@ test("`Exhaustive` catches a reducer handler returning an unknown state key", ()
   expect<Exhaustive<BadHandlers, TestState>>().type.toBe<{
     readonly Inc: "state has no property lmao";
   }>();
+
+  // The synthetic types above cannot show the guard is attached where it has
+  // to run. It exists precisely because TypeScript's own excess-property check
+  // does *not* fire through an inferred return type — an unannotated handler
+  // returning `{ count, lmao }` type-checks on its own — so the only thing
+  // standing between that and a compiling feature is the intersection on
+  // `create`'s `reducer` parameter.
+  const Defined = define({
+    props: Schema.Struct({}),
+    state: Schema.Struct({ count: Schema.Number }),
+    action: Action.of([Action("Inc", {})]),
+  });
+
+  expect(Defined.create).type.toBeCallableWith({
+    initialState: () => ({ count: 0 }),
+    reducer: { Inc: (_action: unknown, snapshot: { state: TestState }) => snapshot.state },
+    render: () => null,
+  });
+
+  expect(Defined.create).type.not.toBeCallableWith({
+    initialState: () => ({ count: 0 }),
+    reducer: { Inc: () => ({ count: 1, lmao: 5 }) },
+    render: () => null,
+  });
+
+  // `Definition.reducer` carries the same guard, for reducers written in their
+  // own file rather than inline.
+  expect(Defined.reducer).type.not.toBeCallableWith({ Inc: () => ({ count: 1, lmao: 5 }) });
 });
 
 // ---------------------------------------------------------------------------
