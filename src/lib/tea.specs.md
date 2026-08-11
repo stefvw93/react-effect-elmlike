@@ -61,7 +61,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 - [x] `reduce` dispatches by `_tag` to the matching reducer handler (declared action or lifecycle action) and returns its `Next`.
 - [x] **Unhandled _lifecycle_ actions leave state unchanged and do not throw.** (Bug fix — see below.)
 - [x] A missing handler for anything that is _not_ a lifecycle tag (reachable only by bypassing the typed `dispatch`/`reduce` surface, e.g. a bad cast) still throws — the no-op is specific to `LifecycleTag`, not "any missing handler." (Caught during `/review-step`: an earlier version of the fix no-opped unconditionally, silently swallowing this case too.) **Also covers inherited `Object.prototype` keys — see below.**
-- [ ] Dispatching `{ _tag: "Unmounted" }` runs the `Unmounted` handler if declared but the _returned state_ is discarded — only its command matters. (Testable directly via `reduce`, no mounting required.)
+- [!] Dispatching `{ _tag: "Unmounted" }` runs the `Unmounted` handler if declared but the _returned state_ is discarded — only its command matters. (Testable directly via `reduce`, no mounting required.) — **Not true of `reduce`:** it returns the handler's `Next` verbatim (verified: `{ count: 999 }`, not the snapshot's state); only `run`'s `step` discards, via `if (action._tag !== "Unmounted")`. Needs a decision — see below.
 
 ### `define(...).create(...)` → `Blueprint.run`
 
@@ -106,6 +106,39 @@ Fixed with `Object.hasOwn` at both sites (`isLifecycleTag`, and a shared
 `handlerFor` used by `reduce` and `run`'s `step`). Only reachable by bypassing
 the typed surface — a bad cast, a malformed devtools replay — which is exactly
 what that branch exists to catch, and where failing loudly matters most.
+
+### Open decision: `reduce` and `run` disagree about `Unmounted`
+
+`run`'s `step` discards the state an `Unmounted` handler returns; `reduce`
+returns it. Both are in this library, so this is not a userland replica
+drifting — it is the library disagreeing with itself about the one action
+whose contract is "the state has nowhere to go".
+
+That matters because `reduce`'s own JSDoc sells it as the way to test teardown
+"without mounting anything". A test that folds `Unmounted` through `reduce`
+sees `{ count: 999 }`; the same feature under `run` sees the state before it.
+Whichever is right, the two should not answer differently.
+
+Two ways out, and it is a design call rather than a bug fix:
+
+1. **`reduce` discards too** — returns `[snapshot.state, command]` for
+   `Unmounted`. Makes the criterion true as written and makes `reduce` a
+   faithful model of the runtime. Costs: `reduce` stops being a plain
+   "look up the handler and return what it said", and the handler's returned
+   state becomes unobservable anywhere.
+2. **Drop the parenthetical** — the discard is a _runtime_ fact, and `reduce`
+   is documented as returning the handler's `Next` verbatim (which is what the
+   `reduce` routing criterion above now asserts for `Mounted`). Costs: the
+   library keeps two answers, and callers have to know which one they are in.
+
+Option 2 is the smaller change and matches the existing test's comment, which
+already says the runtime is what discards. Option 1 is the one that removes a
+whole class of "my unit test disagreed with the runtime" bugs. Not decided
+here — flagged for the author.
+
+Coverage as it stands: the command half is asserted via `reduce`, and the
+discard is asserted via `run` ("Blueprint.run discards Unmounted's returned
+state"), so no behavior is untested — only the criterion's wording is wrong.
 
 ### Type-level guards (exercised via TSTyche, not vitest)
 
