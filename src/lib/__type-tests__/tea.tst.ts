@@ -195,6 +195,28 @@ test("`NoPropCollision` rejects a declared prop colliding with a derived `on<Tag
 
   expect<NoPropCollision<typeof NonCollidingProps, typeof Outputs>>().type.toBe<unknown>();
   expect<NoPropCollision<typeof CollidingProps, typeof Outputs>>().type.toBe<never>();
+
+  // Wired to `define`, not merely computing. The guard sits on `output`
+  // alongside `Disjoint`, so a mis-wiring shows up here and nowhere above.
+  const state = Schema.Struct({});
+  const Actions = Action.of([Action("Bar", {})]);
+
+  expect(define).type.toBeCallableWith({
+    props: NonCollidingProps,
+    state,
+    action: Actions,
+    output: Outputs,
+  });
+  expect(define).type.not.toBeCallableWith({
+    props: CollidingProps,
+    state,
+    action: Actions,
+    output: Outputs,
+  });
+
+  // And the collision is with the *derived* name specifically: `onFoo` is a
+  // perfectly good prop until an output called `Foo` exists to derive it.
+  expect(define).type.toBeCallableWith({ props: CollidingProps, state, action: Actions });
 });
 
 // ---------------------------------------------------------------------------

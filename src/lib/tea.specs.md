@@ -155,7 +155,7 @@ state"), so no behavior is untested — only the criterion's wording is wrong.
 ### Type-level guards (exercised via TSTyche, not vitest)
 
 - [x] `Disjoint<A, O>` is a compile error when an action tag and an output tag collide.
-- [ ] `NoPropCollision<PropsSchema, O>` is a compile error when a declared prop name collides with a derived `on<OutputTag>` name.
+- [x] `NoPropCollision<PropsSchema, O>` is a compile error when a declared prop name collides with a derived `on<OutputTag>` name.
 - [ ] `NoTransform<PropsSchema>` is a compile error when a props schema's `Encoded` differs from its `Type` (a transforming/decoding props schema).
 - [ ] `Exhaustive<U, State>` / `Excess<N, State>` catch a reducer handler returning a state object with a key not present in the declared state schema.
 - [ ] `ServiceOf`/`ServicesOf` union services across multiple reducer handlers' return types without collapsing to `never` (the exact regression this type exists to prevent).
