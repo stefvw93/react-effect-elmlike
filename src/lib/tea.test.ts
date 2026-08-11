@@ -456,6 +456,41 @@ describe("Blueprint.run", () => {
     expect(emitted).toEqual([{ _tag: "Bump" }]);
   });
 
+  it("emissions re-enter the loop transitively, not only once", async () => {
+    const Echo = Action("Echo", {});
+    const Done = Action("Done", {});
+    const Feature = define({
+      props: RunProps,
+      state: RunState,
+      action: Action.of([Bump, Echo, Done]),
+    });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Bump: (_action, { state }) => [
+          { count: state.count + 1 },
+          Command.stream(Stream.succeed({ _tag: "Echo" as const })),
+        ],
+        Echo: (_action, { state }) => [
+          { count: state.count + 10 },
+          Command.stream(Stream.succeed({ _tag: "Done" as const })),
+        ],
+        Done: (_action, { state }) => ({ count: state.count + 100 }),
+      },
+      render: () => null,
+    });
+
+    const { state, emitted } = await Effect.runPromise(
+      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer: Layer.empty }),
+    );
+
+    // Depth two. An interpreter that stepped a command's emissions but not
+    // *their* commands would stop at 11 with `[Echo]` — which is what a single
+    // drain pass looks like, and what the existing depth-one test accepts.
+    expect(state).toEqual({ count: 111 });
+    expect(emitted).toEqual([{ _tag: "Echo" }, { _tag: "Done" }]);
+  });
+
   it("outputs land in `outputs`, never in `emitted`, and never re-enter the reducer", async () => {
     const Feature = define({
       props: RunProps,

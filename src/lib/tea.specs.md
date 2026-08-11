@@ -66,7 +66,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 ### `define(...).create(...)` → `Blueprint.run`
 
 - [x] Seeded actions (from the `actions` iterable passed to `run`) are processed but are not themselves recorded in `emitted`.
-- [ ] Actions/outputs a command's effect/stream emits during the run are fed back into the reducer loop.
+- [x] Actions/outputs a command's effect/stream emits during the run are fed back into the reducer loop.
 - [ ] `emitted` collects every non-output action that arrived via a command (not seed actions, not outputs).
 - [ ] `outputs` collects every message whose tag is in the declared output vocabulary's `cases`; an output never re-enters the reducer and never appears in `emitted`.
 - [ ] `Command.batch` members run independently — each keeps its own concurrency group/policy.
