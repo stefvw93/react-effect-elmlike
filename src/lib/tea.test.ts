@@ -709,6 +709,44 @@ describe("Blueprint.run", () => {
     expect(log).not.toContain("second:done");
   });
 
+  it("outermost wins in the other arrangement too — outer restart over inner ignore", async () => {
+    const { ref, layer } = makeLogLayer();
+    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Go]) });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Go: (action) => [
+          { count: 0 },
+          // The mirror of the test above. One arrangement alone cannot tell
+          // "the outermost policy wins" apart from "ignore always wins", since
+          // both predict the same log. Here outer `restart` must beat inner
+          // `ignore`: the second dispatch interrupts the first rather than
+          // being dropped by it, which is the opposite outcome.
+          Command.effect(
+            Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
+          )
+            .pipe(Command.ignore("inner"))
+            .pipe(Command.restart("outer")),
+        ],
+      },
+      render: () => null,
+    });
+
+    await Effect.runPromise(
+      feature.run(
+        [
+          { _tag: "Go", ms: 200, id: "first" },
+          { _tag: "Go", ms: 0, id: "second" },
+        ],
+        { props: {}, hooks: {}, layer },
+      ),
+    );
+
+    const log = await Effect.runPromise(Ref.get(ref));
+    expect(log).not.toContain("first:done");
+    expect(log).toContain("second:done");
+  });
+
   it("services requested by a command are satisfied from options.layer", async () => {
     const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
     const feature = Feature.create({
