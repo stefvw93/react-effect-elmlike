@@ -772,15 +772,36 @@ describe("Blueprint.run", () => {
     const Feature = define({
       props: RunProps,
       state: RunState,
-      action: Action.of([Go, Action("Stop", { id: Schema.String })]),
+      action: Action.of([Go, Action("Stop", { id: Schema.String }), Action("Arm", {})]),
     });
     const feature = Feature.create({
       initialState: () => ({ count: 0 }),
       reducer: {
         Go: (action) => [
           { count: 0 },
-          Command.effect(Effect.andThen(Effect.sleep("30 millis"), push(`${action.id}:done`))).pipe(
-            Command.queue(action.id),
+          Command.effect(
+            Effect.ensuring(
+              Effect.andThen(
+                push(`${action.id}:start`),
+                Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
+              ),
+              push(`${action.id}:ensuring`),
+            ),
+          ).pipe(Command.queue(action.id)),
+        ],
+        // Delayed like the tag-only test, and for the same reason: a seeded
+        // `Stop` can be reached before either group has been scheduled, and
+        // "cancelled only group a" is not shown by killing a fiber that never
+        // ran.
+        Arm: () => [
+          { count: 0 },
+          Command.stream(
+            Stream.fromEffect(
+              Effect.andThen(
+                Effect.sleep("20 millis"),
+                Effect.succeed({ _tag: "Stop" as const, id: "a" }),
+              ),
+            ),
           ),
         ],
         Stop: (action) => [{ count: 0 }, Command.cancel({ tag: "Go", key: action.id })],
@@ -790,17 +811,20 @@ describe("Blueprint.run", () => {
 
     await Effect.runPromise(
       feature.run(
-        [
-          { _tag: "Go", ms: 0, id: "a" },
-          { _tag: "Go", ms: 0, id: "b" },
-          { _tag: "Stop", id: "a" },
-        ],
+        [{ _tag: "Go", ms: 200, id: "a" }, { _tag: "Go", ms: 60, id: "b" }, { _tag: "Arm" }],
         { props: {}, hooks: {}, layer },
       ),
     );
 
     const log = await Effect.runPromise(Ref.get(ref));
+    // Both were running when the cancel landed.
+    expect(log).toContain("a:start");
+    expect(log).toContain("b:start");
+    // Only `a`'s group was named, and only `a` was interrupted — its finalizer
+    // proves it got far enough to be interrupted rather than never started.
     expect(log).not.toContain("a:done");
+    expect(log).toContain("a:ensuring");
+    // The unnamed sibling ran to completion.
     expect(log).toContain("b:done");
   });
 

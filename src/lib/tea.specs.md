@@ -70,7 +70,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 - [x] `emitted` collects every non-output action that arrived via a command (not seed actions, not outputs).
 - [x] `outputs` collects every message whose tag is in the declared output vocabulary's `cases`; an output never re-enters the reducer and never appears in `emitted`. **`cases` is checked with `Object.hasOwn` — see the prototype-chain note below.**
 - [x] `Command.batch` members run independently — each keeps its own concurrency group/policy.
-- [ ] `Command.cancel({ tag })` (no `key`) interrupts every running group under that tag; `Command.cancel({ tag, key })` interrupts only that specific group.
+- [x] `Command.cancel({ tag })` (no `key`) interrupts every running group under that tag; `Command.cancel({ tag, key })` interrupts only that specific group.
 - [ ] Policy `"restart"`: a new dispatch into the same group interrupts the prior in-flight fiber.
 - [ ] Policy `"ignore"`: a new dispatch into the same group is dropped while one is already in-flight.
 - [ ] Policy `"queue"`: a new dispatch into the same group waits for the prior to settle before running; both eventually complete.
