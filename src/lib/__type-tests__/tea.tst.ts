@@ -363,11 +363,18 @@ test("`ServicesOf` unions services across handlers instead of collapsing to `nev
 // ---------------------------------------------------------------------------
 
 test("`OutputProps` derives one required `on<Tag>` prop per output, with `_tag` stripped", () => {
-  const Outputs = Action.of([Action.output("OrderPlaced", { orderId: Schema.String })]);
+  const Outputs = Action.of([
+    Action.output("OrderPlaced", { orderId: Schema.String }),
+    Action.output("Cancelled", { reason: Schema.String }),
+  ]);
   type Props = OutputProps<MemberOf<typeof Outputs>>;
 
+  // Two outputs, because "one per case" is exactly what a single-output
+  // assertion cannot show: a mapped type that collapsed the union to its first
+  // member would satisfy the old version of this test.
   expect<Props>().type.toBe<{
     readonly onOrderPlaced: (payload: { readonly orderId: string }) => void;
+    readonly onCancelled: (payload: { readonly reason: string }) => void;
   }>();
 
   expect<Props["onOrderPlaced"]>().type.toBeCallableWith({ orderId: "order_1" });
@@ -376,6 +383,18 @@ test("`OutputProps` derives one required `on<Tag>` prop per output, with `_tag` 
     _tag: "OrderPlaced",
     orderId: "order_1",
   });
+
+  // Required, not optional. This is the whole argument for per-output props
+  // over one `onOutput` handler: a parent that does not care has to write
+  // `onCancelled={() => {}}` and be visibly ignoring it, rather than
+  // announcing into the void by default.
+  expect<{
+    readonly onOrderPlaced: (payload: { readonly orderId: string }) => void;
+  }>().type.not.toBeAssignableTo<Props>();
+
+  // And it degrades to `{}` for a feature that declares no outputs, so the
+  // channel split stays free for a leaf feature.
+  expect<OutputProps<never>>().type.toBe<{}>();
 });
 
 // ---------------------------------------------------------------------------
