@@ -442,7 +442,7 @@ describe("Blueprint.run", () => {
     const Feature = define({
       props: RunProps,
       state: RunState,
-      action: Action.of([Go, Action("Stop", {})]),
+      action: Action.of([Go, Action("Stop", {}), Action("Arm", {})]),
     });
     const feature = Feature.create({
       initialState: () => ({ count: 0 }),
@@ -451,10 +451,30 @@ describe("Blueprint.run", () => {
           { count: 0 },
           Command.effect(
             Effect.ensuring(
-              Effect.andThen(Effect.sleep("50 millis"), push(`${action.id}:done`)),
+              Effect.andThen(
+                push(`${action.id}:start`),
+                Effect.andThen(Effect.sleep("200 millis"), push(`${action.id}:done`)),
+              ),
               push(`${action.id}:ensuring`),
             ),
           ).pipe(Command.queue(action.id)),
+        ],
+
+        /**
+         * `Stop` is emitted by a command rather than seeded, and that is
+         * load-bearing. Seeds are all offered to the queue up-front, and the
+         * drain loop can reach `Stop` before either forked fiber has been
+         * scheduled — so cancelling would interrupt fibers that never started,
+         * which is a different thing from interrupting a *running* group and
+         * leaves no finalizer trace to prove otherwise.
+         */
+        Arm: () => [
+          { count: 0 },
+          Command.stream(
+            Stream.fromEffect(
+              Effect.andThen(Effect.sleep("30 millis"), Effect.succeed({ _tag: "Stop" as const })),
+            ),
+          ),
         ],
         Stop: () => [{ count: 0 }, Command.cancel("Go")],
       },
@@ -463,14 +483,23 @@ describe("Blueprint.run", () => {
 
     await Effect.runPromise(
       feature.run(
-        [{ _tag: "Go", ms: 0, id: "a" }, { _tag: "Go", ms: 0, id: "b" }, { _tag: "Stop" }],
+        [{ _tag: "Go", ms: 0, id: "a" }, { _tag: "Go", ms: 0, id: "b" }, { _tag: "Arm" }],
         { props: {}, hooks: {}, layer },
       ),
     );
 
     const log = await Effect.runPromise(Ref.get(ref));
+    // Both groups were genuinely running when the cancel landed...
+    expect(log).toContain("a:start");
+    expect(log).toContain("b:start");
+    // ...neither completed...
     expect(log).not.toContain("a:done");
     expect(log).not.toContain("b:done");
+    // ...and both were interrupted rather than never scheduled. The two
+    // absences above are equally satisfied by work that never started; the
+    // finalizer only runs for a fiber that did.
+    expect(log).toContain("a:ensuring");
+    expect(log).toContain("b:ensuring");
   });
 
   it("Cancel by tag+key interrupts only that specific group", async () => {

@@ -46,7 +46,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 - [x] `Command.effect(effect)` wraps an `Effect` that runs for effects and emits nothing.
 - [x] `Command.stream(stream)` wraps a `Stream` whose emissions feed back into the reducer (or leave as outputs). _(Criterion is superseded by the pending command-leaf redesign — see below. Covered now so the routing behavior is pinned before the leaf changes.)_
 - [x] `Command.batch(...commands)` runs each member independently, each keeping its own policy.
-- [ ] `Command.cancel(target)` interrupts a running group, addressed by tag only or by `{ tag, key }`.
+- [x] `Command.cancel(target)` interrupts a running group, addressed by tag only or by `{ tag, key }`.
 - [ ] `Command.output(message, payload)` emits an outbound message as a one-shot stream; passing an internal message is a compile error.
 - [ ] `Command.restart(key?)`, `.ignore(key?)`, `.queue(key?)` wrap a command in a `Guarded` policy node; all three are `Pipeable` (`cmd.pipe(Command.restart())`).
 - [ ] Nesting `Guarded` wrappers: the outermost policy wins (an inner `Guarded` is not overridden if an outer one already set a policy for the same dispatch).
