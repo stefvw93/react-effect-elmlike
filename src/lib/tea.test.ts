@@ -98,6 +98,17 @@ describe("vocabularies", () => {
     expect(Object.keys(CartActions.cases).sort()).toEqual(
       ["CheckoutRequested", "Failed", "Started"].sort(),
     );
+
+    // Key presence alone would be satisfied by a placeholder. A flattened tag
+    // has to be a first-class case of the *outer* union — constructible and
+    // discriminable there — since `Reducer` keys off `cases` and a handler for
+    // `Failed` has to receive the inner member's own type.
+    expect(CartActions.cases.Failed.make({ reason: "boom" })).toEqual({
+      _tag: "Failed",
+      reason: "boom",
+    });
+    expect(CartActions.guards.Failed({ _tag: "Failed", reason: "boom" })).toBe(true);
+    expect(CartActions.guards.Failed({ _tag: "CheckoutRequested" })).toBe(false);
   });
 
   // Reserved lifecycle tags are rejected at compile time only — see
