@@ -989,7 +989,10 @@ describe("Blueprint.run", () => {
         Go: (action) => [
           { count: 0 },
           Command.effect(
-            Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
+            Effect.andThen(
+              push(`${action.id}:start`),
+              Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
+            ),
           ),
         ],
       },
@@ -999,7 +1002,7 @@ describe("Blueprint.run", () => {
     await Effect.runPromise(
       feature.run(
         [
-          { _tag: "Go", ms: 20, id: "first" },
+          { _tag: "Go", ms: 40, id: "first" },
           { _tag: "Go", ms: 0, id: "second" },
         ],
         { props: {}, hooks: {}, layer },
@@ -1007,8 +1010,13 @@ describe("Blueprint.run", () => {
     );
 
     const log = await Effect.runPromise(Ref.get(ref));
-    expect(log).toContain("first:done");
-    expect(log).toContain("second:done");
+    // "Both completed" is equally true under "queue", so it cannot show that
+    // the default is concurrent. The interleaving is what does: the second
+    // starts while the first is still sleeping and overtakes it. Under
+    // "queue" this same feature reads
+    // first:start, first:done, second:start, second:done — the exact inverse
+    // asserted by the test above.
+    expect(log).toEqual(["first:start", "second:start", "second:done", "first:done"]);
   });
 
   it("a nested Guarded policy does not override an outer one — outermost wins", async () => {
