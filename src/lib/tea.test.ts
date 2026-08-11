@@ -168,22 +168,31 @@ describe("Command", () => {
 
   it("restart/ignore/queue wrap a command in a Guarded node, and are pipeable", () => {
     const base = Command.none;
-    expect(base.pipe(Command.restart())).toMatchObject({
-      _tag: "Guarded",
-      policy: "restart",
-      command: { _tag: "None" },
-    });
-    expect(base.pipe(Command.ignore("sku-1"))).toMatchObject({
-      _tag: "Guarded",
-      policy: "ignore",
-      key: "sku-1",
-      command: { _tag: "None" },
-    });
-    expect(base.pipe(Command.queue())).toMatchObject({
-      _tag: "Guarded",
-      policy: "queue",
-      command: { _tag: "None" },
-    });
+    const wrappers = [
+      ["restart", Command.restart],
+      ["ignore", Command.ignore],
+      ["queue", Command.queue],
+    ] as const;
+
+    for (const [policy, wrap] of wrappers) {
+      const keyed = base.pipe(wrap("sku-1"));
+      expect(keyed).toMatchObject({
+        _tag: "Guarded",
+        policy,
+        key: "sku-1",
+        command: { _tag: "None" },
+      });
+
+      const unkeyed = base.pipe(wrap());
+      expect(unkeyed).toMatchObject({ _tag: "Guarded", policy, command: { _tag: "None" } });
+
+      // An omitted key has to stay `undefined`. `groupId` interpolates it into
+      // the group id, so a stray value would silently split one group into two
+      // and every policy would stop applying. `toMatchObject` cannot catch
+      // that — it ignores keys it was not given.
+      if (unkeyed._tag !== "Guarded") throw new TypeError("expected Guarded");
+      expect(unkeyed.key).toBeUndefined();
+    }
   });
 });
 

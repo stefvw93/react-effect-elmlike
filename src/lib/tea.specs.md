@@ -48,7 +48,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 - [x] `Command.batch(...commands)` runs each member independently, each keeping its own policy.
 - [x] `Command.cancel(target)` interrupts a running group, addressed by tag only or by `{ tag, key }`.
 - [x] `Command.output(message, payload)` emits an outbound message as a one-shot stream; passing an internal message is a compile error. _(Criterion is superseded by the pending command-leaf redesign — see below. Covered now so the payload contract is pinned before `dispatch` replaces it.)_
-- [ ] `Command.restart(key?)`, `.ignore(key?)`, `.queue(key?)` wrap a command in a `Guarded` policy node; all three are `Pipeable` (`cmd.pipe(Command.restart())`).
+- [x] `Command.restart(key?)`, `.ignore(key?)`, `.queue(key?)` wrap a command in a `Guarded` policy node; all three are `Pipeable` (`cmd.pipe(Command.restart())`).
 - [ ] Nesting `Guarded` wrappers: the outermost policy wins (an inner `Guarded` is not overridden if an outer one already set a policy for the same dispatch).
 
 ### `Next` accessors
