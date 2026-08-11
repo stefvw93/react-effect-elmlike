@@ -202,8 +202,18 @@ describe("Command", () => {
 
 describe("Next", () => {
   it("state() reads through a bare state or a [state, command] tuple", () => {
-    expect(Next.state({ count: 1 })).toEqual({ count: 1 });
-    expect(Next.state([{ count: 1 }, Command.none])).toEqual({ count: 1 });
+    const state = { count: 1 };
+
+    expect(Next.state(state)).toEqual({ count: 1 });
+    expect(Next.state([state, Command.none])).toEqual({ count: 1 });
+
+    // Identity, not merely equality. `PropsChanged` fires on every
+    // ancestor-driven render and its documented no-op is "return the same
+    // state reference" — so an accessor that copied, or that rebuilt the
+    // object on the way out, would make that contract unexpressible and turn
+    // every prop change into a state change.
+    expect(Next.state(state)).toBe(state);
+    expect(Next.state([state, Command.none])).toBe(state);
   });
 
   it("command() is undefined for bare state, present for a tuple", () => {
