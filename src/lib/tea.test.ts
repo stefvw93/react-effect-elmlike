@@ -1316,6 +1316,33 @@ describe("Blueprint.run", () => {
     expect(state).toEqual({ count: 1 });
   });
 
+  it("the snapshot handed to a handler carries only state, props and hooks", async () => {
+    // `run` builds its snapshot from the whole `options` object, which also
+    // holds `layer`. A fourth key is invisible to the type — excess-property
+    // checking does not fire on a non-fresh spread — and harmless to read, but
+    // it puts a `Layer` on the one object this file claims is entirely
+    // encodable, and a cast reaches it from userland.
+    const seen: ReadonlyArray<string>[] = [];
+
+    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Bump: (_action, snapshot) => {
+          seen.push(Object.keys(snapshot).sort());
+          return { count: snapshot.state.count + 1 };
+        },
+      },
+      render: () => null,
+    });
+
+    await Effect.runPromise(
+      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer: Layer.empty }),
+    );
+
+    expect(seen).toEqual([["hooks", "props", "state"]]);
+  });
+
   it("an unhandled lifecycle action in run() leaves state unchanged and does not throw", async () => {
     const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
     const feature = Feature.create({

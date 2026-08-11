@@ -1209,7 +1209,13 @@ export const define: <
               const groups = yield* Ref.make(new Map<string, ReadonlyArray<Fiber.Fiber<void>>>());
               const emitted: { _tag: string }[] = [];
               const outputs: { _tag: string }[] = [];
-              const snapshot = { ...options };
+              // Named fields rather than `{ ...options }`: `options` also
+              // carries `layer`, and spreading it whole put a `Layer` on every
+              // handler's `Snapshot`. The type never saw it — excess-property
+              // checking does not fire on a non-fresh spread — so the object
+              // this file elsewhere describes as entirely encodable was
+              // carrying the one value in the API that cannot be.
+              const snapshot = { props: options.props, hooks: options.hooks };
               let state = parts.initialState(options.props);
 
               for (const action of actions) {
