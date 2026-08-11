@@ -218,7 +218,14 @@ describe("Next", () => {
 
   it("command() is undefined for bare state, present for a tuple", () => {
     expect(Next.command({ count: 1 })).toBeUndefined();
-    expect(Next.command([{ count: 1 }, Command.none])).toBe(Command.none);
+
+    // A fresh instance rather than the `Command.none` singleton. `toBe`
+    // against a module-level constant is also satisfied by an accessor that
+    // returns that constant unconditionally, which is exactly the bug that
+    // would make every command a no-op.
+    const command = Command.effect(Effect.void);
+    expect(Next.command([{ count: 1 }, command])).toBe(command);
+    expect(Next.command([{ count: 1 }, command])).not.toBe(Command.none);
   });
 });
 

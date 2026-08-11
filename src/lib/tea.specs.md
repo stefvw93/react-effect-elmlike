@@ -54,7 +54,7 @@ invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
 ### `Next` accessors
 
 - [x] `Next.state(next)` returns the state whether `next` is a bare state or a `[state, command]` tuple.
-- [ ] `Next.command(next)` returns the command for a tuple, `undefined` for a bare state.
+- [x] `Next.command(next)` returns the command for a tuple, `undefined` for a bare state.
 
 ### `define(...).create(...)` → `Blueprint.reduce`
 
