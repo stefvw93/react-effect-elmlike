@@ -1335,8 +1335,6 @@ export const define: <
                 Effect.gen(function* () {
                   if (origin === "settled") return;
 
-                  yield* Effect.log("step", action);
-
                   if (isOutput(action)) return void outputs.push(action);
 
                   const handler = handlerFor(parts.reducer, action._tag);

@@ -6,7 +6,7 @@
  * covered here.
  */
 
-import { Cause, Context, Effect, Layer, Ref, Schema, Stream } from "effect";
+import { Cause, Context, Effect, Layer, Logger, Ref, Schema, Stream } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 import { Action, Command, define, Next } from "./tea";
 
@@ -1341,6 +1341,30 @@ describe("Blueprint.run", () => {
     );
 
     expect(seen).toEqual([["hooks", "props", "state"]]);
+  });
+
+  it("run() logs nothing of its own", async () => {
+    // `run` is a test helper, so anything it logs lands in the output of every
+    // suite that folds a feature through it — and the default logger does the
+    // formatting work whether or not anyone reads it. A regression here is a
+    // debug line left behind, which is exactly how the first one arrived.
+    const captured: unknown[] = [];
+    const capture = Logger.make(({ message }) => void captured.push(message));
+
+    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: { Bump: (_action, { state }) => ({ count: state.count + 1 }) },
+      render: () => null,
+    });
+
+    await Effect.runPromise(
+      feature
+        .run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer: Layer.empty })
+        .pipe(Effect.provide(Logger.layer([capture]))),
+    );
+
+    expect(captured).toEqual([]);
   });
 
   it("an unhandled lifecycle action in run() leaves state unchanged and does not throw", async () => {

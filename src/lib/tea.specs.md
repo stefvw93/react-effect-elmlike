@@ -166,7 +166,7 @@ criterion above — which is why they are here rather than in the two
 bug sections. Both are one-line fixes with a test each.
 
 - [x] `run`'s snapshot leaks `layer` into every handler. `const snapshot = { ...options }` spread `options` whole — `{ props, hooks, layer }` — so `{ ...snapshot, state }` handed each handler a `Snapshot` carrying a fourth key. Invisible to the type (excess-property checking does not fire on a non-fresh spread) and harmless to read, but it put a `Layer` on the one object this file elsewhere claims is entirely encodable, and a cast reached it from userland. Fixed by naming the fields: `{ props: options.props, hooks: options.hooks }`. Asserted on the handler's own keys, since the leak is invisible to both the type and every existing assertion.
-- [ ] Stray `Effect.log("step", action)` in `run`'s `step`. Debug leftover — every action folded through `run` writes a log line, so any suite using `run` is noisy and the default logger runs work nobody asked for. Remove it. No test; its absence is the assertion, and the suite's own output is the tell.
+- [x] Stray `Effect.log("step", action)` in `run`'s `step`. Debug leftover — every action folded through `run` wrote a log line, so any suite using `run` was noisy and the default logger did formatting work nobody asked for. Removed. Contrary to this box's first wording ("no test; its absence is the assertion"), it _is_ directly testable: `Logger.layer([capture])` provided to the `run` effect replaces the logger set and collects what it emits, so the criterion is "`run` logs nothing of its own" — which also catches the next debug line somebody leaves behind, where a one-off deletion would not.
 
 ### Command leaf redesign (decided in _Design decisions_ below, not yet implemented)
 
