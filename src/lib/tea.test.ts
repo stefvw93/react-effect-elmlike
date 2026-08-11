@@ -6,7 +6,7 @@
  * covered here.
  */
 
-import { Cause, Context, Effect, Layer, Logger, Ref, Schema, Stream } from "effect";
+import { Cause, Context, Effect, Layer, Logger, Option, Ref, Schema, Stream } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 import { Action, Command, define, Next } from "./tea";
 
@@ -1365,6 +1365,41 @@ describe("Blueprint.run", () => {
     );
 
     expect(captured).toEqual([]);
+  });
+
+  it("run does not terminate while a command's stream never completes", async () => {
+    // Pins current behavior; it is not the desired behavior. `runGuarded`
+    // increments `inFlight` and only decrements after `Fiber.await` settles, so
+    // a stream that never completes holds it at 1, the quiescence break
+    // (`queueSize === 0 && inFlightCount === 0`) is never taken, and the drain
+    // loop blocks on `Queue.take`. The fix is the deferred `Cmd`/`Sub` split —
+    // see specs.md, Design decisions §3 — so this test exists to make that
+    // change visible when it lands rather than to pass today.
+    //
+    // The timeout is load-bearing: without it a plain `it` hangs the suite
+    // instead of failing it.
+    const runWith = (command: Command<never, never>) => {
+      const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
+      const feature = Feature.create({
+        initialState: () => ({ count: 0 }),
+        reducer: { Bump: () => [{ count: 1 }, command] as const },
+        render: () => null,
+      });
+
+      return Effect.runPromise(
+        feature
+          .run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer: Layer.empty })
+          .pipe(Effect.timeoutOption("100 millis")),
+      );
+    };
+
+    // Control first: the same harness on the same budget with a stream that
+    // completes. Without it, a timeout assertion passes for any reason at all —
+    // including a broken harness that never ran the feature.
+    expect(Option.isSome(await runWith(Command.stream(Stream.empty)))).toBe(true);
+
+    // Subject: identical but for the stream, and it never settles.
+    expect(await runWith(Command.stream(Stream.never))).toEqual(Option.none());
   });
 
   it("an unhandled lifecycle action in run() leaves state unchanged and does not throw", async () => {
