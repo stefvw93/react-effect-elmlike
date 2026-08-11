@@ -160,7 +160,7 @@ state"), so no behavior is untested — only the criterion's wording is wrong.
 - [x] `Exhaustive<U, State>` / `Excess<N, State>` catch a reducer handler returning a state object with a key not present in the declared state schema.
 - [x] `ServiceOf`/`ServicesOf` union services across multiple reducer handlers' return types without collapsing to `never` (the exact regression this type exists to prevent).
 - [x] `OutputProps<Output>` derives one required `on<Tag>` prop per output case, with `_tag` stripped from the payload type.
-- [ ] `Command`'s `Pipeable` typing: `cmd.pipe(Command.restart())` preserves the command's `A` and `R` type parameters.
+- [x] `Command`'s `Pipeable` typing: `cmd.pipe(Command.restart())` preserves the command's `A` and `R` type parameters. **Includes the variance case the leaf redesign has to preserve — see below.**
 
 ## Design decisions — command leaf (pending, not yet implemented)
 

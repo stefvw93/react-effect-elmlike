@@ -416,4 +416,33 @@ test("a command's `A` and `R` survive a policy modifier via `.pipe`", () => {
   expect(guarded.pipe(Command.queue())).type.toBe<
     Command<{ readonly _tag: "X" }, PipeableFooService>
   >();
+
+  // Chained, since nesting is answerable at runtime (outermost wins) and the
+  // types have to survive it too.
+  expect(guarded.pipe(Command.restart("outer")).pipe(Command.ignore("inner"))).type.toBe<
+    Command<{ readonly _tag: "X" }, PipeableFooService>
+  >();
+});
+
+test("`Command` is covariant in `A`, so a narrow command satisfies a wide slot", () => {
+  // `Command.output(...)` produces `Command<OneTag>` and has to be returnable
+  // from a handler whose `Next` expects `Command<Emit<A, O>>`; `Command.none`
+  // is `Command<never>` and has to fit everywhere. Both rest on covariance in
+  // `A`, which nothing asserted.
+  //
+  // Pinned deliberately before the command-leaf redesign. Under the callback
+  // encoding `A` sits in a doubly-contravariant position, which composes back
+  // to covariant — so these assertions should survive that change unchanged,
+  // and this is the test that will say so rather than a re-derivation.
+  expect<Command<{ readonly _tag: "X" }>>().type.toBeAssignableTo<
+    Command<{ readonly _tag: "X" } | { readonly _tag: "Y" }>
+  >();
+
+  expect<Command<never>>().type.toBeAssignableTo<Command<{ readonly _tag: "X" }>>();
+
+  // Not the other way: a command emitting the wider union cannot stand in
+  // where only `X` is accepted.
+  expect<Command<{ readonly _tag: "X" } | { readonly _tag: "Y" }>>().type.not.toBeAssignableTo<
+    Command<{ readonly _tag: "X" }>
+  >();
 });
