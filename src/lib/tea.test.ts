@@ -1205,6 +1205,41 @@ describe("Blueprint.run", () => {
     expect(outputs).toEqual([]);
   });
 
+  it("services reach a stream command too, not only an effect command", async () => {
+    const { ref, layer } = makeLogLayer();
+    const Echo = Action("Echo", {});
+    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump, Echo]) });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        // The criterion names effect *and* stream, and only the effect half
+        // had a test. `R` is computed the same way for both — by walking
+        // handler return types — so a stream's requirement reaching the layer
+        // is a separate path worth pinning.
+        Bump: () => [
+          { count: 1 },
+          Command.stream(
+            Stream.fromEffect(
+              Effect.andThen(push("from-stream"), Effect.succeed({ _tag: "Echo" as const })),
+            ),
+          ),
+        ],
+        Echo: (_action, { state }) => ({ count: state.count + 10 }),
+      },
+      render: () => null,
+    });
+
+    const { state, emitted } = await Effect.runPromise(
+      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer }),
+    );
+
+    // The service was reachable from inside the stream...
+    expect(await Effect.runPromise(Ref.get(ref))).toEqual(["from-stream"]);
+    // ...and what it emitted still routed back through the reducer.
+    expect(state).toEqual({ count: 11 });
+    expect(emitted).toEqual([{ _tag: "Echo" }]);
+  });
+
   it("resolves only once quiescent, including a settle with no emission", async () => {
     const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
     const feature = Feature.create({
