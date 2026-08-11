@@ -128,9 +128,13 @@ describe("Command", () => {
     expect(Object.keys(Command.none).sort()).toEqual(["_tag", "pipe"]);
   });
 
-  it("effect wraps an Effect", () => {
-    const cmd = Command.effect(Effect.void);
+  it("effect wraps the Effect it was given", () => {
+    const inner = Effect.void;
+    const cmd = Command.effect(inner);
     expect(cmd).toMatchObject({ _tag: "Effect" });
+    // Wrapped, not adapted — `interpret` is the only thing that transforms it.
+    if (cmd._tag !== "Effect") throw new TypeError("expected Effect");
+    expect(cmd.effect).toBe(inner);
   });
 
   it("stream wraps a Stream", () => {
@@ -636,6 +640,40 @@ describe("Blueprint.run", () => {
 
     const log = await Effect.runPromise(Ref.get(ref));
     expect(log).toEqual(["via-layer"]);
+  });
+
+  it("Command.effect runs for effects and emits nothing, even when it succeeds with an action", async () => {
+    const { ref, layer } = makeLogLayer();
+    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        // Guarded on `count` so that a regression fails the assertions below
+        // rather than emitting `Bump` forever and hanging the suite.
+        Bump: (_action, { state }) =>
+          state.count === 0
+            ? [
+                { count: 1 },
+                // Succeeds *with a well-formed action*. `interpret` wraps the
+                // effect in `Effect.asVoid`, so the success value is discarded
+                // rather than offered to the queue — an effect command has no
+                // emission channel, only the `R` it asked for.
+                Command.effect(
+                  Effect.andThen(push("ran"), Effect.succeed({ _tag: "Bump" as const })),
+                ),
+              ]
+            : { count: state.count + 1 },
+      },
+      render: () => null,
+    });
+
+    const { state, emitted } = await Effect.runPromise(
+      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer }),
+    );
+
+    expect(await Effect.runPromise(Ref.get(ref))).toEqual(["ran"]);
+    expect(state).toEqual({ count: 1 });
+    expect(emitted).toEqual([]);
   });
 
   it("Command.none is interpreted as a no-op and does not hold up quiescence", async () => {
