@@ -1,3 +1,24 @@
+## TDD Workflow
+
+Every feature follows this 8-step cycle. Each step is a project skill (detail lives in `.claude/skills/<name>/SKILL.md`):
+
+`/spec → /mock → /type-tests → /unit-test → /implement → /e2e → /review-step → /document`
+
+1. `/spec`: interactive Q&A (one question at a time), then co-located `specs.md` (Overview & Purpose + Acceptance Criteria required). User approves before moving on.
+2. `/mock`: `declare`-based full API surface in the real source file (`src/lib/*.ts` or `src/examples/*.tsx`), JSDoc included. Refuses to run without `specs.md`.
+3. `/type-tests`: TSTyche tests at `src/**/__type-tests__/*.tst.ts` (`expect().type` matchers) run via `vp exec tstyche`, or explicit `type-tests: not applicable, <reason>` recorded in `specs.md`.
+4. `/unit-test`: co-located `*.test.ts` covering every acceptance criterion, happy + error paths (full Effect error union), edge cases. **Red phase:** new tests must fail against the mocks before implementation.
+5. `/implement`: replace mocks in-place with signature parity, loop `vp check --fix` → `vp check` → `vp test` until green.
+6. `/e2e`: `*.browser.test.tsx` via `vp test --config vitest.browser.config.ts`. Mandatory for every touched `src/examples/*.tsx` demo; conditional for `src/lib` features (explicit skip recorded otherwise, e.g. pure reducer logic that jsdom/type-level tests already cover).
+7. `/review-step`: code-review pass (medium effort; high when `src/lib` is touched) plus spec-conformance check; every finding fixed or explicitly rejected with reason; loop until clean. **Hard gate: no commit until clean.**
+8. `/document`: JSDoc sync, `specs.md` sync, root `README.md` sync only if `src/lib`'s public surface changed — done directly by the main thread, no docs-authoring subagent. **Hard gate: no commit until complete.** Then branch + PR, never push `main`.
+
+Invariants:
+
+- Strict cycle: no phase skips; a step skipped as not-applicable must be recorded in `specs.md` with a reason.
+- Pause rule: if any step reveals the spec or mock surface is wrong, stop, update spec + mocks (and affected tests) first, then resume.
+- Single package, no monorepo `pack` step: bare `vp check` / `vp test` are always correct here — no `vp run <task>` indirection to reach for.
+
 <!--VITE PLUS START-->
 
 # Using Vite+, the Unified Toolchain for the Web

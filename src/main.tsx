@@ -1,48 +1,64 @@
-import { StrictMode } from "react";
-import { createRoot } from "react-dom/client";
-import { Effect, Schema } from "effect";
-import { Program } from "./lib";
+import { Effect, Layer, Schema } from "effect";
+import { Action, define } from "./lib";
 
-const App = Program.make({
-  model: Schema.Struct({
-    count: Schema.Number,
-  }),
+const Props = Schema.Struct({
+  start: Schema.Number,
+  step: Schema.Number,
+});
 
-  message: [
-    Schema.TaggedStruct("Inc", { by: Schema.Number }),
-    Schema.TaggedStruct("Dec", { by: Schema.Number }),
-    Schema.TaggedStruct("Reset", {}),
-  ],
+const State = Schema.Struct({
+  count: Schema.Number,
+});
 
-  view: (model, dispatch) => (
-    <main>
-      <div>
-        <button type="button" onClick={() => dispatch({ _tag: "Dec", by: 1 })}>
-          - 1
-        </button>
-        <output>count is {model.count}</output>
-        <button type="button" onClick={() => dispatch({ _tag: "Inc", by: 1 })}>
-          + 1
-        </button>
-      </div>
+const Incremented = Action("Incremented", {});
+const Decremented = Action("Decremented", {});
+const CounterAction = Action.of([Incremented, Decremented]);
 
-      <button type="button" onClick={() => dispatch({ _tag: "Reset" })}>
-        reset
-      </button>
-    </main>
-  ),
-}).pipe((program) =>
-  Program.init(program, {
-    update: {
-      Inc: (msg, model) => Effect.succeed({ count: model.count + msg.by }),
-      Dec: (msg, model) => Effect.succeed({ count: model.count - msg.by }),
-      Reset: () => Effect.succeed({ count: 0 }),
+const CounterBlueprint = define({
+  props: Props,
+  state: State,
+  action: CounterAction,
+});
+
+const initialState = CounterBlueprint.initialState((props) => ({ count: props.start }));
+
+const reducer = CounterBlueprint.reducer({
+  Incremented: (_action, { state, props }) => ({ count: state.count + props.step }),
+  Decremented: (_action, { state, props }) => ({ count: state.count - props.step }),
+});
+
+const render = CounterBlueprint.render(() => <></>);
+
+const counter = CounterBlueprint.create({
+  initialState,
+  reducer,
+  render,
+});
+
+console.log({ Counter: CounterBlueprint, created: counter });
+
+const props = { start: 0, step: 5 };
+const at = (count: number) => ({
+  state: { count },
+  props,
+  hooks: {},
+  initialState: { count: 0 },
+});
+
+export const one = [counter.reduce({ _tag: "Incremented" }, at(10))];
+
+void Effect.runPromise(
+  counter.run(
+    [
+      { _tag: "Incremented" },
+      { _tag: "Incremented" },
+      { _tag: "Incremented" },
+      { _tag: "Incremented" },
+    ],
+    {
+      props: { start: 0, step: 5 },
+      hooks: {},
+      layer: Layer.empty,
     },
-  }),
-);
-
-createRoot(document.getElementById("root")!).render(
-  <StrictMode>
-    <App count={0} />
-  </StrictMode>,
-);
+  ),
+).then(console.log);
