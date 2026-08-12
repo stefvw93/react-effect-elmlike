@@ -5,6 +5,7 @@ import {
   type AnyVocabulary,
   type ChannelOf,
   Command,
+  createRuntime,
   define,
   type Disjoint,
   type Exhaustive,
@@ -445,4 +446,102 @@ test("`Command` is covariant in `A`, so a narrow command satisfies a wide slot",
   expect<Command<{ readonly _tag: "X" } | { readonly _tag: "Y" }>>().type.not.toBeAssignableTo<
     Command<{ readonly _tag: "X" }>
   >();
+});
+
+// ---------------------------------------------------------------------------
+// React binding — `createRuntime` → `component`
+// ---------------------------------------------------------------------------
+
+declare const fooLayer: Layer.Layer<FooService>;
+declare const barFromFoo: Layer.Layer<BarService, never, FooService>;
+
+const OrderPlaced = Action.output("OrderPlaced", { orderId: Schema.String });
+
+const Cart = define({
+  props: Schema.Struct({ customerId: Schema.String }),
+  state: Schema.Struct({ count: Schema.Number }),
+  action: Action.of([Action("Added", {})]),
+  output: Action.of([OrderPlaced]),
+});
+
+const cart = Cart.create({
+  initialState: () => ({ count: 0 }),
+  reducer: { Added: (_action, snapshot) => snapshot.state },
+  render: () => null,
+});
+
+test("`component` merges declared props with one required `on<Tag>` prop per output", () => {
+  const Feature = createRuntime(Layer.empty).component(cart);
+
+  expect(Feature).type.toBeCallableWith({
+    customerId: "c1",
+    onOrderPlaced: (payload: { readonly orderId: string }) => void payload.orderId,
+  });
+
+  // Required, not optional. This is the whole argument for per-output props
+  // over a single `onOutput`: the exhaustiveness check lands at the JSX call
+  // site, in every parent, whether or not anyone wrote an exhaustive switch.
+  expect(Feature).type.not.toBeCallableWith({ customerId: "c1" });
+
+  // Declared props are still checked, and still required.
+  expect(Feature).type.not.toBeCallableWith({ onOrderPlaced: () => {} });
+
+  // `_tag` is stripped from the payload — the prop name already carries it.
+  expect<Parameters<Parameters<typeof Feature>[0]["onOrderPlaced"]>[0]>().type.toBe<{
+    readonly orderId: string;
+  }>();
+});
+
+test("`component` is closed over the root's `R`", () => {
+  const needsFoo = define({
+    props: Schema.Struct({}),
+    state: Schema.Struct({ count: Schema.Number }),
+    action: Action.of([Action("A", {})]),
+  }).create({
+    initialState: () => ({ count: 0 }),
+    reducer: { A: () => [{ count: 1 }, Command.effect(fooEffect)] as const },
+    render: () => null,
+  });
+
+  // The DI guarantee a bare `<Provider>` would throw away: a feature needing a
+  // service the root does not provide is a compile error at `component`, not a
+  // runtime failure on first dispatch.
+  expect(createRuntime(Layer.empty).component).type.not.toBeCallableWith(needsFoo);
+
+  // Positive control, so the rejection above is attributable to `R` rather
+  // than to some unrelated mismatch in the blueprint's shape.
+  expect(createRuntime(fooLayer).component).type.toBeCallableWith(needsFoo);
+
+  // A feature may bring its own layer; the root must cover the residue. `Bar`
+  // is supplied here, `Foo` by the root.
+  const needsBoth = define({
+    props: Schema.Struct({}),
+    state: Schema.Struct({ count: Schema.Number }),
+    action: Action.of([Action("A", {}), Action("B", {})]),
+  }).create({
+    initialState: () => ({ count: 0 }),
+    reducer: {
+      A: () => [{ count: 1 }, Command.effect(fooEffect)] as const,
+      B: () => [{ count: 1 }, Command.effect(barEffect)] as const,
+    },
+    render: () => null,
+  });
+
+  expect(createRuntime(fooLayer).component).type.toBeCallableWith(needsBoth, {
+    layer: barFromFoo,
+  });
+
+  // The residue is not a free pass: a root providing nothing still fails, because
+  // `barFromFoo` itself requires `FooService`.
+  expect(createRuntime(Layer.empty).component).type.not.toBeCallableWith(needsBoth, {
+    layer: barFromFoo,
+  });
+});
+
+test("a blueprint's string-keyed surface stays exactly `reduce` and `run`", () => {
+  // The internals slot `component` reads is symbol-keyed, so it cannot be
+  // reached by name from userland and cannot collide with a future method.
+  // Asserted on the string keys specifically: a slot added as a plain property
+  // would show up here, which is the regression this pins.
+  expect<Extract<keyof typeof cart, string>>().type.toBe<"reduce" | "run">();
 });

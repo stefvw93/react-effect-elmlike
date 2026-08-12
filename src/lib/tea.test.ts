@@ -6,9 +6,22 @@
  * covered here.
  */
 
-import { Cause, Context, Effect, Layer, Logger, Option, Ref, Schema, Stream } from "effect";
+import {
+  Cause,
+  Context,
+  Effect,
+  Equivalence,
+  Layer,
+  Logger,
+  ManagedRuntime,
+  Option,
+  Ref,
+  Schema,
+  SchemaParser,
+  Stream,
+} from "effect";
 import { describe, expect, it } from "vite-plus/test";
-import { Action, Command, define, Next } from "./tea";
+import { Action, Command, createFeatureStore, define, Next } from "./tea";
 
 // ---------------------------------------------------------------------------
 // Vocabularies (Action, Action.output, Action.of)
@@ -1433,5 +1446,1049 @@ describe("Blueprint.run", () => {
     await expect(
       Effect.runPromise(feature.run([bogus], { props: {}, hooks: {}, layer: Layer.empty })),
     ).rejects.toThrow(/No reducer handler/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// React binding — the headless half
+//
+// Everything here drives `createFeatureStore` directly. The store needs no DOM
+// (it is a state cell plus an Effect scope), so these are ordinary node tests;
+// render counts, error boundaries and paint belong to the browser suite.
+// ---------------------------------------------------------------------------
+
+describe("Blueprint internals slot", () => {
+  const feature = define({
+    props: Schema.Struct({ id: Schema.String }),
+    state: Schema.Struct({ count: Schema.Number }),
+    action: Action.of([Action("Bump", {})]),
+  }).create({
+    initialState: () => ({ count: 0 }),
+    reducer: { Bump: (_action, snapshot) => ({ count: snapshot.state.count + 1 }) },
+    render: () => null,
+  });
+
+  it("keeps `reduce` and `run` as the only enumerable surface", () => {
+    expect(Object.keys(feature).sort()).toEqual(["reduce", "run"]);
+  });
+
+  it("carries the pieces `component` needs behind a symbol key", () => {
+    const [slot] = Object.getOwnPropertySymbols(feature).filter(
+      (symbol) => symbol.description === "@tea/internals",
+    );
+
+    // `declare const internals` emits nothing, so before the fix this symbol
+    // does not exist at all and `create` never wrote the slot.
+    expect(slot).toBeDefined();
+
+    const internals = (feature as unknown as Record<symbol, Record<string, unknown>>)[slot!];
+    expect(internals.initialState).toBeInstanceOf(Function);
+    expect(internals.render).toBeInstanceOf(Function);
+    expect(internals.props).toBeDefined();
+    expect(internals.outputTags).toEqual([]);
+  });
+
+  it("records the declared output tags", () => {
+    const withOutputs = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Bump", {})]),
+      output: Action.of([Action.output("Done", { at: Schema.Number })]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: { Bump: (_action, snapshot) => snapshot.state },
+      render: () => null,
+    });
+
+    const [slot] = Object.getOwnPropertySymbols(withOutputs).filter(
+      (symbol) => symbol.description === "@tea/internals",
+    );
+    const internals = (withOutputs as unknown as Record<symbol, Record<string, unknown>>)[slot!];
+    expect(internals.outputTags).toEqual(["Done"]);
+  });
+});
+
+/**
+ * `createFeatureStore` takes `ManagedRuntime<any, any>` because the real `R` is
+ * computed the way `ServicesOf` computes it and this scope cannot name it. A
+ * root providing nothing is `ManagedRuntime<never, never>`, and `never` does not
+ * convert to `any` directly, so the widening goes through `unknown`.
+ */
+const testRuntime = () =>
+  ManagedRuntime.make(Layer.empty) as unknown as ManagedRuntime.ManagedRuntime<any, any>;
+
+describe("createFeatureStore", () => {
+  const Props = Schema.Struct({ id: Schema.String });
+  const State = Schema.Struct({ count: Schema.Number, seen: Schema.Number });
+
+  type StoreProps = { readonly id: string };
+  type StoreState = { readonly count: number; readonly seen: number };
+
+  /** Every store in this block shares one root runtime; none of them need `R`. */
+  const makeRuntime = testRuntime;
+
+  const equivalence = {
+    props: Schema.toEquivalence(Props),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as {
+    props: Equivalence.Equivalence<StoreProps>;
+    hooks: Equivalence.Equivalence<Record<string, unknown>>;
+  };
+
+  const setup = (
+    overrides: {
+      readonly reducer?: Record<string, (action: any, snapshot: any) => any>;
+      readonly outputs?: ReadonlyArray<any>;
+      readonly props?: StoreProps;
+    } = {},
+  ) => {
+    const emitted: Array<{ readonly _tag: string }> = [];
+    const defects: Array<unknown> = [];
+
+    const blueprint = define({
+      props: Props,
+      state: State,
+      action: Action.of([Action("Bump", {}), Action("Echo", {})]),
+      ...(overrides.outputs ? { output: Action.of(overrides.outputs as any) } : {}),
+    } as any).create({
+      initialState: () => ({ count: 0, seen: 0 }),
+      reducer: overrides.reducer ?? {
+        Bump: (_action: unknown, snapshot: { state: StoreState }) => ({
+          ...snapshot.state,
+          count: snapshot.state.count + 1,
+        }),
+        Echo: (_action: unknown, snapshot: { state: StoreState }) => snapshot.state,
+      },
+      render: () => null,
+    } as any);
+
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: overrides.props ?? { id: "a" },
+      equivalence: equivalence as any,
+      runtime: makeRuntime(),
+      layer: undefined,
+      emit: (output) => void emitted.push(output),
+      defect: (error) => void defects.push(error),
+    });
+
+    return { store, emitted, defects };
+  };
+
+  it("starts from `initialState(props)`", () => {
+    const { store } = setup();
+    expect(store.getSnapshot()).toEqual({ count: 0, seen: 0 });
+  });
+
+  it("folds a dispatch synchronously and notifies subscribers", () => {
+    const { store } = setup();
+    let notified = 0;
+    store.subscribe(() => void notified++);
+
+    store.dispatch({ _tag: "Bump" } as never);
+
+    // Synchronous: readable on the very next line, with no await and no tick.
+    expect(store.getSnapshot()).toEqual({ count: 1, seen: 0 });
+    expect(notified).toBe(1);
+  });
+
+  it("keeps `getSnapshot` reference-stable between writes", () => {
+    const { store } = setup();
+    expect(store.getSnapshot()).toBe(store.getSnapshot());
+
+    const before = store.getSnapshot();
+    store.dispatch({ _tag: "Echo" } as never);
+    // The handler returned the same state object, so nothing moved.
+    expect(store.getSnapshot()).toBe(before);
+  });
+
+  it("unsubscribes", () => {
+    const { store } = setup();
+    let notified = 0;
+    const unsubscribe = store.subscribe(() => void notified++);
+    unsubscribe();
+    store.dispatch({ _tag: "Bump" } as never);
+    expect(notified).toBe(0);
+  });
+
+  it("keeps `dispatch` reference-stable, so a memoised child is not invalidated", () => {
+    const { store } = setup();
+    const first = store.dispatch;
+    store.dispatch({ _tag: "Bump" } as never);
+    expect(store.dispatch).toBe(first);
+  });
+});
+
+describe("createFeatureStore — sync", () => {
+  const Props = Schema.Struct({ id: Schema.String });
+
+  const equivalence = {
+    props: Schema.toEquivalence(Props),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as any;
+
+  const setup = () => {
+    const seen: Array<string> = [];
+
+    const blueprint = define({
+      props: Props,
+      state: Schema.Struct({ propsChanged: Schema.Number, hookChanged: Schema.Number }),
+      action: Action.of([Action("Bump", {})]),
+    }).create({
+      initialState: () => ({ propsChanged: 0, hookChanged: 0 }),
+      reducer: {
+        Bump: (_action, snapshot) => snapshot.state,
+        PropsChanged: (_action, snapshot) => {
+          seen.push("PropsChanged");
+          return { ...snapshot.state, propsChanged: snapshot.state.propsChanged + 1 };
+        },
+        HookChanged: (_action, snapshot) => {
+          seen.push("HookChanged");
+          return { ...snapshot.state, hookChanged: snapshot.state.hookChanged + 1 };
+        },
+      },
+      render: () => null,
+    });
+
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: { id: "a" },
+      equivalence,
+      runtime: testRuntime(),
+      layer: undefined,
+      emit: () => {},
+      defect: () => {},
+    });
+
+    return { store, seen };
+  };
+
+  it("seeds the baseline on the first call without raising", () => {
+    const { store, seen } = setup();
+    const state = store.sync({ id: "a" }, { online: true });
+    expect(seen).toEqual([]);
+    expect(state).toEqual({ propsChanged: 0, hookChanged: 0 });
+  });
+
+  it("returns the post-fold state, so the change paints on this render", () => {
+    const { store } = setup();
+    store.sync({ id: "a" }, {});
+
+    // The criterion that costs a render cycle if it fails: the value handed
+    // back already reflects the handler that the props change just ran.
+    const state = store.sync({ id: "b" }, {});
+    expect(state).toEqual({ propsChanged: 1, hookChanged: 0 });
+    expect(store.getSnapshot()).toBe(state);
+  });
+
+  it("compares props by value, not identity", () => {
+    const { store, seen } = setup();
+    store.sync({ id: "a" }, {});
+
+    // A fresh object every render is what React actually hands a component;
+    // identity comparison would raise `PropsChanged` on every single render.
+    store.sync({ id: "a" }, {});
+    store.sync({ id: "a" }, {});
+    expect(seen).toEqual([]);
+
+    store.sync({ id: "b" }, {});
+    expect(seen).toEqual(["PropsChanged"]);
+  });
+
+  it("compares hooks shallowly, one level deep", () => {
+    const { store, seen } = setup();
+    const query = { data: 1 };
+    store.sync({ id: "a" }, { query, online: true });
+
+    // Same references, fresh record: no change.
+    store.sync({ id: "a" }, { query, online: true });
+    expect(seen).toEqual([]);
+
+    // One reference moved.
+    store.sync({ id: "a" }, { query: { data: 1 }, online: true });
+    expect(seen).toEqual(["HookChanged"]);
+  });
+
+  it("is idempotent, so a discarded render costs nothing", () => {
+    const { store, seen } = setup();
+    store.sync({ id: "a" }, {});
+
+    // StrictMode/Suspense re-run the render body with the same values.
+    const first = store.sync({ id: "b" }, {});
+    const second = store.sync({ id: "b" }, {});
+    expect(seen).toEqual(["PropsChanged"]);
+    expect(second).toBe(first);
+  });
+});
+
+describe("createFeatureStore — lifecycle", () => {
+  const equivalence = {
+    props: Schema.toEquivalence(Schema.Struct({})),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as any;
+
+  const setup = (reducer: Record<string, any>) => {
+    const log: Array<string> = [];
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Bump", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: reducer as any,
+      render: () => null,
+    });
+
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: undefined,
+      emit: () => {},
+      defect: () => {},
+    });
+
+    return { store, log };
+  };
+
+  it("raises `Mounted` on start and `Unmounted` on stop", () => {
+    const log: Array<string> = [];
+    const { store } = setup({
+      Bump: (_a: unknown, s: any) => s.state,
+      Mounted: (_a: unknown, s: any) => {
+        log.push("Mounted");
+        return s.state;
+      },
+      Unmounted: (_a: unknown, s: any) => {
+        log.push("Unmounted");
+        return s.state;
+      },
+    });
+
+    store.start();
+    expect(log).toEqual(["Mounted"]);
+    store.stop();
+    expect(log).toEqual(["Mounted", "Unmounted"]);
+  });
+
+  it("re-arms after stop, keeping state — the StrictMode remount path", () => {
+    const { store } = setup({
+      Bump: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+      Mounted: (_a: unknown, s: any) => s.state,
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    store.stop();
+    store.start();
+
+    // State survives the dev remount, and the store still works afterwards —
+    // a single `dispose` leaves a closed scope and this second dispatch is
+    // silently lost.
+    store.dispatch({ _tag: "Bump" } as never);
+    expect(store.getSnapshot()).toEqual({ count: 2 });
+  });
+
+  it("is idempotent on repeated start", () => {
+    const log: Array<string> = [];
+    const { store } = setup({
+      Bump: (_a: unknown, s: any) => s.state,
+      Mounted: (_a: unknown, s: any) => {
+        log.push("Mounted");
+        return s.state;
+      },
+    });
+
+    store.start();
+    store.start();
+    expect(log).toEqual(["Mounted"]);
+  });
+
+  it("discards the state an `Unmounted` handler returns", () => {
+    const { store } = setup({
+      Bump: (_a: unknown, s: any) => s.state,
+      Unmounted: () => ({ count: 999 }),
+    });
+
+    store.start();
+    store.stop();
+    expect(store.getSnapshot()).toEqual({ count: 0 });
+  });
+});
+
+describe("createFeatureStore — outputs", () => {
+  const Done = Action.output("Done", { at: Schema.Number });
+
+  const equivalence = {
+    props: Schema.toEquivalence(Schema.Struct({})),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as any;
+
+  it("routes a declared output through `emit` and never back into the reducer", async () => {
+    const folded: Array<string> = [];
+    const emitted: Array<{ readonly _tag: string }> = [];
+
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Bump", {})]),
+      output: Action.of([Done]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Bump: (_action, snapshot) => {
+          folded.push("Bump");
+          return [snapshot.state, Command.output(Done, { at: 1 })];
+        },
+      },
+      render: () => null,
+    });
+
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: undefined,
+      emit: (output) => void emitted.push(output),
+      defect: () => {},
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+
+    // Commands are Effects, so an output leaves on a fiber rather than on the
+    // dispatching stack. The fold is synchronous; what it *starts* is not.
+    await Effect.runPromise(Effect.sleep("10 millis"));
+
+    expect(emitted).toEqual([{ _tag: "Done", at: 1 }]);
+    // An output has no reducer handler; re-entering would throw, so this also
+    // pins that it did not.
+    expect(folded).toEqual(["Bump"]);
+  });
+});
+
+describe("createFeatureStore — defects", () => {
+  const equivalence = {
+    props: Schema.toEquivalence(Schema.Struct({})),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as any;
+
+  const setup = (reducer: Record<string, any>) => {
+    const defects: Array<unknown> = [];
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ handled: Schema.Number }),
+      action: Action.of([Action("Boom", {})]),
+    }).create({
+      initialState: () => ({ handled: 0 }),
+      reducer: reducer as any,
+      render: () => null,
+    });
+
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: undefined,
+      emit: () => {},
+      defect: (error) => void defects.push(error),
+    });
+
+    return { store, defects };
+  };
+
+  it("routes a defect to the `Error` handler when one is declared", () => {
+    const { store, defects } = setup({
+      Boom: () => {
+        throw new Error("kaboom");
+      },
+      Error: (_action: any, s: any) => ({ handled: s.state.handled + 1 }),
+    });
+
+    store.dispatch({ _tag: "Boom" } as never);
+
+    expect(store.getSnapshot()).toEqual({ handled: 1 });
+    // Handled means handled: it must not also reach the error boundary.
+    expect(defects).toEqual([]);
+  });
+
+  it("hands the squashed error and a cause to the `Error` handler", () => {
+    let seen: { error: unknown; cause: unknown } | undefined;
+    const { store } = setup({
+      Boom: () => {
+        throw new Error("kaboom");
+      },
+      Error: (action: any, s: any) => {
+        seen = { error: action.error, cause: action.cause };
+        return s.state;
+      },
+    });
+
+    store.dispatch({ _tag: "Boom" } as never);
+
+    expect((seen?.error as Error).message).toBe("kaboom");
+    expect(seen?.cause).toBeDefined();
+  });
+
+  it("reaches the error boundary when no `Error` handler is declared", () => {
+    const { store, defects } = setup({
+      Boom: () => {
+        throw new Error("kaboom");
+      },
+    });
+
+    store.dispatch({ _tag: "Boom" } as never);
+
+    expect(defects).toHaveLength(1);
+    expect((defects[0] as Error).message).toBe("kaboom");
+  });
+
+  it("does not loop when the `Error` handler itself throws", () => {
+    const { store, defects } = setup({
+      Boom: () => {
+        throw new Error("kaboom");
+      },
+      Error: () => {
+        throw new Error("handler exploded");
+      },
+    });
+
+    store.dispatch({ _tag: "Boom" } as never);
+
+    // Straight out, rather than feeding itself forever.
+    expect(defects).toHaveLength(1);
+    expect((defects[0] as Error).message).toBe("handler exploded");
+  });
+});
+
+class Probe extends Context.Service<Probe, { readonly mark: () => void }>()("Probe") {}
+
+describe("createFeatureStore — feature layers", () => {
+  const equivalence = {
+    props: Schema.toEquivalence(Schema.Struct({})),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as any;
+
+  it("builds the layer per mount and releases it on stop", async () => {
+    const log: Array<string> = [];
+
+    const layer = Layer.effect(
+      Probe,
+      Effect.acquireRelease(
+        Effect.sync(() => {
+          log.push("acquired");
+          return { mark: () => log.push("used") };
+        }),
+        () => Effect.sync(() => void log.push("released")),
+      ),
+    );
+
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Use", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Use: (_action: unknown, snapshot: { readonly state: { readonly count: number } }) => [
+          snapshot.state,
+          Command.effect(Effect.flatMap(Probe, (probe) => Effect.sync(() => probe.mark()))),
+        ],
+      } as any,
+      render: () => null,
+    });
+
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: layer as any,
+      emit: () => {},
+      defect: () => {},
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Use" } as never);
+    await Effect.runPromise(Effect.sleep("20 millis"));
+
+    expect(log).toEqual(["acquired", "used"]);
+
+    store.stop();
+    await Effect.runPromise(Effect.sleep("20 millis"));
+
+    // `OwnershipRule`, made structural: a per-mount service does not outlive
+    // the mount that built it.
+    expect(log).toEqual(["acquired", "used", "released"]);
+  });
+});
+
+describe("validateProps (via `component`'s check)", () => {
+  const Props = Schema.Struct({ id: Schema.String, count: Schema.Number });
+
+  it("rejects an excess property, which no spread would catch at compile time", () => {
+    const validate = SchemaParser.decodeUnknownSync(Props, {
+      onExcessProperty: "error",
+      errors: "all",
+    });
+
+    expect(() => validate({ id: "a", count: 1, extra: true })).toThrow();
+    expect(() => validate({ id: "a", count: 1 })).not.toThrow();
+  });
+
+  it("reports every problem at once rather than one per debugging round", () => {
+    const validate = SchemaParser.decodeUnknownSync(Props, {
+      onExcessProperty: "error",
+      errors: "all",
+    });
+
+    let message = "";
+    try {
+      validate({ id: 1, count: "no" });
+    } catch (error) {
+      message = String(error);
+    }
+
+    expect(message).toContain("id");
+    expect(message).toContain("count");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regressions found by /review-step. Each one was silently broken.
+// ---------------------------------------------------------------------------
+
+describe("createFeatureStore — defects from commands (review regression)", () => {
+  const equivalence = {
+    props: Schema.toEquivalence(Schema.Struct({})),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as any;
+
+  const setup = (reducer: Record<string, any>, layer?: Layer.Layer<any, any, any>) => {
+    const defects: Array<unknown> = [];
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ handled: Schema.Number }),
+      action: Action.of([Action("Boom", {})]),
+    }).create({
+      initialState: () => ({ handled: 0 }),
+      reducer: reducer as any,
+      render: () => null,
+    });
+
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer,
+      emit: () => {},
+      defect: (error) => void defects.push(error),
+    });
+
+    return { store, defects };
+  };
+
+  it("routes a dying command to the `Error` handler", async () => {
+    // Was discarded entirely: `runGuarded` forks and threw the fiber's Exit
+    // away, so nothing upstream could ever see it.
+    const { store, defects } = setup({
+      Boom: (_a: unknown, s: any) => [s.state, Command.effect(Effect.die(new Error("cmd boom")))],
+      Error: (_a: unknown, s: any) => ({ handled: s.state.handled + 1 }),
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Boom" } as never);
+    await Effect.runPromise(Effect.sleep("30 millis"));
+
+    expect(store.getSnapshot()).toEqual({ handled: 1 });
+    expect(defects).toEqual([]);
+  });
+
+  it("sends a dying command to the boundary when no `Error` handler exists", async () => {
+    const { store, defects } = setup({
+      Boom: (_a: unknown, s: any) => [s.state, Command.effect(Effect.die(new Error("cmd boom")))],
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Boom" } as never);
+    await Effect.runPromise(Effect.sleep("30 millis"));
+
+    expect(defects).toHaveLength(1);
+    expect(String(defects[0])).toContain("cmd boom");
+  });
+
+  it("does not mistake an interrupted command for a defect", async () => {
+    // Interruption is how `restart` and unmount end a command. Treating every
+    // non-success Exit as a defect would fire `Error` on ordinary cancellation.
+    const { store, defects } = setup({
+      Boom: (_a: unknown, s: any) => [
+        s.state,
+        Command.effect(Effect.sleep("5 seconds")).pipe(Command.restart()),
+      ],
+      Error: (_a: unknown, s: any) => ({ handled: s.state.handled + 1 }),
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Boom" } as never);
+    store.dispatch({ _tag: "Boom" } as never);
+    await Effect.runPromise(Effect.sleep("30 millis"));
+
+    expect(store.getSnapshot()).toEqual({ handled: 0 });
+    expect(defects).toEqual([]);
+  });
+
+  it("drains an `Error` raised outside an in-progress fold", async () => {
+    // Was stranded on `pending` with nothing to start a drain, so a failing
+    // layer produced no error at all until an unrelated dispatch arrived.
+    const failing = Layer.effectDiscard(
+      Effect.sleep("5 millis").pipe(Effect.andThen(Effect.fail("nope"))),
+    );
+
+    const { store, defects } = setup(
+      { Boom: (_a: unknown, s: any) => s.state },
+      failing as unknown as Layer.Layer<any, any, any>,
+    );
+
+    store.start();
+    await Effect.runPromise(Effect.sleep("40 millis"));
+
+    expect(defects).toHaveLength(1);
+  });
+});
+
+describe("createFeatureStore — remount races (review regression)", () => {
+  const equivalence = {
+    props: Schema.toEquivalence(Schema.Struct({})),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as any;
+
+  it("runs the remount's `Mounted` command instead of interrupting it", async () => {
+    // The StrictMode path. The previous mount's fiber was still parked on the
+    // shared queue, took the new `Mounted` command, and was interrupted with it
+    // still in flight — so a feature that loads on mount never loaded in dev.
+    const ran: Array<string> = [];
+
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Loaded", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Loaded: (_action: unknown, snapshot: { readonly state: { readonly count: number } }) => ({
+          count: snapshot.state.count + 1,
+        }),
+        Mounted: (_action: unknown, snapshot: { readonly state: { readonly count: number } }) => [
+          snapshot.state,
+          Command.effect(
+            Effect.sleep("10 millis").pipe(Effect.andThen(Effect.sync(() => ran.push("loaded")))),
+          ),
+        ],
+      } as any,
+      render: () => null,
+    });
+
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: undefined,
+      emit: () => {},
+      defect: () => {},
+    });
+
+    // Exactly what React does in StrictMode: effect, cleanup, effect.
+    store.start();
+    store.stop();
+    store.start();
+
+    await Effect.runPromise(Effect.sleep("60 millis"));
+
+    // One completion, from the mount that survived. The first mount's command
+    // is interrupted by its own `stop`, which is correct — that mount ended.
+    // What matters is that the *second* mount's command is not the casualty,
+    // which is what happened when both mounts shared one queue.
+    expect(ran).toEqual(["loaded"]);
+  });
+
+  it("runs teardown with the feature layer still alive", async () => {
+    const log: Array<string> = [];
+
+    class Lock extends Context.Service<Lock, { readonly release: () => void }>()("Lock") {}
+
+    const layer = Layer.effect(
+      Lock,
+      Effect.acquireRelease(
+        Effect.sync(() => {
+          log.push("acquired");
+          return { release: () => log.push("released-lock") };
+        }),
+        () => Effect.sync(() => void log.push("layer-finalized")),
+      ),
+    );
+
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Noop", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Noop: (_action: unknown, snapshot: { readonly state: unknown }) => snapshot.state,
+        // The exact case the ordering exists for: teardown needs the feature's
+        // own service, so the layer must outlive the `Unmounted` command.
+        Unmounted: (_action: unknown, snapshot: { readonly state: unknown }) => [
+          snapshot.state,
+          Command.effect(Effect.flatMap(Lock, (lock) => Effect.sync(() => lock.release()))),
+        ],
+      } as any,
+      render: () => null,
+    });
+
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: layer as any,
+      emit: () => {},
+      defect: () => {},
+    });
+
+    store.start();
+    await Effect.runPromise(Effect.sleep("20 millis"));
+    store.stop();
+    await Effect.runPromise(Effect.sleep("40 millis"));
+
+    expect(log).toEqual(["acquired", "released-lock", "layer-finalized"]);
+  });
+});
+
+describe("createFeatureStore — output handler throw (review regression)", () => {
+  const Done = Action.output("Done", { at: Schema.Number });
+
+  const equivalence = {
+    props: Schema.toEquivalence(Schema.Struct({})),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as any;
+
+  it("does not let the feature's `Error` handler swallow a missing `on<Tag>`", async () => {
+    // A missing handler is the parent's bug. Routing it into this feature's
+    // `Error` handler meant the caller never found out.
+    const defects: Array<unknown> = [];
+    let handledHere = 0;
+
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Announce", {})]),
+      output: Action.of([Done]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Announce: (_action: unknown, snapshot: { readonly state: unknown }) => [
+          snapshot.state,
+          Command.output(Done, { at: 1 }),
+        ],
+        Error: (_action: unknown, snapshot: { readonly state: unknown }) => {
+          handledHere += 1;
+          return snapshot.state;
+        },
+      } as any,
+      render: () => null,
+    });
+
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: undefined,
+      // Stands in for `component`'s emit when the prop is absent.
+      emit: () => {
+        throw new TypeError('No "onDone" prop for output "Done"');
+      },
+      defect: (error) => void defects.push(error),
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Announce" } as never);
+    await Effect.runPromise(Effect.sleep("20 millis"));
+
+    expect(handledHere).toBe(0);
+    expect(defects).toHaveLength(1);
+    expect(String(defects[0])).toContain("onDone");
+  });
+});
+
+describe("createFeatureStore — review iteration 2 regressions", () => {
+  const equivalence = {
+    props: Schema.toEquivalence(Schema.Struct({})),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as any;
+
+  const make = (reducer: Record<string, any>, layer?: Layer.Layer<any, any, any>) => {
+    const defects: Array<unknown> = [];
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Boom", {}), Action("Step", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: reducer as any,
+      render: () => null,
+    });
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer,
+      emit: () => {},
+      defect: (error) => void defects.push(error),
+    });
+    return { store, defects };
+  };
+
+  it("does not loop when the `Error` handler's own command dies", async () => {
+    // Was unbounded: `onExit` reported every defect as `\"Command\"`, so the
+    // `from === \"Error\"` guard never fired for a command the Error handler
+    // forked. Measured ~5000 folds in 200ms before the fix.
+    let errorRuns = 0;
+
+    const { store, defects } = make({
+      Boom: (_a: unknown, s: any) => [s.state, Command.effect(Effect.die(new Error("first")))],
+      Step: (_a: unknown, s: any) => s.state,
+      Error: (_a: unknown, s: any) => {
+        errorRuns += 1;
+        return [s.state, Command.effect(Effect.die(new Error("reporting failed")))];
+      },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Boom" } as never);
+    await Effect.runPromise(Effect.sleep("100 millis"));
+
+    // The handler runs for the original defect; the defect its own command
+    // raises goes to the boundary instead of back through the handler.
+    expect(errorRuns).toBe(1);
+    expect(defects).toHaveLength(1);
+    expect(String(defects[0])).toContain("reporting failed");
+  });
+
+  it("a dying command does not cancel the one queued behind it", async () => {
+    const ran: Array<string> = [];
+
+    const { store } = make({
+      Boom: (_a: unknown, s: any) => [
+        s.state,
+        Command.effect(Effect.die(new Error("first"))).pipe(Command.queue("q")),
+      ],
+      Step: (_a: unknown, s: any) => [
+        s.state,
+        Command.effect(Effect.sync(() => void ran.push("second"))).pipe(Command.queue("q")),
+      ],
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Boom" } as never);
+    store.dispatch({ _tag: "Step" } as never);
+    await Effect.runPromise(Effect.sleep("50 millis"));
+
+    // `queue` means "wait your turn", not "share their fate".
+    expect(ran).toEqual(["second"]);
+  });
+
+  it("re-arms after the mount fiber dies on a failing layer", async () => {
+    const failing = Layer.effectDiscard(Effect.fail("nope"));
+    const { store, defects } = make(
+      { Boom: (_a: unknown, s: any) => s.state, Step: (_a: unknown, s: any) => s.state },
+      failing as unknown as Layer.Layer<any, any, any>,
+    );
+
+    store.start();
+    await Effect.runPromise(Effect.sleep("30 millis"));
+    expect(defects).toHaveLength(1);
+
+    // The store must not be permanently deaf: `stop`/`start` re-arm it.
+    store.stop();
+    store.start();
+    await Effect.runPromise(Effect.sleep("30 millis"));
+
+    // Second mount fails the same way rather than silently doing nothing.
+    expect(defects).toHaveLength(2);
+  });
+
+  it("completes a multi-hop teardown chain", async () => {
+    const ran: Array<string> = [];
+
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Flushed", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        // Second hop: only reachable if the emission's command still finds a
+        // draining fiber. `stop` clearing `mount` dropped exactly this.
+        Flushed: (_action: unknown, snapshot: { readonly state: unknown }) => [
+          snapshot.state,
+          Command.effect(Effect.sync(() => void ran.push("lock-released"))),
+        ],
+        Unmounted: (_action: unknown, snapshot: { readonly state: unknown }) => [
+          snapshot.state,
+          Command.stream(
+            Stream.fromEffect(
+              Effect.sync(() => {
+                ran.push("session-closed");
+                return { _tag: "Flushed" as const };
+              }),
+            ),
+          ),
+        ],
+      } as any,
+      render: () => null,
+    });
+
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: undefined,
+      emit: () => {},
+      defect: () => {},
+    });
+
+    store.start();
+    store.stop();
+    await Effect.runPromise(Effect.sleep("50 millis"));
+
+    expect(ran).toEqual(["session-closed", "lock-released"]);
+  });
+
+  it("does not drop a command dispatched before `start`", async () => {
+    // A child dispatching from its own `useLayoutEffect` folds before the
+    // parent's passive effect arms the store.
+    const ran: Array<string> = [];
+
+    const { store } = make({
+      Boom: (_a: unknown, s: any) => s.state,
+      Step: (_a: unknown, s: any) => [
+        s.state,
+        Command.effect(Effect.sync(() => void ran.push("early"))),
+      ],
+    });
+
+    store.dispatch({ _tag: "Step" } as never);
+    store.start();
+    await Effect.runPromise(Effect.sleep("30 millis"));
+
+    expect(ran).toEqual(["early"]);
   });
 });

@@ -21,12 +21,14 @@ This spec is retroactive: `tea.ts` already carries a real implementation
 test coverage and to pin down documented-but-unverified behavior before
 changing anything.
 
-**Out of scope for this spec and its downstream steps:** `createRuntime` and
-its returned `{ Provider, component, useRuntime }` — the one `declare const`
-left in the file, i.e. the React binding layer. Everything else with a real
-implementation is in scope, including the type-level guards that encode real
-invariants (`Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/
-`Excess`, `ServiceOf`/`ServicesOf`).
+**The React binding was out of scope for the first pass and is now in scope.**
+`createRuntime`'s `{ Provider, component, useRuntime }` was the one `declare
+const` left in the file; `Provider` and `useRuntime` have since landed, and the
+remaining three `declare`s — the `internals` symbol, `createFeatureStore` and
+`validateProps` — are what _React binding_ below specifies. Everything else with
+a real implementation stays in scope, including the type-level guards that
+encode real invariants (`Disjoint`, `NoTransform`, `NoPropCollision`,
+`Exhaustive`/`Excess`, `ServiceOf`/`ServicesOf`).
 
 ## Acceptance Criteria
 
@@ -188,6 +190,164 @@ working tree in between.
 - [x] `ServiceOf`/`ServicesOf` union services across multiple reducer handlers' return types without collapsing to `never` (the exact regression this type exists to prevent).
 - [x] `OutputProps<Output>` derives one required `on<Tag>` prop per output case, with `_tag` stripped from the payload type.
 - [x] `Command`'s `Pipeable` typing: `cmd.pipe(Command.restart())` preserves the command's `A` and `R` type parameters. **Includes the variance case the leaf redesign has to preserve — see below.**
+
+### React binding (`createRuntime` → `component`)
+
+The three remaining `declare`s. `internals` is the smallest and the most urgent:
+`declare const internals: unique symbol` emits **nothing**, so `create`'s
+`[internals]: {…}` key and `component`'s `blueprint[internals]` read both hit a
+`ReferenceError` the moment either runs. It has to become a real
+`Symbol("@tea/internals")`. The other two are `createFeatureStore` (the live
+fold) and `validateProps`.
+
+- [x] `Blueprint` carries a `BlueprintInternals` slot behind a real module-private `unique symbol` — `initialState`, `render`, `useHooks`, the props schema, and the declared output tags — populated by `create` and read only by `component`. `reduce` and `run` remain the entire public surface: the slot is absent from `Object.keys(blueprint)` and unreachable by name from userland.
+- [x] `component(blueprint)` returns an `FC` that renders `render({ state, props, hooks, dispatch })` and re-renders when a command changes state.
+- [x] Incoming props are split by derived name — exactly `outputTags.map(t => "on" + t)` — before validation; declared props whose names merely start with `on` (e.g. `onScroll`) are left alone. `NoPropCollision` is what makes the split unambiguous.
+- [x] `validateProps` runs the props schema with `onExcessProperty: "error"` and `errors: "all"`, and **throws** on failure rather than reporting — a malformed prop is the parent's defect, so it reaches the nearest React error boundary. It runs on mount and on every props-identity change, and not on a re-render driven by this feature's own state (React hands back the identical props object then).
+- [x] A message whose tag is in `outputTags` leaves through the matching `on<Tag>` prop with `_tag` stripped from the payload, and never re-enters the reducer. Everything else re-enters. Own-keys only, per the prototype-chain note above.
+- [x] An output with no corresponding `on<Tag>` prop at runtime **throws**, matching the missing-handler precedent: `OutputProps` makes every one required, so an absent handler means the typed surface was bypassed.
+- [x] `dispatch` accepts only declared actions and is reference-stable for the life of the mount, so it can be passed to a memoised child without invalidating it.
+- [x] Lifecycle actions are raised by the runtime, in this order and no other: `Mounted` once per mount, then `PropsChanged`/`HookChanged` as ambient inputs change, then `Unmounted` once at teardown.
+- [x] `PropsChanged` and `HookChanged` are detected **by value, during render** — props via `Schema.toEquivalence(propsSchema)`, hooks via `Equivalence.Record(Equivalence.strictEqual())` — and the state their handlers produce is what that same render draws. No extra render cycle, and no paint of the pre-change state.
+- [x] `store.sync` is idempotent: called twice with equivalent props and hooks it raises nothing the second time, so a render React discards (StrictMode, Suspense retry, concurrent restart) costs nothing.
+- [x] A defect from a command, or a feature `layer` that fails to build, reaches the `Error` handler; with no `Error` handler declared it is rethrown **during render**, which is the only place React's error boundary can catch it.
+- [x] Services come from the root `ManagedRuntime` via context; `component(bp, { layer })` satisfies the residue `Exclude<R, RootR>`.
+
+#### Store lifetime, and why it is split
+
+The store **object** (state cell, subscribers, pending queue) is created in
+`useState`'s initialiser and lives as long as the component instance. Its
+**Effect scope** is opened by the mount effect and closed by that effect's
+cleanup.
+
+The split is forced by StrictMode. A store created in `useState` survives
+React's simulated unmount → remount, so a single `dispose()` in the cleanup
+leaves the remounted component holding a closed scope — every command after
+that point forks into nothing and silently does not run. That is not the
+cosmetic double-build already documented for the root runtime; it breaks
+development outright. Splitting the two lifetimes makes a remount re-arm the
+store, and state survives it, which is what React means by remounting the same
+instance.
+
+`Mounted` therefore fires once **per effect cycle** — twice in dev. Latching it
+to once per store object was considered and rejected: it hides non-idempotent
+`Mounted` handlers that will misbehave in production under Suspense and
+offscreen remounts, which is the bug StrictMode exists to surface.
+
+#### The fold is synchronous; only commands are Effects
+
+`sync` returns the state to render, so a fold cannot round-trip through an
+Effect queue — the value would arrive a render too late, which is the extra
+cycle the whole design avoids. So every action folds in a plain function call:
+read state, run the handler, write state, notify subscribers, fork the command.
+
+A re-entrancy guard serialises them. Without it a command that emits on the
+forking stack — `Stream.succeed`, which is exactly what `Command.output` is
+today — re-enters the fold mid-write, and the outer fold writes stale state on
+the way out. Actions arriving while a fold is on the stack queue behind it.
+
+This is also why the machinery is **extracted rather than duplicated**.
+`interpret`, `runGuarded`, `cancelGroup` and `groupId` become one internal core;
+`run` is that core with a synchronous drain to quiescence, and the store is the
+same core with a forked drain loop that never terminates. `Blueprint.run`'s own
+JSDoc already names this the honest factoring, and the alternative is two
+implementations of policy, group and cancellation semantics that must agree
+forever. Every existing `run` criterion above must stay green through the
+extraction — that suite is the safety net for it.
+
+#### Feature layers are per mount
+
+A layer passed to `component` is built when the store starts and released when
+it stops. Consistent with `OwnershipRule`: anything that must survive a mount
+belongs in the root layer, and building per mount makes that structural instead
+of advisory. Three `<Cart>` mounts build three copies, and that cost is the
+pressure that pushes genuinely shared services up to the root.
+
+Memoising across mounts was rejected for the reason `OwnershipRule` gives:
+service state would outlive the mount that created it — a store with extra
+steps, reintroduced one layer down where nothing checks it — and nothing would
+ever release it.
+
+#### Teardown outlives the mount scope
+
+`LifecycleHandlers.Unmounted` promises its command outlives the component and
+dies only with the Provider. That was written when the root scope was the only
+scope; a per-mount scope would interrupt the teardown command `stop()` had just
+issued, making the handler useless for the one job it exists for.
+
+Resolved by keeping the promise and ordering the teardown: `stop()` raises
+`Unmounted`, forks its command into the **root** runtime's scope, and closes the
+mount scope only once that command settles. Closing immediately was the literal
+reading of the JSDoc and was rejected — it releases the feature's own layer out
+from under a teardown command that needs it, which is precisely the feature that
+had a reason to bring a layer at all.
+
+#### Found by `/review-step`: the store's error path did not exist
+
+Six confirmed defects, four of them reproduced by the reviewer against the
+shipped code. Recorded rather than quietly patched, because five of the six were
+invisible — no throw, no log, no failing test — and the shapes recur.
+
+- [x] **A dying command reached nothing.** `runGuarded` forks the command and threw the fiber's `Exit` away, and a dying child does not propagate to its parent, so an enclosing `catchCause` could never see it — `interpret` has already returned by the time the command runs. Every runtime defect from a command (a failed fetch, a missing service, a bug in an `Effect`) vanished: no `Error` handler, no boundary, no log. Fixed with an `onExit` hook on `commandInterpreter`, filtered so interruption — which is how `restart` and unmount normally end a command — is not mistaken for a defect.
+- [x] **`raiseDefect` queued an `Error` nobody drained.** It pushed onto `pending` without starting a fold, so a defect raised _outside_ an in-progress fold sat there until an unrelated dispatch happened to arrive — at which point it fired late and looked caused by that dispatch. Now it goes through `fold`, which queues behind a running fold and drains when there is none.
+- [x] **A remount's `Mounted` command was stolen and killed.** The command queue was per store while the fiber draining it was per mount, so after `stop` the previous fiber was still parked on `Queue.take` and took the _next_ mount's command; the interrupt that followed killed it. A feature that loads its data on mount never loaded it in development. Fixed by making the queue, groups and in-flight counter per mount, so a stale fiber can only take from a queue nobody offers to again.
+- [x] **Teardown ran without the services it needed.** `stop` forked teardown externally and read a `context` cell the mount fiber wrote, so a mount that ended before `Layer.build` resolved ran teardown unprovided — and the "release the lock" command died with a missing-service defect that was itself discarded. Fixed twice over: teardown is now delivered _in-band_ as a queue entry, so it runs on the fiber that owns the scope, and `context` is local to that fiber rather than a shared cell.
+- [x] **A feature could swallow its caller's bug.** The `TypeError` for a missing `on<Tag>` prop was caught by `fold` and routed into the feature's own `Error` handler, so a feature with error handling absorbed it and transitioned into an error state instead of anyone finding out. It now goes straight to the boundary, like a bad prop.
+- [x] **Three `runtime.runSync` calls ran during render.** Creating the queue and refs through the root `ManagedRuntime` forced its layer to build synchronously, which an async root layer cannot do — so the first mount of any feature would block or throw. All three are context-free, so they use the default runtime.
+
+Two more were taken as written rather than argued with:
+
+- [x] `sync` advanced its comparison baseline unconditionally, so a render React discarded left the committed render comparing new against new — losing the change rather than merely repeating it. The baseline now moves only when something moved. The residual is honest and unfixable from here: a discarded render that _did_ see a change still advances it. Equal-by-value objects are interchangeable, so keeping the older reference costs nothing.
+- [x] `handlersRef.current = handlers` was a bare render-phase write with no commit-phase counterpart. Moved into an effect; outputs arrive on command fibers, i.e. after commit, so it is early enough.
+
+Dead surface removed in the same pass: `createFeatureStore`'s `name` argument (required, never read), and `commandInterpreter`'s returned `cancelGroup` (no call site). `inFlight` stays — `run`'s quiescence check reads it, and the store must pass one for the shared interpreter to write.
+
+**What this says about the process.** The node suite was green through all six. `/e2e` caught a seventh independently (the render-phase notify). The defects that survived to `/review-step` were all on the _error_ path, which is exactly the path unit tests written from acceptance criteria do not exercise — the criteria say what happens when things work.
+
+#### `/review-step` iteration 2: the fixes had their own defects
+
+Nine more, five of them in code written to fix iteration 1. Worth recording as a
+pattern rather than a list: **every one was on the failure path the first pass
+had just built**, which is the part with no happy-path test to keep it honest.
+
+- [x] **The recursion guard was dead on arrival.** `onExit` reported every command defect with the constant `"Command"`, so `raiseDefect`'s `from === "Error"` check never fired for a command the `Error` handler itself forked — Error → command → defect → Error, unbounded, measured at ~5000 folds in 200ms. The synchronous-throw sibling _was_ guarded and tested, which is precisely why this looked covered. `interpret` already knew the issuing tag; the hook signature threw it away. Now `onExit` carries `ctx`.
+- [x] **`queue` meant "share their fate".** `Fiber.joinAll` re-raises the prior's cause, so a dying command killed everything queued behind it before their bodies ran — and `onExit` then reported that one failure once per follower. Pre-existing in `runGuarded`; invisible until something started watching Exits. The join is now exit-only.
+- [x] **A dead mount fiber left the store deaf.** Nothing cleared `mount` when the fiber died, so a failing layer meant every later dispatch — including the Retry the `Error` handler had just rendered — queued into a void, and `stop`'s teardown went to the same dead queue. Cleared in an `Effect.ensuring`, guarded on identity so a newer mount is not clobbered.
+- [x] **Teardown ran one hop.** `stop` cleared `mount` immediately, so an `Unmounted` command that emitted an action whose handler returned _another_ command lost the second one — "close the session" ran, "release the lock" did not. `mount` now stays until the fiber returns, and the fiber drains its own teardown chain to quiescence before closing the scope.
+- [x] **Joining teardown double-reported it.** Each fiber's `onExit` already reports its own failure; `joinAll` re-raising the same cause into the mount fiber had the terminal `catchCause` raise it again, and killed the fiber instead of letting it return normally.
+- [x] **Commands dispatched before `start` were dropped.** `dispatch` reaches the subtree during render and React runs descendants' layout effects before this component's passive effect, so a child dispatching from `useLayoutEffect` folded before anything was armed: the state moved, the command vanished. Buffered and flushed by `start`.
+
+Open, and deliberately not patched in this pass:
+
+- [ ] `sync` writes the state cell after `useSyncExternalStore` has already read `getSnapshot`, so React's post-render consistency check can schedule the very re-render the render-body `sync` exists to avoid. The one-render browser test still passes, so the cost is not always paid — but the mechanism is real and the design's headline claim rests on it. Needs its own pass, probably `useSyncExternalStore`'s `getSnapshot` returning a value captured for the render rather than the live cell.
+- [ ] `Command.batch` members share one `CommandContext`, so an outer `restart`/`ignore` wrapping a batch puts every member in one group — contradicting the criterion above that batch members each keep their own policy. Pre-existing in `run`, surfaced by reading the extracted interpreter.
+- [ ] `create` derives the output-tag set twice: `Object.keys(spec.output.cases)` for the internals slot, `Object.hasOwn(spec.output.cases, tag)` in `run`. One rule, two spellings, in one closure.
+
+#### Deferred, and recorded rather than silently absent
+
+- [ ] `RuntimeOptions.onEvent` stays **declared and unwired** this pass; no `DevtoolsEvent` is emitted. Deferred deliberately: the `cause: { _tag: "Output", from, output }` variant needs a parent↔child channel that does not exist, and the obvious substitute — attributing whatever the parent dispatches next to the child's output — invents causality it cannot verify, since the handler may dispatch zero actions, three, or none synchronously. Wiring the other two `cause` variants and omitting the third was the runner-up. This box records the gap so the dead option is visible; it is not a criterion this pass satisfies.
+- SSR: not applicable. This is a Vite SPA with a single `createRoot` entry and no server render, so `useSyncExternalStore` is used without `getServerSnapshot`. Revisit only if a server entry appears.
+
+#### Found by the browser suite: `sync` notified subscribers during render
+
+The render-body `sync` moved state and then notified subscribers, and the only
+subscriber is `useSyncExternalStore` — so an ambient change scheduled a React
+update _from inside a render_. React said so out loud ("Cannot update a
+component while rendering a different component"), and only the browser suite
+saw it: the node tests drive the store with no React attached, so nothing there
+could notice.
+
+Redundant as well as illegal. `sync` already hands the new state straight back
+to the render that asked for it, so the paint is happening either way; the
+notify could only ever have scheduled a second one — the extra render cycle this
+whole design exists to avoid, reintroduced by the mechanism meant to prevent it.
+
+Fixed with a `syncing` flag that suppresses notification for that window only.
+Changes arriving from `dispatch` or a command fiber are outside render and still
+notify. This is the concrete payoff of `/e2e` being mandatory for this pass
+rather than skipped as "the node tests cover the fold".
+
+- e2e: covered. `src/lib/tea.browser.test.tsx`, ten tests under `vitest.browser.config.ts` — initial paint, click-driven repaint, outputs crossing the boundary (both handler shapes), one-render props change, props identity churn raising nothing, StrictMode remount, `on`-prefixed declared props surviving the split, excess-prop rejection, and the missing-`on<Tag>` throw.
 
 ## Design decisions — command leaf (pending, not yet implemented)
 
@@ -362,8 +522,21 @@ what TCA ships. Not decided; flagged for after the leaf change lands.
 - Concurrency-policy tests (`restart`/`ignore`/`queue`/`parallel`) exercise the real scheduler with short `Effect.sleep`/`Ref`/`Deferred` timing rather than `TestClock`, matching how the (now-deleted) ad-hoc smoke test verified them.
 - Type-level guard tests use TSTyche (`tstyche.json` + `src/lib/__type-tests__/tea.tst.ts`), introduced by this pass — no `tstyche.json` exists anywhere in the repo yet.
 - The suspected `run` non-termination on a never-completing command (see _Design decisions_, §3) needs a test with an explicit timeout — a plain `it` would hang the suite rather than fail it. Write it against the current `Stream` leaf so the behavior is pinned before the leaf changes.
+- The React binding is built against the **current** `Stream` command leaf. The pending leaf redesign touches `interpret`'s `"Stream"` case and the constructor only; extracting the core moves that case without changing it, so the two passes stay independent and neither blocks the other.
+- Binding tests split by what they need: fold, routing, lifecycle ordering and store lifetime are `jsdom` unit tests driving `createFeatureStore` directly with no React; anything about render counts, error boundaries or actual paint is `/e2e`.
+- `@testing-library/react` is not installed and is not used elsewhere in this repo. Unit tests drive the store directly; the browser tests mount through the real DOM, matching how the existing `src/examples/*` demos are exercised.
 
 ## Expected Behavior & Edge Cases
 
+### First pass (reducer core)
+
 - Not applicable: `/mock` — a real implementation of everything in scope already exists; nothing to stub.
 - Not applicable: `/e2e` — this file is the pure Effect/reducer core with no DOM. The React binding (`createRuntime`, browser-observable behavior) is out of scope for this pass.
+
+### React binding pass
+
+- `/mock` is already satisfied: `FeatureStore`, `BlueprintInternals` and the three `declare`s are the mock surface, written with full JSDoc in `tea.ts` before this spec existed. `/implement` replaces them in place with signature parity.
+- `/e2e` is **mandatory** here, unlike the first pass: the whole point of this layer is browser-observable. A real-browser test must cover at minimum a mount that renders initial state, a `dispatch` that repaints, an `on<Tag>` output reaching a parent, and a props change repainting on one render rather than two.
+- The `internals` symbol landing as a real `Symbol` is load-bearing for _every_ criterion in this section — nothing else in the binding can run until it does — so it is the first thing `/implement` fixes.
+- Extraction risk: the shared core must keep all 1437 lines of the existing `run` suite green, including the pinned non-termination test. A green `run` suite after extraction is the acceptance gate for the refactor itself, separate from the new criteria.
+- The mount effect's cleanup is async in effect (it awaits the teardown command before closing the scope) while React's cleanup is synchronous. `stop()` therefore returns immediately and drains on a fiber; a component that remounts before the drain finishes must not have its new scope torn down by the old one's completion.
