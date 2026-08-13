@@ -201,6 +201,57 @@ bug sections. Both are one-line fixes with a test each.
 - [x] `run`'s snapshot leaks `layer` into every handler. `const snapshot = { ...options }` spread `options` whole — `{ props, hooks, layer }` — so `{ ...snapshot, state }` handed each handler a `Snapshot` carrying a fourth key. Invisible to the type (excess-property checking does not fire on a non-fresh spread) and harmless to read, but it put a `Layer` on the one object this file elsewhere claims is entirely encodable, and a cast reached it from userland. Fixed by naming the fields: `{ props: options.props, hooks: options.hooks }`. Asserted on the handler's own keys, since the leak is invisible to both the type and every existing assertion.
 - [x] Stray `Effect.log("step", action)` in `run`'s `step`. Debug leftover — every action folded through `run` wrote a log line, so any suite using `run` was noisy and the default logger did formatting work nobody asked for. Removed. Contrary to this box's first wording ("no test; its absence is the assertion"), it _is_ directly testable: `Logger.layer([capture])` provided to the `run` effect replaces the logger set and collects what it emits, so the criterion is "`run` logs nothing of its own" — which also catches the next debug line somebody leaves behind, where a one-off deletion would not.
 
+### Open work, as to-dos
+
+The six items left open after the identity-split pass. Each appears somewhere in
+the review-round narrative below; this section is the actionable version — what
+is wrong, where, what a fix must not break, and how you know it worked. Ordered
+by "how much does it need a decision before it needs code".
+
+Numbered so they can be referenced from a branch name or a commit.
+
+#### 1. Re-arming a mount that died, from `component`
+
+- [ ] **Problem.** A feature layer that fails to build kills the mount fiber. `release` clears `mount` and `active`, so a `start` that follows _can_ build fresh cells — but through `component` nothing calls one: the arming effect is `useEffect(() => { store.start(); return () => store.stop(); }, [store])` (`tea.ts`, `component`) and `store` never changes. Every command after that is dropped for the life of the component, silently, including the Retry button the `Error` handler just rendered. A driver holding the store directly recovers; a React subtree does not.
+- **Decision needed first.** Two candidates, both with a real cost:
+  - A store-bumped `version` used as a dep of the arming effect. Simple, but a permanently failing layer becomes an unbounded retry loop.
+  - A demand-driven re-arm inside `offer` when the previous mount died. No loop — it only fires when work actually arrives — but it re-enters `fold` from inside a fold, so the re-entrancy guard has to be shown to hold.
+- **Must not break.** The silent drop after a _normal_ unmount (the component is gone; dropping is correct). Reporting the drop instead was tried and reverted in this pass — `component`'s `defect` sink throws to the error boundary, so it replaced the recovery UI with a crash. Whatever lands must distinguish "died" from "unmounted" without making the second one loud.
+- **Done when.** A test drives a failing layer through `component` (browser suite, since the arming effect is the subject), clicks Retry, and the retried command runs. Plus a test that a permanently failing layer does not spin.
+
+#### 2. What unmount owes work already in flight
+
+- [ ] **Problem.** `teardown` interrupts every fiber in `cells.groups` before interpreting the `Unmounted` command, unconditionally. `start(); dispatch(Go); stop()` now loses a 50ms effect roughly 0ms in, where the previous polling drain let it finish. A "flush the pending write on the way out" pattern silently loses the write unless it is moved into the `Unmounted` handler.
+- **Decision needed first.** The sweep is what makes teardown terminate at all — a `Mounted` subscription never completes, so without it the loop cannot reach quiescence. So the question is not "sweep or not" but _which_ work the sweep is entitled to kill. Candidates: sweep only long-lived leaves once the leaf redesign lands (§ _Design decisions_); or give in-flight work a short grace window before the sweep, bounded by the same 5s budget; or keep the sweep and document that flush-on-exit belongs in `Unmounted`, which is the current de-facto answer.
+- **Must not break.** Teardown termination, and the 5s bound as a whole-teardown bound (it was per-hop once, which made it ~83 minutes).
+- **Done when.** The chosen semantics has a test, and the JSDoc on `teardown` stops describing the trade-off as open.
+
+#### 3. `search.tsx` never applies the `restart` its own docs describe
+
+- [ ] **Problem.** The file header, the inline comment at the `TextEdited` handler, and the `PropsChanged` comment all describe a `"restart"` policy that turns each keystroke into a cancel-and-debounce. `grep -n "restart" src/examples/search.tsx` finds only prose. With the default `"parallel"`, every keystroke fires its own 300ms-delayed request and a filter change races the pending query instead of superseding it. The demo's headline claim is not wired.
+- **Fix.** `.pipe(Command.restart("query"))` on the `Command.stream` in the `TextEdited` handler, and on the re-issued `TextEdited` in `PropsChanged` so a filter change supersedes rather than races.
+- **Why it is not a drive-by.** `src/examples/*.tsx` is `/e2e`-mandatory, so this is its own full cycle with browser tests, not a one-line edit.
+- **Done when.** A browser test types three characters and asserts one request survives, and that a filter change during a pending query supersedes it.
+
+#### 4. `queue` registers O(N²) awaiters
+
+- [ ] **Problem.** `"queue"` awaits _every_ fiber currently in its group, which is what makes a `queue`-wrapped `Command.batch` serialise and what keeps a dying predecessor from releasing a follower early. The cost is that N rapid dispatches on one key register O(N²) awaiters, and each new fiber pins references to all its predecessors until they settle. Correct, but a scaling cliff for a `queue`-keyed command driven by keystrokes — where `restart` is almost always what was meant anyway.
+- **Fix direction.** Await only the most recent entry per group _plus_ the same-occurrence siblings ahead of it, since the predecessors form a chain: waiting on the tail transitively waits on everything behind it. Needs care that a chain link interrupted mid-flight still releases its follower.
+- **Must not break.** The two tests that pin why the full await exists: `queue` serialising a batch, and a follower waiting for the siblings of a predecessor that died.
+- **Done when.** Awaiter count is linear in N under a probe, both existing tests still pass.
+
+#### 5. The `useSyncExternalStore`-after-`sync` ordering has no discriminating test
+
+- [ ] **Problem.** `component` reads `useSyncExternalStore` after calling `store.sync(props, hooks)`, so both React reads see post-fold state. The browser test that looks like its guard counts one render either way — the spec records that the extra render was never reproduced — so reverting the ordering would pass the whole suite. The ordering is defensively correct and ships untested.
+- **Options.** Either find an input that does discriminate (a props change during a concurrent render, where the pre-fold read differs from the post-fold one) and pin it; or accept that it is unfalsifiable at this level, delete the ordering's claim to being a fix, and keep only the hook-order argument.
+- **Done when.** Either a test fails when the two lines are swapped, or the comment stops implying one exists.
+
+#### 6. `RuntimeOptions.onEvent` is accepted and ignored
+
+- [ ] **Problem.** `createRuntime(layer, options)` destructures its second parameter as `_options` and never emits a `DevtoolsEvent`. Deliberate and recorded — but `src/examples/app.tsx` and `src/examples/cart.tsx` both present it as working ("Every state change in every feature, in order"), so a reader copying the example installs an observer that never fires and gets no signal that it never fired.
+- **Fix, cheapest first.** Mark `onEvent` unimplemented in the JSDoc callers actually read and stop the examples presenting it as live; or drop it from the public signature until the devtools stream exists; or wire it, which is a feature, not a cleanup.
+- **Done when.** Either the type no longer offers it, or a reader of the JSDoc and the examples cannot mistake it for working.
+
 ### Command leaf redesign (decided in _Design decisions_ below, not yet implemented)
 
 Sequenced **after** the non-termination test above, so the current leaf's
