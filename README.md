@@ -25,6 +25,54 @@ A blueprint is inert: `cart.reduce(action, snapshot)` is the whole reducer as on
 pure function, and `cart.run(actions, options)` folds a sequence and reports what
 was emitted — both without React.
 
+## Commands
+
+A reducer returns the next state and, optionally, a `Command`. The leaf is an
+`Effect` handed a `dispatch`, so everything Effect can already express is left to
+Effect — a command that emits nothing simply ignores the parameter:
+
+```ts
+Added: (action, { state }) => [
+  next,
+  Command.effect(() => Effect.all([persist(next), track(action)])),
+];
+```
+
+Concurrency is userland. Debounce, throttle, switch-to-latest and run-at-most-N
+are Effect combinators written inside the effect, not a policy vocabulary the
+runtime interprets. What the runtime does own is the one thing a handler cannot
+do for itself: naming a running fiber so a _different_ action's handler can
+interrupt it. That is `Command.keyed` plus `Command.cancel`, and `Command.batch`
+is what puts the cancel ahead of the command replacing it:
+
+```ts
+TextEdited: (action, { state }) => [
+  { ...state, text: action.text, pending: true },
+  Command.batch(
+    Command.cancel({ tag: "TextEdited", key: "query" }),
+    Command.keyed(
+      "query",
+      Command.effect((dispatch) =>
+        Effect.sleep("300 millis").pipe(
+          Effect.andThen(search(action.text)),
+          Effect.flatMap((hits) => dispatch({ _tag: "HitsArrived", hits })),
+        ),
+      ),
+    ),
+  ),
+];
+```
+
+A long-lived source is `Stream.runForEach(source, dispatch)` inside the same
+leaf, so the whole `Stream` vocabulary stays available one call earlier.
+
+`dispatch` is typed by the feature's own action vocabulary, which reaches the
+leaf through the handler's contextual type. Two places that context cannot
+reach, both by TypeScript's rules rather than this library's: a `.pipe` receiver
+(so `Command.keyed(key, command)` exists alongside the curried form), and a
+command hoisted into a `const` (name the type there:
+`Command.effect<MyAction>(…)`).
+
 To mount one, build a root runtime once and turn blueprints into components:
 
 ```tsx

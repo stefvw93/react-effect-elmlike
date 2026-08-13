@@ -130,7 +130,10 @@ describe("vocabularies", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Command ADT + constructors + policy wrappers
+// Command ADT + constructors
+//
+// The leaf, `keyed`, `batch` ordering and the removed policy surface are in
+// "Command — the effect leaf" further down.
 // ---------------------------------------------------------------------------
 
 describe("Command", () => {
@@ -141,28 +144,6 @@ describe("Command", () => {
     expect(Object.keys(Command.none).sort()).toEqual(["_tag", "pipe"]);
   });
 
-  it("effect wraps the Effect it was given", () => {
-    const inner = Effect.void;
-    const cmd = Command.effect(inner);
-    expect(cmd).toMatchObject({ _tag: "Effect" });
-    // Wrapped, not adapted — `interpret` is the only thing that transforms it.
-    if (cmd._tag !== "Effect") throw new TypeError("expected Effect");
-    expect(cmd.effect).toBe(inner);
-  });
-
-  it("stream wraps the Stream it was given", () => {
-    const inner = Stream.empty;
-    const cmd = Command.stream(inner);
-    expect(cmd).toMatchObject({ _tag: "Stream" });
-    if (cmd._tag !== "Stream") throw new TypeError("expected Stream");
-    expect(cmd.stream).toBe(inner);
-  });
-
-  it("batch collects members, each independent", () => {
-    const cmd = Command.batch(Command.none, Command.effect(Effect.void));
-    expect(cmd).toMatchObject({ _tag: "Batch", commands: [{ _tag: "None" }, { _tag: "Effect" }] });
-  });
-
   it("cancel accepts a bare tag string or a { tag, key } group", () => {
     expect(Command.cancel("Foo")).toMatchObject({ _tag: "Cancel", target: { tag: "Foo" } });
     expect(Command.cancel({ tag: "Foo", key: "sku-1" })).toMatchObject({
@@ -170,47 +151,8 @@ describe("Command", () => {
       target: { tag: "Foo", key: "sku-1" },
     });
   });
-
-  it("output emits an outbound message as a one-shot stream", async () => {
-    const OrderPlaced = Action.output("OrderPlaced", { orderId: Schema.String });
-    const cmd = Command.output(OrderPlaced, { orderId: "o1" });
-    if (cmd._tag !== "Stream") throw new TypeError("expected Stream");
-    const emitted = await Effect.runPromise(Stream.runCollect(cmd.stream));
-    expect(emitted).toEqual([{ _tag: "OrderPlaced", orderId: "o1" }]);
-  });
-
-  it("restart/ignore/queue wrap a command in a Guarded node, and are pipeable", () => {
-    const base = Command.none;
-    const wrappers = [
-      ["restart", Command.restart],
-      ["ignore", Command.ignore],
-      ["queue", Command.queue],
-    ] as const;
-
-    for (const [policy, wrap] of wrappers) {
-      const keyed = base.pipe(wrap("sku-1"));
-      expect(keyed).toMatchObject({
-        _tag: "Guarded",
-        policy,
-        key: "sku-1",
-        command: { _tag: "None" },
-      });
-
-      const unkeyed = base.pipe(wrap());
-      expect(unkeyed).toMatchObject({ _tag: "Guarded", policy, command: { _tag: "None" } });
-
-      // An omitted key has to stay `undefined`. `groupId` interpolates it into
-      // the group id, so a stray value would silently split one group into two
-      // and every policy would stop applying. `toMatchObject` cannot catch
-      // that — it ignores keys it was not given.
-      if (unkeyed._tag !== "Guarded") throw new TypeError("expected Guarded");
-      expect(unkeyed.key).toBeUndefined();
-    }
-  });
 });
 
-// ---------------------------------------------------------------------------
-// Next accessors
 // ---------------------------------------------------------------------------
 
 describe("Next", () => {
@@ -236,7 +178,7 @@ describe("Next", () => {
     // against a module-level constant is also satisfied by an accessor that
     // returns that constant unconditionally, which is exactly the bug that
     // would make every command a no-op.
-    const command = Command.effect(Effect.void);
+    const command = Command.effect(() => Effect.void);
     expect(Next.command([{ count: 1 }, command])).toBe(command);
     expect(Next.command([{ count: 1 }, command])).not.toBe(Command.none);
   });
@@ -287,7 +229,7 @@ describe("Blueprint.reduce", () => {
       state: CounterState,
       action: Action.of([Up, Down]),
     });
-    const mountCommand = Command.effect(Effect.void);
+    const mountCommand = Command.effect(() => Effect.void);
     const twoWay = TwoWay.create({
       initialState: (props) => ({ count: props.start }),
       reducer: {
@@ -369,7 +311,7 @@ describe("Blueprint.reduce", () => {
       initialState: (props) => ({ count: props.start }),
       reducer: {
         Incremented: (_action, { state, props }) => ({ count: state.count + props.step }),
-        Unmounted: () => [{ count: 999 }, Command.effect(Effect.void)] as const,
+        Unmounted: () => [{ count: 999 }, Command.effect(() => Effect.void)] as const,
       },
       render: () => null,
     });
@@ -442,7 +384,7 @@ describe("Blueprint.run", () => {
         Bump: (_action, { state }) => {
           const count = state.count + 1;
           return count === 2
-            ? [{ count }, Command.stream(Stream.succeed({ _tag: "Echo" as const }))]
+            ? [{ count }, Command.effect((dispatch) => dispatch({ _tag: "Echo" as const }))]
             : { count };
         },
         Echo: (_action, { state }) => ({ count: state.count + 10 }),
@@ -475,7 +417,7 @@ describe("Blueprint.run", () => {
           state.count === 0
             ? [
                 { count: state.count + 1 },
-                Command.stream(Stream.succeed({ _tag: "Bump" as const })),
+                Command.effect((dispatch) => dispatch({ _tag: "Bump" as const })),
               ]
             : { count: state.count + 1 },
       },
@@ -503,11 +445,11 @@ describe("Blueprint.run", () => {
       reducer: {
         Bump: (_action, { state }) => [
           { count: state.count + 1 },
-          Command.stream(Stream.succeed({ _tag: "Echo" as const })),
+          Command.effect((dispatch) => dispatch({ _tag: "Echo" as const })),
         ],
         Echo: (_action, { state }) => [
           { count: state.count + 10 },
-          Command.stream(Stream.succeed({ _tag: "Done" as const })),
+          Command.effect((dispatch) => dispatch({ _tag: "Done" as const })),
         ],
         Done: (_action, { state }) => ({ count: state.count + 100 }),
       },
@@ -533,12 +475,15 @@ describe("Blueprint.run", () => {
       reducer: {
         Bump: (_action, { state }) => [
           { count: state.count + 1 },
-          Command.stream(
-            Stream.fromIterable([
-              { _tag: "Tick" as const },
-              { _tag: "Tick" as const },
-              { _tag: "Tick" as const },
-            ]),
+          Command.effect((dispatch) =>
+            Stream.runForEach(
+              Stream.fromIterable([
+                { _tag: "Tick" as const },
+                { _tag: "Tick" as const },
+                { _tag: "Tick" as const },
+              ]),
+              dispatch,
+            ),
           ),
         ],
         Tick: (_action, { state }) => ({ count: state.count + 10 }),
@@ -608,529 +553,11 @@ describe("Blueprint.run", () => {
     ).rejects.toThrow(/No reducer handler/);
   });
 
-  it("Batch runs members independently, each keeping its own policy", async () => {
-    const { ref, layer } = makeLogLayer();
-    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Go]) });
-    const feature = Feature.create({
-      initialState: () => ({ count: 0 }),
-      reducer: {
-        Go: (action) => [
-          { count: 0 },
-          Command.batch(
-            Command.effect(
-              Effect.andThen(push(`${action.id}:start`), Effect.sleep(`${action.ms} millis`)),
-            ).pipe(Command.restart(`a-${action.id}`)),
-            Command.effect(push(`${action.id}:other`)),
-          ),
-        ],
-      },
-      render: () => null,
-    });
-
-    await Effect.runPromise(
-      feature.run([{ _tag: "Go", ms: 5, id: "x" }], { props: {}, hooks: {}, layer }),
-    );
-
-    const log = await Effect.runPromise(Ref.get(ref));
-    expect(log).toContain("x:start");
-    expect(log).toContain("x:other");
-  });
-
-  it("Batch members keep their own policies — one guarded member does not govern the others", async () => {
-    const { ref, layer } = makeLogLayer();
-    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Go]) });
-    const feature = Feature.create({
-      initialState: () => ({ count: 0 }),
-      reducer: {
-        Go: (action) => [
-          { count: 0 },
-          Command.batch(
-            // Guarded by "ignore": still in flight when the second Go lands,
-            // so that one is dropped.
-            Command.effect(
-              Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:guarded`)),
-            ).pipe(Command.ignore("g")),
-            // Unguarded sibling: must run on *both* dispatches. If a batch
-            // applied one member's policy to the whole node, this would be
-            // dropped too and the assertion below would catch it.
-            Command.effect(push(`${action.id}:free`)),
-          ),
-        ],
-      },
-      render: () => null,
-    });
-
-    await Effect.runPromise(
-      feature.run(
-        [
-          { _tag: "Go", ms: 20, id: "first" },
-          { _tag: "Go", ms: 0, id: "second" },
-        ],
-        { props: {}, hooks: {}, layer },
-      ),
-    );
-
-    const log = await Effect.runPromise(Ref.get(ref));
-    expect(log).toContain("first:guarded");
-    expect(log).not.toContain("second:guarded");
-    expect(log).toContain("first:free");
-    expect(log).toContain("second:free");
-  });
-
-  it("Batch members occupy their own groups — cancelling one leaves its sibling running", async () => {
-    const { ref, layer } = makeLogLayer();
-    const Feature = define({
-      props: RunProps,
-      state: RunState,
-      action: Action.of([Go, Action("Stop", {}), Action("Arm", {})]),
-    });
-    const feature = Feature.create({
-      initialState: () => ({ count: 0 }),
-      reducer: {
-        Go: () => [
-          { count: 0 },
-          // Two members under the same tag but different keys. If a batch
-          // shared one group across its members, cancelling "a" would take
-          // "b" with it — the policy test above cannot see that, since it
-          // only distinguishes which member's *policy* applied.
-          Command.batch(
-            Command.effect(
-              Effect.andThen(
-                push("a:start"),
-                Effect.andThen(Effect.sleep("200 millis"), push("a:done")),
-              ),
-            ).pipe(Command.queue("a")),
-            Command.effect(
-              Effect.andThen(
-                push("b:start"),
-                Effect.andThen(Effect.sleep("60 millis"), push("b:done")),
-              ),
-            ).pipe(Command.queue("b")),
-          ),
-        ],
-        Arm: () => [
-          { count: 0 },
-          Command.stream(
-            Stream.fromEffect(
-              Effect.andThen(Effect.sleep("20 millis"), Effect.succeed({ _tag: "Stop" as const })),
-            ),
-          ),
-        ],
-        Stop: () => [{ count: 0 }, Command.cancel({ tag: "Go", key: "a" })],
-      },
-      render: () => null,
-    });
-
-    await Effect.runPromise(
-      feature.run([{ _tag: "Go", ms: 0, id: "x" }, { _tag: "Arm" }], {
-        props: {},
-        hooks: {},
-        layer,
-      }),
-    );
-
-    const log = await Effect.runPromise(Ref.get(ref));
-    expect(log).toContain("a:start");
-    expect(log).toContain("b:start");
-    expect(log).not.toContain("a:done");
-    expect(log).toContain("b:done");
-  });
-
-  it("Cancel by tag only interrupts every group under that tag", async () => {
-    const { ref, layer } = makeLogLayer();
-    const Feature = define({
-      props: RunProps,
-      state: RunState,
-      action: Action.of([Go, Action("Stop", {}), Action("Arm", {})]),
-    });
-    const feature = Feature.create({
-      initialState: () => ({ count: 0 }),
-      reducer: {
-        Go: (action) => [
-          { count: 0 },
-          Command.effect(
-            Effect.ensuring(
-              Effect.andThen(
-                push(`${action.id}:start`),
-                Effect.andThen(Effect.sleep("200 millis"), push(`${action.id}:done`)),
-              ),
-              push(`${action.id}:ensuring`),
-            ),
-          ).pipe(Command.queue(action.id)),
-        ],
-
-        /**
-         * `Stop` is emitted by a command rather than seeded, and that is
-         * load-bearing. Seeds are all offered to the queue up-front, and the
-         * drain loop can reach `Stop` before either forked fiber has been
-         * scheduled — so cancelling would interrupt fibers that never started,
-         * which is a different thing from interrupting a *running* group and
-         * leaves no finalizer trace to prove otherwise.
-         */
-        Arm: () => [
-          { count: 0 },
-          Command.stream(
-            Stream.fromEffect(
-              Effect.andThen(Effect.sleep("30 millis"), Effect.succeed({ _tag: "Stop" as const })),
-            ),
-          ),
-        ],
-        Stop: () => [{ count: 0 }, Command.cancel("Go")],
-      },
-      render: () => null,
-    });
-
-    await Effect.runPromise(
-      feature.run(
-        [{ _tag: "Go", ms: 0, id: "a" }, { _tag: "Go", ms: 0, id: "b" }, { _tag: "Arm" }],
-        { props: {}, hooks: {}, layer },
-      ),
-    );
-
-    const log = await Effect.runPromise(Ref.get(ref));
-    // Both groups were genuinely running when the cancel landed...
-    expect(log).toContain("a:start");
-    expect(log).toContain("b:start");
-    // ...neither completed...
-    expect(log).not.toContain("a:done");
-    expect(log).not.toContain("b:done");
-    // ...and both were interrupted rather than never scheduled. The two
-    // absences above are equally satisfied by work that never started; the
-    // finalizer only runs for a fiber that did.
-    expect(log).toContain("a:ensuring");
-    expect(log).toContain("b:ensuring");
-  });
-
-  it("Cancel by tag+key interrupts only that specific group", async () => {
-    const { ref, layer } = makeLogLayer();
-    const Feature = define({
-      props: RunProps,
-      state: RunState,
-      action: Action.of([Go, Action("Stop", { id: Schema.String }), Action("Arm", {})]),
-    });
-    const feature = Feature.create({
-      initialState: () => ({ count: 0 }),
-      reducer: {
-        Go: (action) => [
-          { count: 0 },
-          Command.effect(
-            Effect.ensuring(
-              Effect.andThen(
-                push(`${action.id}:start`),
-                Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
-              ),
-              push(`${action.id}:ensuring`),
-            ),
-          ).pipe(Command.queue(action.id)),
-        ],
-        // Delayed like the tag-only test, and for the same reason: a seeded
-        // `Stop` can be reached before either group has been scheduled, and
-        // "cancelled only group a" is not shown by killing a fiber that never
-        // ran.
-        Arm: () => [
-          { count: 0 },
-          Command.stream(
-            Stream.fromEffect(
-              Effect.andThen(
-                Effect.sleep("20 millis"),
-                Effect.succeed({ _tag: "Stop" as const, id: "a" }),
-              ),
-            ),
-          ),
-        ],
-        Stop: (action) => [{ count: 0 }, Command.cancel({ tag: "Go", key: action.id })],
-      },
-      render: () => null,
-    });
-
-    await Effect.runPromise(
-      feature.run(
-        [{ _tag: "Go", ms: 200, id: "a" }, { _tag: "Go", ms: 60, id: "b" }, { _tag: "Arm" }],
-        { props: {}, hooks: {}, layer },
-      ),
-    );
-
-    const log = await Effect.runPromise(Ref.get(ref));
-    // Both were running when the cancel landed.
-    expect(log).toContain("a:start");
-    expect(log).toContain("b:start");
-    // Only `a`'s group was named, and only `a` was interrupted — its finalizer
-    // proves it got far enough to be interrupted rather than never started.
-    expect(log).not.toContain("a:done");
-    expect(log).toContain("a:ensuring");
-    // The unnamed sibling ran to completion.
-    expect(log).toContain("b:done");
-  });
-
-  it('policy "restart" interrupts the prior in-flight fiber in the same group', async () => {
-    const { ref, layer } = makeLogLayer();
-    const Feature = define({
-      props: RunProps,
-      state: RunState,
-      action: Action.of([Go, Action("Arm", {})]),
-    });
-    const feature = Feature.create({
-      initialState: () => ({ count: 0 }),
-      reducer: {
-        Go: (action) => [
-          { count: 0 },
-          Command.effect(
-            Effect.ensuring(
-              Effect.andThen(
-                push(`${action.id}:start`),
-                Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
-              ),
-              push(`${action.id}:ensuring`),
-            ),
-          ).pipe(Command.restart("group")),
-        ],
-        // The second dispatch arrives late, so the first is genuinely
-        // *in-flight* when it lands. Seeded back-to-back, both would be
-        // handled in one drain pass and the "prior" fiber would be interrupted
-        // before the scheduler ever started it — which is not what the
-        // criterion says restart does.
-        Arm: () => [
-          { count: 0 },
-          Command.stream(
-            Stream.fromEffect(
-              Effect.andThen(
-                Effect.sleep("20 millis"),
-                Effect.succeed({ _tag: "Go" as const, ms: 0, id: "second" }),
-              ),
-            ),
-          ),
-        ],
-      },
-      render: () => null,
-    });
-
-    await Effect.runPromise(
-      feature.run([{ _tag: "Go", ms: 200, id: "first" }, { _tag: "Arm" }], {
-        props: {},
-        hooks: {},
-        layer,
-      }),
-    );
-
-    const log = await Effect.runPromise(Ref.get(ref));
-    // The first was running...
-    expect(log).toContain("first:start");
-    // ...was interrupted rather than allowed to finish...
-    expect(log).not.toContain("first:done");
-    expect(log).toContain("first:ensuring");
-    // ...and the restarting dispatch ran in its place.
-    expect(log).toContain("second:done");
-  });
-
-  it('policy "ignore" drops a new dispatch while one is in-flight', async () => {
-    const { ref, layer } = makeLogLayer();
-    const Arm = Action("Arm", { delay: Schema.Number, id: Schema.String });
-    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Go, Arm]) });
-    const feature = Feature.create({
-      initialState: () => ({ count: 0 }),
-      reducer: {
-        Go: (action) => [
-          { count: 0 },
-          Command.effect(
-            Effect.andThen(
-              push(`${action.id}:start`),
-              Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
-            ),
-          ).pipe(Command.ignore("group")),
-        ],
-        Arm: (action) => [
-          { count: 0 },
-          Command.stream(
-            Stream.fromEffect(
-              Effect.andThen(
-                Effect.sleep(`${action.delay} millis`),
-                Effect.succeed({ _tag: "Go" as const, ms: 0, id: action.id }),
-              ),
-            ),
-          ),
-        ],
-      },
-      render: () => null,
-    });
-
-    await Effect.runPromise(
-      feature.run(
-        [
-          { _tag: "Go", ms: 60, id: "first" },
-          // Lands while `first` is running — dropped.
-          { _tag: "Arm", delay: 20, id: "second" },
-          // Lands well after `first` has settled — must be admitted. Nothing
-          // previously distinguished "ignore while busy" from "ignore
-          // forever": a group that never reopened passed the old test.
-          { _tag: "Arm", delay: 200, id: "third" },
-        ],
-        { props: {}, hooks: {}, layer },
-      ),
-    );
-
-    const log = await Effect.runPromise(Ref.get(ref));
-    expect(log).toContain("first:start");
-    expect(log).toContain("first:done");
-    expect(log).not.toContain("second:start");
-    expect(log).not.toContain("second:done");
-    expect(log).toContain("third:done");
-  });
-
-  it('policy "queue" defers a new dispatch until the prior settles; both complete', async () => {
-    const { ref, layer } = makeLogLayer();
-    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Go]) });
-    const feature = Feature.create({
-      initialState: () => ({ count: 0 }),
-      reducer: {
-        Go: (action) => [
-          { count: 0 },
-          Command.effect(
-            Effect.andThen(
-              push(`${action.id}:start`),
-              Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
-            ),
-          ).pipe(Command.queue("group")),
-        ],
-      },
-      render: () => null,
-    });
-
-    await Effect.runPromise(
-      feature.run(
-        [
-          { _tag: "Go", ms: 40, id: "first" },
-          { _tag: "Go", ms: 0, id: "second" },
-        ],
-        { props: {}, hooks: {}, layer },
-      ),
-    );
-
-    const log = await Effect.runPromise(Ref.get(ref));
-    // The criterion says the newcomer waits *before running*, which completion
-    // order alone cannot show — a second command that started immediately and
-    // happened to finish later would produce the same two `:done` entries in
-    // the same order. Interleaving the starts pins it: under "parallel" this
-    // reads first:start, second:start, second:done, first:done.
-    expect(log).toEqual(["first:start", "first:done", "second:start", "second:done"]);
-  });
-
-  it('policy "parallel" (the default) runs concurrent dispatches concurrently; both complete', async () => {
-    const { ref, layer } = makeLogLayer();
-    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Go]) });
-    const feature = Feature.create({
-      initialState: () => ({ count: 0 }),
-      reducer: {
-        Go: (action) => [
-          { count: 0 },
-          Command.effect(
-            Effect.andThen(
-              push(`${action.id}:start`),
-              Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
-            ),
-          ),
-        ],
-      },
-      render: () => null,
-    });
-
-    await Effect.runPromise(
-      feature.run(
-        [
-          { _tag: "Go", ms: 40, id: "first" },
-          { _tag: "Go", ms: 0, id: "second" },
-        ],
-        { props: {}, hooks: {}, layer },
-      ),
-    );
-
-    const log = await Effect.runPromise(Ref.get(ref));
-    // "Both completed" is equally true under "queue", so it cannot show that
-    // the default is concurrent. The interleaving is what does: the second
-    // starts while the first is still sleeping and overtakes it. Under
-    // "queue" this same feature reads
-    // first:start, first:done, second:start, second:done — the exact inverse
-    // asserted by the test above.
-    expect(log).toEqual(["first:start", "second:start", "second:done", "first:done"]);
-  });
-
-  it("a nested Guarded policy does not override an outer one — outermost wins", async () => {
-    const { ref, layer } = makeLogLayer();
-    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Go]) });
-    const feature = Feature.create({
-      initialState: () => ({ count: 0 }),
-      reducer: {
-        Go: (action) => [
-          { count: 0 },
-          // Outer "ignore" wraps an inner "restart" — outer should win, so a
-          // second dispatch is dropped rather than interrupting the first.
-          Command.effect(
-            Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
-          )
-            .pipe(Command.restart("group"))
-            .pipe(Command.ignore("group")),
-        ],
-      },
-      render: () => null,
-    });
-
-    await Effect.runPromise(
-      feature.run(
-        [
-          { _tag: "Go", ms: 20, id: "first" },
-          { _tag: "Go", ms: 0, id: "second" },
-        ],
-        { props: {}, hooks: {}, layer },
-      ),
-    );
-
-    const log = await Effect.runPromise(Ref.get(ref));
-    expect(log).toContain("first:done");
-    expect(log).not.toContain("second:done");
-  });
-
-  it("outermost wins in the other arrangement too — outer restart over inner ignore", async () => {
-    const { ref, layer } = makeLogLayer();
-    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Go]) });
-    const feature = Feature.create({
-      initialState: () => ({ count: 0 }),
-      reducer: {
-        Go: (action) => [
-          { count: 0 },
-          // The mirror of the test above. One arrangement alone cannot tell
-          // "the outermost policy wins" apart from "ignore always wins", since
-          // both predict the same log. Here outer `restart` must beat inner
-          // `ignore`: the second dispatch interrupts the first rather than
-          // being dropped by it, which is the opposite outcome.
-          Command.effect(
-            Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
-          )
-            .pipe(Command.ignore("inner"))
-            .pipe(Command.restart("outer")),
-        ],
-      },
-      render: () => null,
-    });
-
-    await Effect.runPromise(
-      feature.run(
-        [
-          { _tag: "Go", ms: 200, id: "first" },
-          { _tag: "Go", ms: 0, id: "second" },
-        ],
-        { props: {}, hooks: {}, layer },
-      ),
-    );
-
-    const log = await Effect.runPromise(Ref.get(ref));
-    expect(log).not.toContain("first:done");
-    expect(log).toContain("second:done");
-  });
-
   it("services requested by a command are satisfied from options.layer", async () => {
     const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
     const feature = Feature.create({
       initialState: () => ({ count: 0 }),
-      reducer: { Bump: () => [{ count: 1 }, Command.effect(push("via-layer"))] },
+      reducer: { Bump: () => [{ count: 1 }, Command.effect(() => push("via-layer"))] },
       render: () => null,
     });
 
@@ -1139,84 +566,6 @@ describe("Blueprint.run", () => {
 
     const log = await Effect.runPromise(Ref.get(ref));
     expect(log).toEqual(["via-layer"]);
-  });
-
-  it("one stream's emissions are routed per element — actions to the reducer, outputs out", async () => {
-    const Feature = define({
-      props: RunProps,
-      state: RunState,
-      action: Action.of([Bump]),
-      output: Action.of([Announced]),
-    });
-    const feature = Feature.create({
-      initialState: () => ({ count: 0 }),
-      reducer: {
-        // Routing is by `_tag` and nothing else, so a single stream carrying
-        // both kinds is the case that proves it: the destination is a property
-        // of each element, not of the command that produced them.
-        Bump: (_action, { state }) =>
-          state.count === 0
-            ? [
-                { count: 1 },
-                Command.stream(
-                  Stream.fromIterable([
-                    { _tag: "Announced" as const, id: "a1" },
-                    { _tag: "Bump" as const },
-                    { _tag: "Announced" as const, id: "a2" },
-                  ]),
-                ),
-              ]
-            : { count: state.count + 1 },
-      },
-      render: () => null,
-    });
-
-    const { state, emitted, outputs } = await Effect.runPromise(
-      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer: Layer.empty }),
-    );
-
-    // Seed `Bump` took count to 1; the streamed `Bump` re-entered and took it
-    // to 2. The two outputs never reached the reducer.
-    expect(state).toEqual({ count: 2 });
-    expect(emitted).toEqual([{ _tag: "Bump" }]);
-    expect(outputs).toEqual([
-      { _tag: "Announced", id: "a1" },
-      { _tag: "Announced", id: "a2" },
-    ]);
-  });
-
-  it("Command.effect runs for effects and emits nothing, even when it succeeds with an action", async () => {
-    const { ref, layer } = makeLogLayer();
-    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
-    const feature = Feature.create({
-      initialState: () => ({ count: 0 }),
-      reducer: {
-        // Guarded on `count` so that a regression fails the assertions below
-        // rather than emitting `Bump` forever and hanging the suite.
-        Bump: (_action, { state }) =>
-          state.count === 0
-            ? [
-                { count: 1 },
-                // Succeeds *with a well-formed action*. `interpret` wraps the
-                // effect in `Effect.asVoid`, so the success value is discarded
-                // rather than offered to the queue — an effect command has no
-                // emission channel, only the `R` it asked for.
-                Command.effect(
-                  Effect.andThen(push("ran"), Effect.succeed({ _tag: "Bump" as const })),
-                ),
-              ]
-            : { count: state.count + 1 },
-      },
-      render: () => null,
-    });
-
-    const { state, emitted } = await Effect.runPromise(
-      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer }),
-    );
-
-    expect(await Effect.runPromise(Ref.get(ref))).toEqual(["ran"]);
-    expect(state).toEqual({ count: 1 });
-    expect(emitted).toEqual([]);
   });
 
   it("Command.none is interpreted as a no-op and does not hold up quiescence", async () => {
@@ -1239,41 +588,6 @@ describe("Blueprint.run", () => {
     expect(outputs).toEqual([]);
   });
 
-  it("services reach a stream command too, not only an effect command", async () => {
-    const { ref, layer } = makeLogLayer();
-    const Echo = Action("Echo", {});
-    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump, Echo]) });
-    const feature = Feature.create({
-      initialState: () => ({ count: 0 }),
-      reducer: {
-        // The criterion names effect *and* stream, and only the effect half
-        // had a test. `R` is computed the same way for both — by walking
-        // handler return types — so a stream's requirement reaching the layer
-        // is a separate path worth pinning.
-        Bump: () => [
-          { count: 1 },
-          Command.stream(
-            Stream.fromEffect(
-              Effect.andThen(push("from-stream"), Effect.succeed({ _tag: "Echo" as const })),
-            ),
-          ),
-        ],
-        Echo: (_action, { state }) => ({ count: state.count + 10 }),
-      },
-      render: () => null,
-    });
-
-    const { state, emitted } = await Effect.runPromise(
-      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer }),
-    );
-
-    // The service was reachable from inside the stream...
-    expect(await Effect.runPromise(Ref.get(ref))).toEqual(["from-stream"]);
-    // ...and what it emitted still routed back through the reducer.
-    expect(state).toEqual({ count: 11 });
-    expect(emitted).toEqual([{ _tag: "Echo" }]);
-  });
-
   it("resolves only once quiescent, including a settle with no emission", async () => {
     const { ref, layer } = makeLogLayer();
     const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
@@ -1286,7 +600,7 @@ describe("Blueprint.run", () => {
       reducer: {
         Bump: () => [
           { count: 1 },
-          Command.effect(Effect.andThen(Effect.sleep("50 millis"), push("late"))),
+          Command.effect(() => Effect.andThen(Effect.sleep("50 millis"), push("late"))),
         ],
       },
       render: () => null,
@@ -1378,41 +692,6 @@ describe("Blueprint.run", () => {
     );
 
     expect(captured).toEqual([]);
-  });
-
-  it("run does not terminate while a command's stream never completes", async () => {
-    // Pins current behavior; it is not the desired behavior. `runGuarded`
-    // increments `inFlight` and only decrements after `Fiber.await` settles, so
-    // a stream that never completes holds it at 1, the quiescence break
-    // (`queueSize === 0 && inFlightCount === 0`) is never taken, and the drain
-    // loop blocks on `Queue.take`. The fix is the deferred `Cmd`/`Sub` split —
-    // see specs.md, Design decisions §3 — so this test exists to make that
-    // change visible when it lands rather than to pass today.
-    //
-    // The timeout is load-bearing: without it a plain `it` hangs the suite
-    // instead of failing it.
-    const runWith = (command: Command<never, never>) => {
-      const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
-      const feature = Feature.create({
-        initialState: () => ({ count: 0 }),
-        reducer: { Bump: () => [{ count: 1 }, command] as const },
-        render: () => null,
-      });
-
-      return Effect.runPromise(
-        feature
-          .run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer: Layer.empty })
-          .pipe(Effect.timeoutOption("100 millis")),
-      );
-    };
-
-    // Control first: the same harness on the same budget with a stream that
-    // completes. Without it, a timeout assertion passes for any reason at all —
-    // including a broken harness that never ran the feature.
-    expect(Option.isSome(await runWith(Command.stream(Stream.empty)))).toBe(true);
-
-    // Subject: identical but for the stream, and it never settles.
-    expect(await runWith(Command.stream(Stream.never))).toEqual(Option.none());
   });
 
   it("an unhandled lifecycle action in run() leaves state unchanged and does not throw", async () => {
@@ -1995,7 +1274,7 @@ describe("createFeatureStore — feature layers", () => {
       reducer: {
         Use: (_action: unknown, snapshot: { readonly state: { readonly count: number } }) => [
           snapshot.state,
-          Command.effect(Effect.flatMap(Probe, (probe) => Effect.sync(() => probe.mark()))),
+          Command.effect(() => Effect.flatMap(Probe, (probe) => Effect.sync(() => probe.mark()))),
         ],
       } as any,
       render: () => null,
@@ -2096,7 +1375,10 @@ describe("createFeatureStore — defects from commands (review regression)", () 
     // Was discarded entirely: `runGuarded` forks and threw the fiber's Exit
     // away, so nothing upstream could ever see it.
     const { store, defects } = setup({
-      Boom: (_a: unknown, s: any) => [s.state, Command.effect(Effect.die(new Error("cmd boom")))],
+      Boom: (_a: unknown, s: any) => [
+        s.state,
+        Command.effect(() => Effect.die(new Error("cmd boom"))),
+      ],
       Error: (_a: unknown, s: any) => ({ handled: s.state.handled + 1 }),
     });
 
@@ -2110,7 +1392,10 @@ describe("createFeatureStore — defects from commands (review regression)", () 
 
   it("sends a dying command to the boundary when no `Error` handler exists", async () => {
     const { store, defects } = setup({
-      Boom: (_a: unknown, s: any) => [s.state, Command.effect(Effect.die(new Error("cmd boom")))],
+      Boom: (_a: unknown, s: any) => [
+        s.state,
+        Command.effect(() => Effect.die(new Error("cmd boom"))),
+      ],
     });
 
     store.start();
@@ -2122,12 +1407,23 @@ describe("createFeatureStore — defects from commands (review regression)", () 
   });
 
   it("does not mistake an interrupted command for a defect", async () => {
-    // Interruption is how `restart` and unmount end a command. Treating every
+    // Interruption is how `Cancel` and unmount end a command. Treating every
     // non-success Exit as a defect would fire `Error` on ordinary cancellation.
+    //
+    // The second dispatch used to be what interrupted the first, via a
+    // `restart` policy. With the policy vocabulary gone the handler cancels its
+    // own group before forking again, which is the same story told where the
+    // reader can see it.
     const { store, defects } = setup({
       Boom: (_a: unknown, s: any) => [
         s.state,
-        Command.effect(Effect.sleep("5 seconds")).pipe(Command.restart()),
+        Command.batch(
+          Command.cancel({ tag: "Boom", key: "sleep" }),
+          Command.keyed(
+            "sleep",
+            Command.effect(() => Effect.sleep("5 seconds")),
+          ),
+        ),
       ],
       Error: (_a: unknown, s: any) => ({ handled: s.state.handled + 1 }),
     });
@@ -2184,7 +1480,7 @@ describe("createFeatureStore — remount races (review regression)", () => {
         }),
         Mounted: (_action: unknown, snapshot: { readonly state: { readonly count: number } }) => [
           snapshot.state,
-          Command.effect(
+          Command.effect(() =>
             Effect.sleep("10 millis").pipe(Effect.andThen(Effect.sync(() => ran.push("loaded")))),
           ),
         ],
@@ -2244,7 +1540,7 @@ describe("createFeatureStore — remount races (review regression)", () => {
         // own service, so the layer must outlive the `Unmounted` command.
         Unmounted: (_action: unknown, snapshot: { readonly state: unknown }) => [
           snapshot.state,
-          Command.effect(Effect.flatMap(Lock, (lock) => Effect.sync(() => lock.release()))),
+          Command.effect(() => Effect.flatMap(Lock, (lock) => Effect.sync(() => lock.release()))),
         ],
       } as any,
       render: () => null,
@@ -2362,11 +1658,14 @@ describe("createFeatureStore — review iteration 2 regressions", () => {
     let errorRuns = 0;
 
     const { store, defects } = make({
-      Boom: (_a: unknown, s: any) => [s.state, Command.effect(Effect.die(new Error("first")))],
+      Boom: (_a: unknown, s: any) => [
+        s.state,
+        Command.effect(() => Effect.die(new Error("first"))),
+      ],
       Step: (_a: unknown, s: any) => s.state,
       Error: (_a: unknown, s: any) => {
         errorRuns += 1;
-        return [s.state, Command.effect(Effect.die(new Error("reporting failed")))];
+        return [s.state, Command.effect(() => Effect.die(new Error("reporting failed")))];
       },
     });
 
@@ -2381,17 +1680,28 @@ describe("createFeatureStore — review iteration 2 regressions", () => {
     expect(String(defects[0])).toContain("reporting failed");
   });
 
-  it("a dying command does not cancel the one queued behind it", async () => {
+  it("a dying command does not take down the one dispatched after it", async () => {
     const ran: Array<string> = [];
 
+    // The two used to share a `queue` policy, which is how they came to be
+    // adjacent at all. With the policies gone they are simply two commands in
+    // one group, and the property under test is the one that survived: a fiber
+    // that dies is reported, and its siblings are neither cancelled nor
+    // implicated.
     const { store } = make({
       Boom: (_a: unknown, s: any) => [
         s.state,
-        Command.effect(Effect.die(new Error("first"))).pipe(Command.queue("q")),
+        Command.keyed(
+          "q",
+          Command.effect(() => Effect.die(new Error("first"))),
+        ),
       ],
       Step: (_a: unknown, s: any) => [
         s.state,
-        Command.effect(Effect.sync(() => void ran.push("second"))).pipe(Command.queue("q")),
+        Command.keyed(
+          "q",
+          Command.effect(() => Effect.sync(() => void ran.push("second"))),
+        ),
       ],
     });
 
@@ -2400,7 +1710,6 @@ describe("createFeatureStore — review iteration 2 regressions", () => {
     store.dispatch({ _tag: "Step" } as never);
     await Effect.runPromise(Effect.sleep("50 millis"));
 
-    // `queue` means "wait your turn", not "share their fate".
     expect(ran).toEqual(["second"]);
   });
 
@@ -2438,16 +1747,17 @@ describe("createFeatureStore — review iteration 2 regressions", () => {
         // draining fiber. `stop` clearing `mount` dropped exactly this.
         Flushed: (_action: unknown, snapshot: { readonly state: unknown }) => [
           snapshot.state,
-          Command.effect(Effect.sync(() => void ran.push("lock-released"))),
+          Command.effect(() => Effect.sync(() => void ran.push("lock-released"))),
         ],
         Unmounted: (_action: unknown, snapshot: { readonly state: unknown }) => [
           snapshot.state,
-          Command.stream(
-            Stream.fromEffect(
+          Command.effect((dispatch: (action: unknown) => Effect.Effect<void>) =>
+            Effect.flatMap(
               Effect.sync(() => {
                 ran.push("session-closed");
                 return { _tag: "Flushed" as const };
               }),
+              dispatch,
             ),
           ),
         ],
@@ -2481,7 +1791,7 @@ describe("createFeatureStore — review iteration 2 regressions", () => {
       Boom: (_a: unknown, s: any) => s.state,
       Step: (_a: unknown, s: any) => [
         s.state,
-        Command.effect(Effect.sync(() => void ran.push("early"))),
+        Command.effect(() => Effect.sync(() => void ran.push("early"))),
       ],
     });
 
@@ -2521,11 +1831,11 @@ describe("Command.batch grouping (review iteration 3)", () => {
   };
 
   const slow = (label: string, ms: number, log: Array<string>) =>
-    Command.effect(
+    Command.effect(() =>
       Effect.sleep(`${ms} millis`).pipe(Effect.andThen(Effect.sync(() => void log.push(label)))),
     );
 
-  it("keyed `Command.cancel` still reaches a policy-wrapped batch", async () => {
+  it("keyed `Command.cancel` reaches every member of a keyed batch", async () => {
     // Indexing batch members into per-member groups broke exactly this:
     // `cancelGroup` matches an explicit key *exactly*, so `Load::k#0` was
     // unreachable from `cancel({ tag, key })` and nothing was interrupted.
@@ -2534,7 +1844,7 @@ describe("Command.batch grouping (review iteration 3)", () => {
     const s = store({
       Go: (_a: unknown, snap: { readonly state: unknown }) => [
         snap.state,
-        Command.batch(slow("a", 60, log), slow("b", 60, log)).pipe(Command.restart("k")),
+        Command.keyed("k", Command.batch(slow("a", 60, log), slow("b", 60, log))),
       ],
       Stop: (_a: unknown, snap: { readonly state: unknown }) => [
         snap.state,
@@ -2549,167 +1859,6 @@ describe("Command.batch grouping (review iteration 3)", () => {
     await Effect.runPromise(Effect.sleep("100 millis"));
 
     expect(log).toEqual([]);
-  });
-
-  it("`queue` around a batch still serialises its members", async () => {
-    // Per-member groups made each member wait only on itself, so both started
-    // at once — the exact interleaving `queue` exists to prevent.
-    const log: Array<string> = [];
-
-    const step = (label: string) =>
-      Command.effect(
-        Effect.sync(() => void log.push(`${label}:start`)).pipe(
-          Effect.andThen(Effect.sleep("30 millis")),
-          Effect.andThen(Effect.sync(() => void log.push(`${label}:done`))),
-        ),
-      );
-
-    const s = store({
-      Go: (_a: unknown, snap: { readonly state: unknown }) => [
-        snap.state,
-        Command.batch(step("a"), step("b")).pipe(Command.queue("k")),
-      ],
-      Stop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
-    });
-
-    s.start();
-    s.dispatch({ _tag: "Go" } as never);
-    await Effect.runPromise(Effect.sleep("120 millis"));
-
-    expect(log).toEqual(["a:start", "a:done", "b:start", "b:done"]);
-  });
-
-  const sleep = (ms: number) => Effect.runPromise(Effect.sleep(`${ms} millis`));
-
-  it("`ignore` around a batch runs every member", async () => {
-    // The members share one group — that is what keeps a keyed `cancel`
-    // working — so the second one used to see `running.length > 0` and return
-    // without forking. `ignore` defers to an earlier *dispatch*, not to a
-    // sibling forked microseconds ago.
-    const log: Array<string> = [];
-
-    const s = store({
-      Go: (_a: unknown, snap: { readonly state: unknown }) => [
-        snap.state,
-        Command.batch(slow("a", 10, log), slow("b", 10, log)).pipe(Command.ignore("k")),
-      ],
-      Stop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
-    });
-
-    s.start();
-    s.dispatch({ _tag: "Go" } as never);
-    await sleep(80);
-
-    expect([...log].sort()).toEqual(["a", "b"]);
-  });
-
-  it("`ignore` around a batch still drops a whole second dispatch", async () => {
-    // The other half of the same criterion: distinguishing sibling from
-    // predecessor must not cost the deferral that `ignore` is for.
-    const log: Array<string> = [];
-    let dispatches = 0;
-
-    const s = store({
-      Go: (_a: unknown, snap: { readonly state: unknown }) => {
-        const round = ++dispatches;
-        return [
-          snap.state,
-          Command.batch(slow(`a${round}`, 60, log), slow(`b${round}`, 60, log)).pipe(
-            Command.ignore("k"),
-          ),
-        ];
-      },
-      Stop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
-    });
-
-    s.start();
-    s.dispatch({ _tag: "Go" } as never);
-    await sleep(15);
-    s.dispatch({ _tag: "Go" } as never);
-    await sleep(150);
-
-    expect([...log].sort()).toEqual(["a1", "b1"]);
-  });
-
-  it("`restart` around a batch does not have members interrupt each other", async () => {
-    const log: Array<string> = [];
-
-    const s = store({
-      Go: (_a: unknown, snap: { readonly state: unknown }) => [
-        snap.state,
-        Command.batch(slow("a", 40, log), slow("b", 40, log)).pipe(Command.restart("k")),
-      ],
-      Stop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
-    });
-
-    s.start();
-    s.dispatch({ _tag: "Go" } as never);
-    await sleep(140);
-
-    expect([...log].sort()).toEqual(["a", "b"]);
-  });
-
-  it("a second dispatch restarts every member of the batch it supersedes", async () => {
-    // Not just "the last one wins": the group rewrite `restart` performs used
-    // to replace the whole entry with the forking fiber, so a member that
-    // forked earlier in the same batch stopped being interruptible at all.
-    const log: Array<string> = [];
-    let dispatches = 0;
-
-    const s = store({
-      Go: (_a: unknown, snap: { readonly state: unknown }) => {
-        const round = ++dispatches;
-        return [
-          snap.state,
-          Command.batch(slow(`a${round}`, 50, log), slow(`b${round}`, 50, log)).pipe(
-            Command.restart("k"),
-          ),
-        ];
-      },
-      Stop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
-    });
-
-    s.start();
-    s.dispatch({ _tag: "Go" } as never);
-    await sleep(15);
-    s.dispatch({ _tag: "Go" } as never);
-    await sleep(150);
-
-    expect([...log].sort()).toEqual(["a2", "b2"]);
-  });
-
-  it("`queue` waits for every prior fiber, including siblings of one that died", async () => {
-    // `Fiber.joinAll` re-raises the first failing fiber's cause and stops
-    // joining there, so a follower was released by a predecessor's *death*
-    // while that predecessor's still-running sibling held the queue.
-    const log: Array<string> = [];
-    let dispatches = 0;
-
-    const s = store({
-      Go: (_a: unknown, snap: { readonly state: unknown }) => {
-        const round = ++dispatches;
-        return [
-          snap.state,
-          round === 1
-            ? Command.batch(
-                Command.effect(
-                  Effect.sleep("10 millis").pipe(Effect.andThen(Effect.die(new Error("boom")))),
-                ),
-                slow("slow", 60, log),
-              ).pipe(Command.queue("k"))
-            : Command.effect(Effect.sync(() => void log.push("after"))).pipe(Command.queue("k")),
-        ];
-      },
-      Stop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
-    });
-
-    s.start();
-    s.dispatch({ _tag: "Go" } as never);
-    await sleep(5);
-    s.dispatch({ _tag: "Go" } as never);
-    await sleep(200);
-
-    expect(log).toEqual(["slow", "after"]);
   });
 });
 
@@ -2732,7 +1881,7 @@ describe("createFeatureStore — a dead mount does not swallow work", () => {
       reducer: {
         Go: (_a: unknown, snap: { readonly state: { readonly count: number } }) => [
           { count: snap.state.count + 1 },
-          Command.effect(Effect.sync(() => void ran.push("go"))),
+          Command.effect(() => Effect.sync(() => void ran.push("go"))),
         ],
       } as any,
       render: () => null,
@@ -2799,7 +1948,7 @@ describe("createFeatureStore — teardown belongs to the mount that started it",
         Noop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
         Unmounted: (_a: unknown, snap: { readonly state: unknown }) => [
           snap.state,
-          Command.effect(
+          Command.effect(() =>
             Effect.sleep("30 millis").pipe(
               Effect.andThen(Effect.sync(() => void log.push("torn"))),
             ),
@@ -2867,7 +2016,7 @@ describe("createFeatureStore — teardown belongs to the mount that started it",
         // The follow-up: reached only by the teardown command emitting it.
         SecondHop: (_a: unknown, snap: { readonly state: unknown }) => [
           snap.state,
-          Command.effect(
+          Command.effect(() =>
             Effect.flatMap(Marked, (service) =>
               Effect.sync(() => void log.push(`second-hop:${service.id}`)),
             ),
@@ -2875,7 +2024,11 @@ describe("createFeatureStore — teardown belongs to the mount that started it",
         ],
         Unmounted: (_a: unknown, snap: { readonly state: unknown }) => [
           snap.state,
-          Command.stream(Stream.succeed({ _tag: "SecondHop" as const })),
+          // The reducer is cast, so there is no contextual type to carry `A`
+          // into the leaf — it is named here instead.
+          Command.effect<{ readonly _tag: "SecondHop" }>((dispatch) =>
+            dispatch({ _tag: "SecondHop" as const }),
+          ),
         ],
       } as any,
       render: () => null,
@@ -2925,7 +2078,7 @@ describe("createFeatureStore — teardown belongs to the mount that started it",
         },
         Error: (_a: unknown, snap: { readonly state: unknown }) => [
           snap.state,
-          Command.effect(
+          Command.effect(() =>
             Effect.sleep("30 millis").pipe(
               Effect.andThen(Effect.sync(() => void log.push("compensated"))),
             ),
@@ -2972,7 +2125,7 @@ describe("createFeatureStore — teardown belongs to the mount that started it",
         Noop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
         Error: (_a: unknown, snap: { readonly state: { readonly count: number } }) => [
           { count: snap.state.count + 1 },
-          Command.effect(Effect.sync(() => void ran.push("compensated"))),
+          Command.effect(() => Effect.sync(() => void ran.push("compensated"))),
         ],
       } as any,
       render: () => null,
@@ -3021,13 +2174,13 @@ describe("createFeatureStore — teardown belongs to the mount that started it",
       reducer: {
         Go: (_a: unknown, snap: { readonly state: { readonly count: number } }) => [
           { count: snap.state.count + 1 },
-          Command.effect(Effect.void),
+          Command.effect(() => Effect.void),
         ],
         // The common shape: the handler that hears about the dead layer wants
         // to do something about it, and what it returns has nowhere to run.
         Error: (_a: unknown, snap: { readonly state: unknown }) => [
           snap.state,
-          Command.effect(Effect.void),
+          Command.effect(() => Effect.void),
         ],
       } as any,
       render: () => null,
@@ -3124,7 +2277,7 @@ describe("createFeatureStore — recovery after a dead mount (review iteration 4
       reducer: {
         Retry: (_a: unknown, snap: { readonly state: { readonly count: number } }) => [
           { count: snap.state.count + 1 },
-          Command.effect(Effect.sync(() => void ran.push("retried"))),
+          Command.effect(() => Effect.sync(() => void ran.push("retried"))),
         ],
       } as any,
       render: () => null,
@@ -3195,7 +2348,7 @@ describe("createFeatureStore — teardown drains to quiescence (review iteration
       Flushed: (_a: unknown, s: any) => s.state,
       Unmounted: (_a: unknown, s: any) => [
         s.state,
-        Command.effect(Effect.die(new Error("teardown boom"))),
+        Command.effect(() => Effect.die(new Error("teardown boom"))),
       ],
     });
 
@@ -3215,11 +2368,11 @@ describe("createFeatureStore — teardown drains to quiescence (review iteration
       Flushed: (_a: unknown, s: any) => s.state,
       Unmounted: (_a: unknown, s: any) => [
         s.state,
-        Command.effect(Effect.die(new Error("teardown boom"))),
+        Command.effect(() => Effect.die(new Error("teardown boom"))),
       ],
       Error: (_a: unknown, s: any) => [
         s.state,
-        Command.effect(Effect.sync(() => void ran.push("compensated"))),
+        Command.effect(() => Effect.sync(() => void ran.push("compensated"))),
       ],
     });
 
@@ -3243,8 +2396,8 @@ describe("createFeatureStore — teardown drains to quiescence (review iteration
       Unmounted: (_a: unknown, s: any) => [
         s.state,
         Command.batch(
-          Command.effect(Effect.sleep("1 milli").pipe(Effect.andThen(Effect.die("boom")))),
-          Command.effect(
+          Command.effect(() => Effect.sleep("1 milli").pipe(Effect.andThen(Effect.die("boom")))),
+          Command.effect(() =>
             Effect.sleep("40 millis").pipe(
               Effect.andThen(Effect.sync(() => void ran.push("lock-released"))),
             ),
@@ -3268,7 +2421,7 @@ describe("createFeatureStore — teardown drains to quiescence (review iteration
     const { store } = make({
       Go: (_a: unknown, s: any) => [
         s.state,
-        Command.effect(
+        Command.effect(() =>
           Effect.sleep("20 millis").pipe(
             Effect.andThen(Effect.sync(() => void ran.push("late-write"))),
           ),
@@ -3292,9 +2445,12 @@ describe("createFeatureStore — teardown drains to quiescence (review iteration
     // `run` cannot reach quiescence here — a known limitation. Teardown can,
     // because unmount interrupts outstanding work before draining.
     const { store, defects } = make({
-      Go: (_a: unknown, s: any) => [s.state, Command.stream(Stream.never)],
+      Go: (_a: unknown, s: any) => [s.state, Command.effect(() => Effect.never)],
       Flushed: (_a: unknown, s: any) => s.state,
-      Unmounted: (_a: unknown, s: any) => [s.state, Command.effect(Effect.sync(() => void 0))],
+      Unmounted: (_a: unknown, s: any) => [
+        s.state,
+        Command.effect(() => Effect.sync(() => void 0)),
+      ],
     });
 
     store.start();
@@ -3306,5 +2462,473 @@ describe("createFeatureStore — teardown drains to quiescence (review iteration
     // -teardown defect instead.
     await Effect.runPromise(Effect.sleep("150 millis"));
     expect(defects).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The command leaf — `Command.effect`, `keyed`, `batch`
+//
+// Written against the redesigned surface. The `Command` and `Blueprint.run`
+// blocks above still drive the pre-redesign one; they are migrated in place
+// during /implement, not here.
+// ---------------------------------------------------------------------------
+
+describe("Command — the effect leaf", () => {
+  it("effect wraps the callback it was given, and does not adapt it", () => {
+    const leaf = () => Effect.void;
+    const cmd = Command.effect(leaf);
+
+    expect(cmd).toMatchObject({ _tag: "Effect" });
+    if (cmd._tag !== "Effect") throw new TypeError("expected Effect");
+    // Wrapped, not adapted — `interpret` is the only thing that transforms it,
+    // and it is what hands the callback its `dispatch`.
+    expect(cmd.effect).toBe(leaf);
+  });
+
+  it("keyed names a command, through `.pipe` and applied directly", () => {
+    const inner = Command.effect(() => Effect.void);
+
+    expect(inner.pipe(Command.keyed("query"))).toMatchObject({
+      _tag: "Keyed",
+      key: "query",
+      command: { _tag: "Effect" },
+    });
+    expect(Command.keyed("query")(inner)).toMatchObject({ _tag: "Keyed", key: "query" });
+  });
+
+  it("keyed nests rather than collapsing, so the outermost name can win", () => {
+    const cmd = Command.effect(() => Effect.void)
+      .pipe(Command.keyed("inner"))
+      .pipe(Command.keyed("outer"));
+
+    // Structure, not just the outer tag: `interpret` resolves outermost-first,
+    // which it can only do if both nodes survive construction.
+    expect(cmd).toMatchObject({
+      _tag: "Keyed",
+      key: "outer",
+      command: { _tag: "Keyed", key: "inner", command: { _tag: "Effect" } },
+    });
+  });
+
+  it("batch collects its members in order", () => {
+    const cmd = Command.batch(Command.cancel("Foo"), Command.none);
+
+    // Order is the whole contract of the node — a `Cancel` that ran after the
+    // command replacing it would interrupt the replacement.
+    expect(cmd).toMatchObject({
+      _tag: "Batch",
+      commands: [{ _tag: "Cancel", target: { tag: "Foo" } }, { _tag: "None" }],
+    });
+  });
+
+  it("has no policy vocabulary and no stream leaf left on it", () => {
+    // Concurrency is Effect's. Asserted by name so a re-introduction has to
+    // argue with a test rather than merely compile.
+    for (const removed of ["restart", "ignore", "queue", "stream"]) {
+      expect(Command).not.toHaveProperty(removed);
+    }
+    expect(Object.keys(Command).sort()).toEqual([
+      "batch",
+      "cancel",
+      "effect",
+      "keyed",
+      "none",
+      "output",
+    ]);
+  });
+
+  it("output is re-expressed on the effect leaf, its signature unchanged", async () => {
+    const OrderPlaced = Action.output("OrderPlaced", { orderId: Schema.String });
+    const cmd = Command.output(OrderPlaced, { orderId: "o1" });
+
+    // Not a variant of its own any more: an outbound message is one `dispatch`
+    // inside an ordinary leaf, which is what makes `Effect` *the* leaf.
+    expect(cmd).toMatchObject({ _tag: "Effect" });
+    if (cmd._tag !== "Effect") throw new TypeError("expected Effect");
+
+    const seen: Array<unknown> = [];
+    await Effect.runPromise(
+      cmd.effect((message) => Effect.sync(() => void seen.push(message)) as Effect.Effect<void>),
+    );
+
+    expect(seen).toEqual([{ _tag: "OrderPlaced", orderId: "o1" }]);
+  });
+});
+
+describe("Blueprint.run — the effect leaf", () => {
+  it("a command emits by calling dispatch — zero times, once, or many", async () => {
+    const Echo = Action("Echo", { id: Schema.String });
+    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump, Echo]) });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        // One leaf, three emissions, and the count of them is the point: the
+        // old surface could emit exactly one action per stream element, so a
+        // command emitting three times had to be three elements. Here it is
+        // one effect calling `dispatch` in a loop.
+        Bump: (_action, { state }) =>
+          state.count === 0
+            ? [
+                { count: 1 },
+                Command.effect((dispatch) =>
+                  Effect.forEach(["a", "b", "c"], (id) => dispatch({ _tag: "Echo", id })),
+                ),
+              ]
+            : { count: state.count },
+        Echo: (_action, { state }) => ({ count: state.count + 10 }),
+      },
+      render: () => null,
+    });
+
+    const { state, emitted } = await Effect.runPromise(
+      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer: Layer.empty }),
+    );
+
+    expect(state).toEqual({ count: 31 });
+    expect(emitted).toEqual([
+      { _tag: "Echo", id: "a" },
+      { _tag: "Echo", id: "b" },
+      { _tag: "Echo", id: "c" },
+    ]);
+  });
+
+  it("a command that ignores its dispatch emits nothing, whatever it succeeds with", async () => {
+    const { ref, layer } = makeLogLayer();
+    const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        // Succeeds with a well-formed action, and ignores the parameter. This
+        // is why there is no separate "effect that cannot emit" constructor:
+        // emission is a call, not a return value, so an unused parameter is
+        // already the whole of that variant.
+        Bump: (_action, { state }) =>
+          state.count === 0
+            ? [
+                { count: 1 },
+                Command.effect(() =>
+                  Effect.andThen(push("ran"), Effect.succeed({ _tag: "Bump" as const })),
+                ),
+              ]
+            : { count: state.count + 1 },
+      },
+      render: () => null,
+    });
+
+    const { state, emitted } = await Effect.runPromise(
+      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer }),
+    );
+
+    expect(await Effect.runPromise(Ref.get(ref))).toEqual(["ran"]);
+    expect(state).toEqual({ count: 1 });
+    expect(emitted).toEqual([]);
+  });
+
+  it("a long-lived source is `Stream.runForEach(source, dispatch)` inside the leaf", async () => {
+    const Feature = define({
+      props: RunProps,
+      state: RunState,
+      action: Action.of([Bump]),
+      output: Action.of([Announced]),
+    });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        // What `Command.stream` used to be, one call earlier and in userland.
+        // Routing is still by `_tag` alone, so a single source carrying both
+        // kinds proves the destination is a property of each message rather
+        // than of the command that produced it.
+        Bump: (_action, { state }) =>
+          state.count === 0
+            ? [
+                { count: 1 },
+                Command.effect((dispatch) =>
+                  Stream.runForEach(
+                    Stream.fromIterable([
+                      { _tag: "Announced" as const, id: "a1" },
+                      { _tag: "Bump" as const },
+                      { _tag: "Announced" as const, id: "a2" },
+                    ]),
+                    dispatch,
+                  ),
+                ),
+              ]
+            : { count: state.count + 1 },
+      },
+      render: () => null,
+    });
+
+    const { state, emitted, outputs } = await Effect.runPromise(
+      feature.run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer: Layer.empty }),
+    );
+
+    expect(state).toEqual({ count: 2 });
+    expect(emitted).toEqual([{ _tag: "Bump" }]);
+    expect(outputs).toEqual([
+      { _tag: "Announced", id: "a1" },
+      { _tag: "Announced", id: "a2" },
+    ]);
+  });
+
+  it("`Command.keyed` names the fiber, so a tag+key `Cancel` reaches only that one", async () => {
+    const { ref, layer } = makeLogLayer();
+    const Feature = define({
+      props: RunProps,
+      state: RunState,
+      action: Action.of([Go, Action("Stop", { id: Schema.String }), Action("Arm", {})]),
+    });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Go: (action) => [
+          { count: 0 },
+          Command.effect(() =>
+            Effect.ensuring(
+              Effect.andThen(
+                push(`${action.id}:start`),
+                Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
+              ),
+              push(`${action.id}:ensuring`),
+            ),
+          ).pipe(Command.keyed(action.id)),
+        ],
+        // Delayed rather than seeded: a seeded `Stop` can be reached before
+        // either group has been scheduled, and "cancelled only a" is not shown
+        // by killing a fiber that never ran.
+        Arm: () => [
+          { count: 0 },
+          Command.effect((dispatch) =>
+            Effect.andThen(Effect.sleep("20 millis"), dispatch({ _tag: "Stop", id: "a" })),
+          ),
+        ],
+        Stop: (action) => [{ count: 0 }, Command.cancel({ tag: "Go", key: action.id })],
+      },
+      render: () => null,
+    });
+
+    await Effect.runPromise(
+      feature.run(
+        [{ _tag: "Go", ms: 200, id: "a" }, { _tag: "Go", ms: 60, id: "b" }, { _tag: "Arm" }],
+        { props: {}, hooks: {}, layer },
+      ),
+    );
+
+    const log = await Effect.runPromise(Ref.get(ref));
+    expect(log).toContain("a:start");
+    expect(log).toContain("b:start");
+    // Only `a` was named. Its finalizer proves it got far enough to be
+    // interrupted rather than never started.
+    expect(log).not.toContain("a:done");
+    expect(log).toContain("a:ensuring");
+    expect(log).toContain("b:done");
+  });
+
+  it("an unkeyed command is addressable by its tag alone", async () => {
+    const { ref, layer } = makeLogLayer();
+    const Feature = define({
+      props: RunProps,
+      state: RunState,
+      action: Action.of([Go, Action("Stop", {}), Action("Arm", {})]),
+    });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        // No `keyed` anywhere: naming is optional, and the issuing action's
+        // tag is the address a command has whether or not it asked for one.
+        Go: (action) => [
+          { count: 0 },
+          Command.effect(() =>
+            Effect.ensuring(
+              Effect.andThen(
+                push(`${action.id}:start`),
+                Effect.andThen(Effect.sleep("200 millis"), push(`${action.id}:done`)),
+              ),
+              push(`${action.id}:ensuring`),
+            ),
+          ),
+        ],
+        Arm: () => [
+          { count: 0 },
+          Command.effect((dispatch) =>
+            Effect.andThen(Effect.sleep("30 millis"), dispatch({ _tag: "Stop" })),
+          ),
+        ],
+        Stop: () => [{ count: 0 }, Command.cancel("Go")],
+      },
+      render: () => null,
+    });
+
+    await Effect.runPromise(
+      feature.run(
+        [{ _tag: "Go", ms: 0, id: "a" }, { _tag: "Go", ms: 0, id: "b" }, { _tag: "Arm" }],
+        { props: {}, hooks: {}, layer },
+      ),
+    );
+
+    const log = await Effect.runPromise(Ref.get(ref));
+    expect(log).toContain("a:start");
+    expect(log).toContain("b:start");
+    expect(log).not.toContain("a:done");
+    expect(log).not.toContain("b:done");
+    expect(log).toContain("a:ensuring");
+    expect(log).toContain("b:ensuring");
+  });
+
+  it("Batch members run in order, sharing the issuing action's group", async () => {
+    const { ref, layer } = makeLogLayer();
+    const Feature = define({
+      props: RunProps,
+      state: RunState,
+      action: Action.of([Go, Action("Stop", {}), Action("Arm", {})]),
+    });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Go: () => [
+          { count: 0 },
+          // One `keyed` around the batch, so both members inherit the same
+          // key. With no policy left there is no supersession question, and
+          // the group is a plain address — which means a cancel at that
+          // address has to reach both members, not one.
+          Command.batch(
+            Command.effect(() =>
+              Effect.ensuring(
+                Effect.andThen(push("a:start"), Effect.sleep("200 millis")),
+                push("a:ensuring"),
+              ),
+            ),
+            Command.effect(() =>
+              Effect.ensuring(
+                Effect.andThen(push("b:start"), Effect.sleep("200 millis")),
+                push("b:ensuring"),
+              ),
+            ),
+          ).pipe(Command.keyed("shared")),
+        ],
+        Arm: () => [
+          { count: 0 },
+          Command.effect((dispatch) =>
+            Effect.andThen(Effect.sleep("30 millis"), dispatch({ _tag: "Stop" })),
+          ),
+        ],
+        Stop: () => [{ count: 0 }, Command.cancel({ tag: "Go", key: "shared" })],
+      },
+      render: () => null,
+    });
+
+    await Effect.runPromise(
+      feature.run([{ _tag: "Go", ms: 0, id: "x" }, { _tag: "Arm" }], {
+        props: {},
+        hooks: {},
+        layer,
+      }),
+    );
+
+    const log = await Effect.runPromise(Ref.get(ref));
+    // In order: the first member is interpreted, and forked, before the second.
+    expect(log.indexOf("a:start")).toBeGreaterThanOrEqual(0);
+    expect(log.indexOf("a:start")).toBeLessThan(log.indexOf("b:start"));
+    // One address, both members: cancelling the group the batch ran under
+    // interrupts every fiber it forked.
+    expect(log).toContain("a:ensuring");
+    expect(log).toContain("b:ensuring");
+  });
+
+  it("Batch sequences a Cancel ahead of the command replacing it", async () => {
+    const { ref, layer } = makeLogLayer();
+    const Feature = define({
+      props: RunProps,
+      state: RunState,
+      action: Action.of([Go, Action("Arm", {})]),
+    });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        // The restart-on-keystroke shape from the spec, and the one job no
+        // combinator inside the leaf can do for itself: the cancel has to run
+        // *before* the replacement fiber is registered, or it interrupts the
+        // replacement instead of the thing being replaced.
+        Go: (action) => [
+          { count: 0 },
+          Command.batch(
+            Command.cancel({ tag: "Go", key: "query" }),
+            Command.keyed(
+              "query",
+              Command.effect(() =>
+                Effect.ensuring(
+                  Effect.andThen(
+                    push(`${action.id}:start`),
+                    Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
+                  ),
+                  push(`${action.id}:ensuring`),
+                ),
+              ),
+            ),
+          ),
+        ],
+        // The superseding dispatch is delayed rather than seeded, and that is
+        // load-bearing: seeds are all offered up front, so the drain can reach
+        // the second `Go` before the first one's fiber has been scheduled —
+        // and interrupting a fiber that never started shows nothing about
+        // ordering, because it leaves no trace either way.
+        Arm: () => [
+          { count: 0 },
+          Command.effect((dispatch) =>
+            Effect.andThen(
+              Effect.sleep("30 millis"),
+              dispatch({ _tag: "Go", ms: 0, id: "second" }),
+            ),
+          ),
+        ],
+      },
+      render: () => null,
+    });
+
+    await Effect.runPromise(
+      feature.run([{ _tag: "Go", ms: 200, id: "first" }, { _tag: "Arm" }], {
+        props: {},
+        hooks: {},
+        layer,
+      }),
+    );
+
+    const log = await Effect.runPromise(Ref.get(ref));
+    // The superseded one was interrupted...
+    expect(log).toContain("first:start");
+    expect(log).not.toContain("first:done");
+    expect(log).toContain("first:ensuring");
+    // ...and the replacement survived its own cancel and ran to completion.
+    expect(log).toContain("second:done");
+  });
+
+  it("does not terminate while a never-completing command is in flight", async () => {
+    // Pins today's behaviour deliberately — the leaf change does not fix it.
+    // `Command.effect(() => Effect.never)` pins `inFlight` exactly as
+    // `Command.stream(Stream.never)` did, so quiescence is never reached. The
+    // fix is the deferred `Cmd`/`Sub` split; whoever lands it inverts this
+    // test rather than deleting it. The timeout is load-bearing: without it a
+    // plain `it` hangs the suite instead of failing it.
+    const runWith = (command: Command<never, never>) => {
+      const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump]) });
+      const feature = Feature.create({
+        initialState: () => ({ count: 0 }),
+        reducer: { Bump: () => [{ count: 1 }, command] as const },
+        render: () => null,
+      });
+
+      return Effect.runPromise(
+        feature
+          .run([{ _tag: "Bump" }], { props: {}, hooks: {}, layer: Layer.empty })
+          .pipe(Effect.timeoutOption("100 millis")),
+      );
+    };
+
+    // Control first: the same harness on the same budget with an effect that
+    // completes. Without it the timeout assertion below passes for any reason
+    // at all, including a harness that never ran the feature.
+    expect(Option.isSome(await runWith(Command.effect(() => Effect.void)))).toBe(true);
+
+    // Subject: identical but for the effect, and it never settles.
+    expect(await runWith(Command.effect(() => Effect.never))).toEqual(Option.none());
   });
 });

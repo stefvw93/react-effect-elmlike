@@ -26,7 +26,6 @@ import {
   Ref,
   Schema,
   SchemaParser,
-  Stream,
 } from "effect";
 
 // ---------------------------------------------------------------------------
@@ -557,91 +556,103 @@ export type ServicesOf<U> = {
 // ---------------------------------------------------------------------------
 
 /**
+ * Where a command's emissions go.
+ *
+ * Not `Dispatch`, which is the *React-facing* one handed to `render` and
+ * returns `void` because it is called from an event handler. This one is handed
+ * to a command's effect and returns an `Effect`, so it composes with the effect
+ * that calls it: `Effect.flatMap(load, dispatch)`, `Stream.runForEach(source,
+ * dispatch)`, `Effect.forEach(batch, dispatch)`. A `void` callback would force
+ * every call site into `Effect.sync` and make a long-lived source impossible to
+ * express without leaving Effect's vocabulary.
+ *
+ * Contravariant in `A`, which is what keeps `Command` covariant — see the
+ * variance note on `Command`.
+ */
+export type Dispatcher<A> = (action: A) => Effect.Effect<void>;
+
+/**
  * The async work a state change kicks off.
  *
- * An ADT rather than a bare `Stream`, because a command carries two things the
- * stream itself cannot: a concurrency policy, and the ability to *be* a
- * cancellation rather than to perform one. Composition still happens on the
- * `Stream` before it is wrapped, so nothing in Effect's vocabulary is lost —
- * `Stream.merge`, `Stream.catchTag`, `Stream.callback` are all used as before,
- * one `Command.stream(…)` from the end.
+ * The leaf is an `Effect` handed a `dispatch`, so **everything Effect can
+ * already express is left to Effect**: debounce, retry, timeout, racing,
+ * running two things at once, running at most one at a time. This library used
+ * to ship a `restart`/`ignore`/`queue`/`parallel` policy vocabulary as ADT
+ * nodes, which meant owning a fiber supervisor — a group map, a per-dispatch
+ * occurrence, one supersession rule per policy — to reimplement combinators
+ * Effect already had. Every defect that surface ever produced was in the
+ * supervisor, never in the ADT walking around it.
  *
- * `Pipeable`, so a policy reads as a modifier chained onto the command it
- * governs — see `Command.restart` / `.ignore` / `.queue`.
+ * What is left is the one thing a handler genuinely cannot do for itself:
+ * naming a running fiber so a *different* action's handler can interrupt it.
+ * That is `Keyed` plus `Cancel`.
+ *
+ * Variance: `A` appears only inside `Dispatch<A>`, which is contravariant in
+ * `A`, and `Dispatch<A>` sits in the leaf callback's parameter position, which
+ * is contravariant again. The two compose to covariant, so `Command<Narrow>`
+ * stays assignable to `Command<Wide>` and `Command.none: Command<never>` stays
+ * the bottom.
+ *
+ * `Pipeable`, so `keyed` reads as a modifier on the command it names.
  */
 export type Command<A, R = never> = Pipeable.Pipeable &
   /** Explicit no-op, for when a bare `state` return reads worse. */
   (
     | { readonly _tag: "None" }
 
-    /** Run for effects; emit nothing. */
-    | { readonly _tag: "Effect"; readonly effect: Effect.Effect<unknown, never, R> }
-
-    /** Emit actions and outputs over time. Cannot fail — conversion is userland. */
-    | { readonly _tag: "Stream"; readonly stream: Stream.Stream<A, never, R> }
+    /**
+     * The leaf. Runs for effects, and emits by calling `dispatch` — zero times,
+     * once, or forever. A command that emits nothing simply ignores the
+     * parameter, which is why there is no separate "effect that cannot emit"
+     * variant: it is this one with an unused argument.
+     */
+    | {
+        readonly _tag: "Effect";
+        readonly effect: (dispatch: Dispatcher<A>) => Effect.Effect<unknown, never, R>;
+      }
 
     /**
-     * Several commands at once, each keeping its own policy. `Stream.merge`
-     * covers this only while both halves want the same group.
+     * Names the fiber this command forks, so `Cancel` can address it. Nothing
+     * else: it does not interrupt, defer, or serialise anything. Nesting
+     * resolves outermost-first, matching the wrapper it replaced.
+     */
+    | { readonly _tag: "Keyed"; readonly key: string; readonly command: Command<A, R> }
+
+    /**
+     * Several commands, interpreted in order under one group.
      *
-     * Under an outer policy the members are one group — one `Cancel` target,
-     * one `"queue"` serialisation queue — without being one another's
-     * predecessors: `"ignore"` runs every member rather than dropping all but
-     * the first, and `"restart"` interrupts the previous dispatch's members
-     * rather than the siblings it was forked alongside.
+     * Composing two *effects* is `Effect.all` and does not belong here — it
+     * forks one fiber instead of two and brings its own `concurrency` and
+     * `mode` options. What `Effect.all` cannot do is sequence a `Cancel` ahead
+     * of the command replacing it, because the cancel has to run *before* the
+     * new fiber is registered and nothing running inside that fiber can do it.
+     * That is what this variant is for.
      */
     | { readonly _tag: "Batch"; readonly commands: ReadonlyArray<Command<A, R>> }
 
     /**
-     * Interrupt a running group. A command in its own right, so a handler can
-     * invalidate work another action started — the cross-tag case no policy can
-     * express.
+     * Interrupt running work by name. A command in its own right, so a handler
+     * can invalidate work *another* action started — the cross-tag case no
+     * combinator inside a single handler's effect can reach.
      */
     | { readonly _tag: "Cancel"; readonly target: Group }
-
-    /**
-     * Policy as a wrapper rather than a field, so it exists in exactly one place,
-     * the variants that fork nothing cannot carry a meaningless one, and nesting
-     * is answerable: the outermost wins.
-     */
-    | {
-        readonly _tag: "Guarded";
-        readonly policy: Policy;
-        /** Refines the group within the issuing action's tag. */
-        readonly key?: string;
-        readonly command: Command<A, R>;
-      }
   );
 
 /**
- * What a policy governs and what `Cancel` addresses. The tag is the issuing
- * action's and is filled by the runtime, never written by hand; `key` refines
- * within it, so `"restart"` on `QuantityChanged` can mean per-sku.
+ * What `Cancel` addresses.
  *
- * An omitted `key` on `Cancel` targets every group under the tag.
+ * The tag is the issuing action's and is filled by the runtime, never written by
+ * hand; `key` refines within it, so cancelling `QuantityChanged` can mean
+ * per-sku. An omitted `key` targets every keyed and unkeyed group under the tag.
  *
- * This is the *address*, and only the address. Whether a command supersedes
- * another is a separate question the runtime answers internally — the two would
- * otherwise disagree over `Command.batch`, whose members must be one target for
- * `Cancel` and one queue for `"queue"` while still not superseding each other
- * under `"ignore"` and `"restart"`. Nothing here has to change for that to
- * work, which is the point.
+ * An address and nothing more. Nothing in the runtime decides on a feature's
+ * behalf whether new work supersedes what it finds already running — that is a
+ * `Cancel` the handler writes, where the reader can see it.
  */
 export interface Group {
   readonly tag: string;
   readonly key?: string;
 }
-
-/**
- * What a new dispatch does about the ones already running in its group.
- *
- * `"restart"` interrupts them, `"ignore"` stands down, `"queue"` waits for all
- * of them to settle, `"parallel"` (the default, meaning no `Guarded` wrapper at
- * all) neither looks nor waits. `"queue"` is the one that counts a command's
- * own `Command.batch` siblings as things to wait for; the other two are about
- * earlier dispatches only.
- */
-export type Policy = "restart" | "ignore" | "queue" | "parallel";
 
 const pipeable = <T extends object>(value: T): T & Pipeable.Pipeable =>
   Object.assign(value, {
@@ -658,16 +669,77 @@ const pipeable = <T extends object>(value: T): T & Pipeable.Pipeable =>
 const discharge = <T>(effect: Effect.Effect<T, never, any>): Effect.Effect<T, never, never> =>
   effect as Effect.Effect<T, never, never>;
 
+/**
+ * The constructors, and the whole vocabulary a reducer has for describing work.
+ *
+ * Five of them, and the count is the design: one leaf (`effect`), one no-op
+ * (`none`), one name (`keyed`), one sequencer (`batch`), one interrupt
+ * (`cancel`). `output` is the leaf again with its message filled in, kept as a
+ * constructor only because the channel brand is still checked at its call site
+ * — see the deferred decision in `tea.specs.md`.
+ *
+ * What is deliberately absent is a concurrency vocabulary. Debounce, throttle,
+ * switch-to-latest and run-at-most-N are Effect combinators the handler writes
+ * inside its own effect, because Effect already has them and a second set
+ * written as data can only be a worse copy of it.
+ */
 export const Command: {
   readonly none: Command<never>;
 
-  readonly effect: <R>(effect: Effect.Effect<unknown, never, R>) => Command<never, R>;
+  /**
+   * The only leaf. `dispatch` is how the command emits; a command that emits
+   * nothing ignores it, which is why there is no second constructor for that
+   * case.
+   *
+   * Concurrency lives in the effect you pass, not around it: `Effect.all` for
+   * two things at once, `Effect.race` for first-wins, a `Semaphore` for
+   * at-most-N, `Effect.sleep` ahead of the work for a debounce that a `Cancel`
+   * can still interrupt mid-delay.
+   */
+  readonly effect: <A = never, R = never>(
+    effect: (dispatch: Dispatcher<A>) => Effect.Effect<unknown, never, R>,
+  ) => Command<A, R>;
 
-  readonly stream: <A, R>(stream: Stream.Stream<A, never, R>) => Command<A, R>;
+  /**
+   * Names the fiber a command forks so `Cancel` can find it, and does nothing
+   * else.
+   *
+   * Naming is not reserving — two commands may hold the same key at once, and
+   * neither displaces the other. Replacing one is a `Cancel` in front of it.
+   *
+   * Two forms, and the choice is not stylistic. `Command.keyed(key, command)`
+   * puts the command in an argument position, where the contextual type that
+   * types a leaf's `dispatch` still reaches it. `cmd.pipe(Command.keyed(key))`
+   * is a `.pipe` receiver, which TypeScript checks *before* the contextual type
+   * of the `.pipe` call exists — so a leaf written inline there gets
+   * `Dispatcher<never>` and cannot emit. Pipe a command whose `A` is already
+   * fixed; pass one that still needs it.
+   */
+  readonly keyed: {
+    (key: string): <A, R>(command: Command<A, R>) => Command<A, R>;
+    <A, R>(key: string, command: Command<A, R>): Command<A, R>;
+  };
 
+  /**
+   * Commands in order, under one group. For composing *effects*, reach for
+   * `Effect.all` inside a single `Command.effect` instead — see the `Batch`
+   * variant for why this exists at all.
+   */
   readonly batch: <A, R>(...commands: ReadonlyArray<Command<A, R>>) => Command<A, R>;
 
-  readonly cancel: (target: Group | string) => Command<never>;
+  /**
+   * A bare string targets every group under that action tag.
+   *
+   * Generic in `A` with a `never` default, which looks like decoration and is
+   * not. A cancel is written *first* in a batch — sequencing it ahead of the
+   * command replacing it is the node's entire purpose — and a concrete
+   * `Command<never>` argument outranks the contextual return type as an
+   * inference source, so it fixed the batch's `A` to `never` before the sibling
+   * leaf was checked and left that leaf's `dispatch` accepting nothing. Generic,
+   * it adopts the batch's `A` instead of pinning it; alone, the default still
+   * makes it `Command<never>`.
+   */
+  readonly cancel: <A = never>(target: Group | string) => Command<A, never>;
 
   /**
    * Outbound announcement. The phantom on `Message` does the work here: passing
@@ -679,17 +751,15 @@ export const Command: {
     message: Message<Tag, Fields, "outbound">,
     payload: Simplify<Omit<Schema.Struct<Fields>["Type"], "_tag">>,
   ) => Command<{ readonly _tag: Tag } & Schema.Struct<Fields>["Type"]>;
-
-  /** Pipeable, so the policy reads as a modifier: `cmd.pipe(Command.restart())`. */
-  readonly restart: (key?: string) => <A, R>(command: Command<A, R>) => Command<A, R>;
-  readonly ignore: (key?: string) => <A, R>(command: Command<A, R>) => Command<A, R>;
-  readonly queue: (key?: string) => <A, R>(command: Command<A, R>) => Command<A, R>;
 } = {
   none: pipeable({ _tag: "None" }),
 
   effect: (effect) => pipeable({ _tag: "Effect", effect }),
 
-  stream: (stream) => pipeable({ _tag: "Stream", stream }),
+  keyed: ((key: string, command?: Command<any, any>) =>
+    command === undefined
+      ? (inner: Command<any, any>) => pipeable({ _tag: "Keyed", key, command: inner })
+      : pipeable({ _tag: "Keyed", key, command })) as (typeof Command)["keyed"],
 
   batch: (...commands) => pipeable({ _tag: "Batch", commands }),
 
@@ -699,58 +769,50 @@ export const Command: {
       target: typeof target === "string" ? { tag: target } : target,
     }),
 
+  // One `dispatch` inside an ordinary leaf, which is what leaves `Effect` as
+  // the only leaf. Routing is by `_tag` at the sink — the same routing that
+  // sends an internal action back to the reducer — so an outbound message
+  // needs no variant of its own, and never did.
+  // The type argument is load-bearing: `A` is only ever inferred from a call's
+  // contextual type, and there is none here — the result is cast to the
+  // declared signature. Left off, `A` defaults to `never` and `dispatch`
+  // accepts nothing.
   output: (message, payload) =>
-    Command.stream(Stream.succeed((message as any).make(payload))) as any,
-
-  restart: (key) => (command) => pipeable({ _tag: "Guarded", policy: "restart", key, command }),
-  ignore: (key) => (command) => pipeable({ _tag: "Guarded", policy: "ignore", key, command }),
-  queue: (key) => (command) => pipeable({ _tag: "Guarded", policy: "queue", key, command }),
+    Command.effect<{ readonly _tag: string }>((dispatch) =>
+      dispatch((message as any).make(payload)),
+    ) as any,
 };
 
 /**
- * Which *interpretation* forked a fiber — the concurrency identity, as opposed
- * to the cancellation identity a `Group` carries.
+ * A forked command fiber, held so `Cancel` and unmount can reach it.
  *
- * One is minted per policy-bearing command per dispatch and shared by every
- * fiber that interpretation forks, so every member of a `Command.batch` gets
- * the same one. That is the whole point: `ignore` and `restart` are about
- * superseding *an earlier dispatch*, and a group key cannot tell an earlier
- * dispatch apart from a sibling forked three lines ago. Indexing the members
- * into `key#0`/`key#1` was the alternative, and it answered this question by
- * destroying the other one — an indexed key is not the key `Command.cancel`
- * was given, and it is not the key the serialisation queue is per.
- *
- * A bare `Symbol` because nothing may read it except by identity: it is never
- * addressed, never serialised, and never appears in the public surface.
+ * A bare fiber and nothing beside it. The previous surface needed a second
+ * identity here — which *interpretation* forked the fiber — because `ignore`
+ * and `restart` had to tell an earlier dispatch apart from a sibling forked
+ * three lines ago. With no policy to make that judgement, there is no judgement
+ * to inform, and the map is a plain address book again.
  */
-type Occurrence = symbol;
-
-/** A forked command fiber together with the interpretation that forked it. */
 type GroupEntry = {
   readonly fiber: Fiber.Fiber<void>;
-  readonly occurrence: Occurrence;
 };
 
 /**
- * The group a command's fibers belong to, plus the policy governing them.
- * `tag` is the issuing action's, filled by the runtime; see `Group`.
+ * The group a command's fibers belong to. `tag` is the issuing action's, filled
+ * by the runtime; `key` is whatever a `Keyed` node named it. See `Group`.
  */
 type CommandContext = {
   readonly tag: string;
   readonly key?: string;
-  readonly policy?: Policy;
-  /** Set when a `Guarded` node adopts a policy; see `Occurrence`. */
-  readonly occurrence?: Occurrence;
 };
 
 /**
  * The command interpreter, shared by `Blueprint.run` and `createFeatureStore`.
  *
  * This is the headless core `Blueprint.run`'s JSDoc names — the thing that has
- * to exist exactly once, because it is where concurrency policy, grouping and
- * cancellation are decided. Two copies would have to agree forever about what
- * `"restart"` interrupts and when a group is empty, and the one that is not
- * under test drifts. `run`'s suite is what guards this.
+ * to exist exactly once, because it is where grouping and cancellation are
+ * decided. Two copies would have to agree forever about what a `Cancel` reaches
+ * and when a group is empty, and the one that is not under test drifts. `run`'s
+ * suite is what guards this.
  *
  * Parameterised only by its two sinks, which is the entire difference between
  * the two callers. `run` points `emit` at its own queue and terminates at
@@ -769,19 +831,33 @@ const commandInterpreter = (deps: {
   /**
    * How a command's fiber ended.
    *
-   * `runGuarded` forks and returns, so a command that *dies* dies on a fiber
+   * `forkLeaf` forks and returns, so a command that *dies* dies on a fiber
    * nobody is awaiting — an enclosing `catchCause` around `interpret` sees
    * nothing, because `interpret` has already returned by the time the command
    * runs. Without this hook the store's whole documented error contract is
    * unreachable: every defect from a command is discarded silently.
    *
-   * Interruption is normal here (that is what `restart` and unmount do), so a
+   * Interruption is normal here (that is what `Cancel` and unmount do), so a
    * caller filters on it rather than treating every non-success as a defect.
    */
   readonly onExit?: (exit: Exit.Exit<void>, ctx: CommandContext) => Effect.Effect<void>;
   readonly inFlight: Ref.Ref<number>;
   readonly groups: Ref.Ref<Map<string, ReadonlyArray<GroupEntry>>>;
-}) => {
+}): {
+  /**
+   * Walk a command, forking its leaves into the mount scope.
+   *
+   * `None` returns. `Effect` forks the leaf, handing it a `dispatch` bound to
+   * `deps.emit`, and registers the fiber under the context's group. `Keyed`
+   * sets the key for everything below it, outermost winning. `Batch`
+   * interprets its members in order under one context. `Cancel` interrupts
+   * every fiber at the address it names.
+   */
+  readonly interpret: (
+    command: Command<any, any>,
+    ctx: CommandContext,
+  ) => Effect.Effect<void, never, any>;
+} => {
   const groupId = (target: Group): string => `${target.tag}::${target.key ?? ""}`;
 
   const cancelGroup = (target: Group) =>
@@ -792,79 +868,31 @@ const commandInterpreter = (deps: {
           ? [groupId(target)]
           : Array.from(map.keys()).filter((id) => id.startsWith(`${target.tag}::`));
 
-      // Every occurrence in the group, deliberately: `Cancel` addresses the
-      // group, and a batch's members are all of them at that address.
+      // Every fiber at the address, deliberately: `Cancel` addresses a group,
+      // and a batch's members are all of them at that address.
       for (const id of ids) {
         for (const entry of map.get(id) ?? []) yield* Fiber.interrupt(entry.fiber);
       }
     });
 
-  const runGuarded = (ctx: CommandContext, run: Effect.Effect<void, never, any>) =>
+  /**
+   * Fork one leaf, register it under `ctx`'s group, and arrange for it to be
+   * unregistered however it ends.
+   *
+   * What is *not* here is the whole point of the redesign: no policy, no
+   * supersession rule, no per-interpretation occurrence to tell an earlier
+   * dispatch from a sibling forked three lines ago. A leaf forks, and the map
+   * is a plain address book.
+   */
+  const forkLeaf = (ctx: CommandContext, run: Effect.Effect<void, never, any>) =>
     Effect.gen(function* () {
-      const policy = ctx.policy ?? "parallel";
       const id = groupId(ctx);
-      // Unguarded commands never read it back — `"parallel"` neither waits nor
-      // interrupts — but every entry carries one so the map has a single shape.
-      const occurrence: Occurrence = ctx.occurrence ?? Symbol();
-      const running = (yield* Ref.get(deps.groups)).get(id) ?? [];
-      const superseded = running.filter((entry) => entry.occurrence !== occurrence);
-
-      // `superseded`, not `running`: both policies mean "an earlier dispatch is
-      // already here", and a batch member forked microseconds ago by the same
-      // interpretation is not that. Filtering on the group alone made `ignore`
-      // drop every member after the first and `restart` have members interrupt
-      // each other.
-      if (policy === "ignore" && superseded.length > 0) return;
-      if (policy === "restart") for (const entry of superseded) yield* Fiber.interrupt(entry.fiber);
-
-      // `running`, not `superseded`: the serialisation queue is per *group*, so
-      // a `queue`-wrapped batch runs its members one at a time. This is the one
-      // place the two identities deliberately disagree.
-      //
-      // `Fiber.await` each rather than `Fiber.joinAll`, which re-raises the
-      // first failing fiber's cause and stops joining there — killing the
-      // follower before its own body ran, and (once the cause is caught)
-      // releasing it on a predecessor's *death* while that predecessor's
-      // siblings still hold the queue. `queue` means "wait your turn", not
-      // "share their fate" and not "leave when one of them trips".
-      const awaitPrior =
-        policy === "queue" && running.length > 0
-          ? Effect.forEach(running, (entry) => Fiber.await(entry.fiber), { discard: true })
-          : Effect.void;
 
       yield* Ref.update(deps.inFlight, (n) => n + 1);
 
-      // A fiber `Fiber.interrupt`ed before the scheduler has started it never
-      // runs its own body — including an `Effect.ensuring` baked into that
-      // body — so cleanup can't live there. A separate watcher, waiting on
-      // `Fiber.await`, observes the Exit regardless of whether the fiber ever
-      // got to start.
-      const fiber: Fiber.Fiber<void> = yield* awaitPrior.pipe(
-        Effect.andThen(run),
-        Effect.forkChild,
-      );
+      const fiber: Fiber.Fiber<void> = yield* Effect.forkChild(run);
 
-      // `restart` removes exactly the fibers it just interrupted rather than
-      // replacing the whole entry: a `[fiber]` reset also erased the siblings
-      // of this interpretation, after which a member that forked earlier in the
-      // same batch was no longer reachable from `Cancel` or from unmount.
-      //
-      // By fiber identity and not by occurrence, because `Fiber.interrupt`
-      // above is a yield point: an entry that arrived after this call's
-      // snapshot was never interrupted, so dropping it would leave a live fiber
-      // nothing can reach. `interpret` happens to be serialised on one fiber
-      // today, but nothing enforces that and this does not need it to hold.
-      const interrupted =
-        policy === "restart" ? new Set(superseded.map((entry) => entry.fiber)) : undefined;
-
-      yield* Ref.update(deps.groups, (m) => {
-        const existing = m.get(id) ?? [];
-        const kept =
-          interrupted === undefined
-            ? existing
-            : existing.filter((entry) => !interrupted.has(entry.fiber));
-        return new Map(m).set(id, [...kept, { fiber, occurrence }]);
-      });
+      yield* Ref.update(deps.groups, (m) => new Map(m).set(id, [...(m.get(id) ?? []), { fiber }]));
 
       const cleanup = Effect.gen(function* () {
         yield* Ref.update(deps.inFlight, (n) => n - 1);
@@ -878,12 +906,15 @@ const commandInterpreter = (deps: {
         yield* deps.settled;
       });
 
+      // A fiber interrupted before the scheduler has started it never runs its
+      // own body — including an `Effect.ensuring` baked into that body — so
+      // cleanup cannot live there. A separate watcher on `Fiber.await` observes
+      // the Exit whether or not the fiber ever got to start.
+      //
       // `ensuring`, not `andThen`: chaining `cleanup` behind `onExit` meant an
       // `onExit` that died skipped the `inFlight` decrement and the `groups`
-      // removal, leaving a settled fiber in its group forever — after which
-      // every command under an `ignore` policy for that group is silently
-      // dropped for the rest of the mount. The bookkeeping has to survive a
-      // reporting failure.
+      // removal, leaving a settled fiber in its group forever. The bookkeeping
+      // has to survive a reporting failure.
       yield* Fiber.await(fiber).pipe(
         Effect.flatMap((exit) =>
           deps.onExit === undefined ? Effect.void : deps.onExit(exit, ctx),
@@ -892,6 +923,17 @@ const commandInterpreter = (deps: {
         Effect.forkChild,
       );
     });
+
+  /**
+   * What a leaf emits with. Bound to `deps.emit`, which is the whole difference
+   * between the two callers — `run`'s queue, or the store's synchronous fold.
+   *
+   * Returns an `Effect`, so it composes with the effect that called it. That is
+   * what lets a long-lived source be `Stream.runForEach(source, dispatch)` and
+   * a one-shot be `Effect.flatMap(load, dispatch)`, with no separate variant
+   * for either.
+   */
+  const dispatch: Dispatcher<any> = (action) => deps.emit(action);
 
   const interpret = (
     command: Command<any, any>,
@@ -902,31 +944,31 @@ const commandInterpreter = (deps: {
         case "None":
           return;
         case "Effect":
-          return yield* runGuarded(ctx, Effect.asVoid(command.effect));
-        case "Stream":
-          return yield* runGuarded(ctx, Stream.runForEach(command.stream, deps.emit));
+          // `suspend`, so a leaf builder that throws synchronously dies on the
+          // command's own fiber and is reported through `onExit`, rather than
+          // escaping into whoever called `interpret` — which is the fold, and
+          // has no business catching it.
+          return yield* forkLeaf(
+            ctx,
+            Effect.asVoid(Effect.suspend(() => command.effect(dispatch))),
+          );
+        case "Keyed":
+          // Outermost wins: an inner `Keyed` under an outer one keeps `ctx`
+          // whole. Nesting is answerable rather than an error because a keyed
+          // command composes into a batch that is itself keyed.
+          return yield* interpret(
+            command.command,
+            ctx.key === undefined ? { tag: ctx.tag, key: command.key } : ctx,
+          );
         case "Batch":
-          // One `ctx`, so every member shares both the issuing action's group
-          // *and*, when a policy is in force, its occurrence. The group is what
-          // `Cancel` addresses and what `queue` serialises per; the occurrence
-          // is what tells these members apart from an earlier dispatch's. See
-          // `Occurrence` for why indexing members into `key#0`/`key#1` — the
-          // obvious fix, tried and reverted — cannot work.
+          // One `ctx`, so every member shares the issuing action's group — the
+          // address `Cancel` names. In order, because the one thing this node
+          // can do that `Effect.all` cannot is put a `Cancel` before the
+          // command replacing it.
           for (const member of command.commands) yield* interpret(member, ctx);
           return;
         case "Cancel":
           return yield* cancelGroup(command.target);
-        case "Guarded": {
-          // The occurrence is minted here and only here: one interpretation of
-          // one policy-bearing command, however many fibers it goes on to fork.
-          // An inner `Guarded` under an outer one keeps `ctx` whole, so
-          // "outermost wins" covers the occurrence as well as the policy.
-          const next: CommandContext =
-            ctx.policy === undefined
-              ? { tag: ctx.tag, key: command.key, policy: command.policy, occurrence: Symbol() }
-              : ctx;
-          return yield* interpret(command.command, next);
-        }
       }
     });
 
@@ -1738,34 +1780,31 @@ export interface FeatureStore<Props, State, Action, H extends AnyHooks> {
   readonly dispatch: Dispatch<Action>;
 
   /**
-   * The snapshot's ambient half, pushed from the render body — and, because it
-   * is the only thing that sees both the old and new values, the place
-   * `PropsChanged` and `HookChanged` are detected and raised.
+   * The snapshot's ambient half, and — because it is the only thing that sees
+   * both the old and new values — the place `PropsChanged` and `HookChanged`
+   * are detected and raised.
    *
-   * **Called during render, and it returns the state to render.** That is what
-   * makes the ambient lifecycle actions cost zero extra render cycles: props
-   * arrive on a render, the comparison happens on that same render, and the
-   * state the handler produced is what gets drawn. Detecting in an effect
-   * instead means the first render always paints the pre-change state and a
-   * second one corrects it — a visible tear for anything derived from props.
+   * **Called from an effect, not from the render body.** It used to fold during
+   * render and hand the new state straight back, so a props-driven change
+   * painted on the render that carried the props rather than the one after it.
+   * That saved a render on paper and never on a measurement: `getSnapshot` is a
+   * stable method and the pre-fold read equalled the previous render's
+   * snapshot, so React had nothing to schedule a second render over, and a
+   * render count reads the same with the fold moved. What it cost was real —
+   * mutating a store during render, a rule inside `fold` suppressing the
+   * notification that mutation would otherwise trigger, and an ordering
+   * constraint between this call and `useSyncExternalStore` that no test could
+   * catch a violation of. Removed on that trade.
    *
-   * `component` calls this **before** subscribing, so `useSyncExternalStore`
-   * reads `getSnapshot` after the fold and both of React's reads — the one
-   * during render and the one it takes when the render finishes — see the same
-   * state. Subscribing first meant the fold moved the snapshot underneath
-   * React's consistency check, which is the extra render this whole path
-   * exists to avoid.
+   * Returns nothing: the state it produces arrives through `getSnapshot` on the
+   * render React schedules from the store notification, like every other fold.
    *
-   * The returned state is therefore redundant at that call site and kept for
-   * direct drivers (and the tests): it is the same value `getSnapshot` returns
-   * from this point on.
-   *
-   * **Must be idempotent, and the equivalences are what make it so.** A render
-   * can be thrown away — StrictMode double-renders, Suspense retries,
-   * concurrent restarts — and this mutates a store, so it will be called twice
-   * with the same values. The second call compares equal and does nothing.
-   * That property is the whole licence for mutating during render, so a change
-   * detected by identity rather than by value would forfeit it.
+   * **Must be idempotent, and the equivalences are what make it so.** An effect
+   * can re-run — StrictMode double-invokes them, props identity can change
+   * without any value changing — and this raises actions, so it will be called
+   * twice with the same values. The second call compares equal and does
+   * nothing. A change detected by identity rather than by value would forfeit
+   * that.
    *
    * The first call **seeds the baseline** rather than raising: the store is
    * built from `initialState(props)` before any hook has run, so there is no
@@ -1775,7 +1814,7 @@ export interface FeatureStore<Props, State, Action, H extends AnyHooks> {
    * latest values only to hand to a handler when a command-emitted action lands
    * between renders, never accumulating them into state.
    */
-  readonly sync: (props: Props, hooks: H) => State;
+  readonly sync: (props: Props, hooks: H) => void;
 
   /**
    * Open the mount scope, build the feature layer inside it, raise `Mounted`.
@@ -1818,9 +1857,10 @@ export interface FeatureStore<Props, State, Action, H extends AnyHooks> {
  * the return value when the `useSyncExternalStore` read moved below it.)
  *
  * A re-entrancy guard serialises them. Without it a command emitting on the
- * forking stack — `Stream.succeed`, which is what `Command.output` is today —
- * re-enters the fold mid-write and the outer fold writes stale state on the way
- * out. Actions arriving while a fold is on the stack queue behind it.
+ * forking stack — a leaf whose whole body is `dispatch(…)`, which is what
+ * `Command.output` is — re-enters the fold mid-write and the outer fold writes
+ * stale state on the way out. Actions arriving while a fold is on the stack
+ * queue behind it.
  *
  * What has to be true, and what `run` already answers for the synchronous case:
  *
@@ -1966,9 +2006,10 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
 
   const subscribers = new Set<() => void>();
 
-  // The re-entrancy guard. A command emitting on the forking stack —
-  // `Stream.succeed`, which is what `Command.output` is — would otherwise
-  // re-enter mid-write and have the outer fold overwrite it on the way out.
+  // The re-entrancy guard. A command emitting on the forking stack — a leaf
+  // whose whole body is `dispatch(…)`, which is what `Command.output` is —
+  // would otherwise re-enter mid-write and have the outer fold overwrite it on
+  // the way out.
   let folding = false;
   const pending: Array<{ readonly _tag: string }> = [];
 
@@ -2187,7 +2228,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       // "did not settle" defect into the `Error` handler.
       settled: Effect.sync(() => Queue.offerUnsafe(cells.queue, { _tag: "Settled" })),
       // The store's whole error contract hangs off this. Interruption is the
-      // normal way a command ends here — `restart` and unmount both cause it —
+      // normal way a command ends here — `Cancel` and unmount both cause it —
       // so only a genuine failure is a defect.
       // `ctx.tag`, never a constant: it is the tag of the action that issued
       // the command, so a command forked *by the `Error` handler* reports with
@@ -2557,9 +2598,17 @@ const noHooks: AnyHooks = Object.freeze({});
  * `component` is closed over the root's `R`, so building a feature that needs
  * a service the root does not provide is a compile error.
  *
- * Two gaps stay, both irreducible: a missing Provider is a *runtime* error,
- * because React cannot check ancestry statically; and StrictMode will build and
- * dispose the runtime twice in development.
+ * One gap stays, and it is irreducible: StrictMode will build and dispose the
+ * runtime twice in development.
+ *
+ * A missing `<Provider>` is *not* a gap, and this used to claim it was — that a
+ * feature rendered outside one failed at runtime, because React cannot check
+ * ancestry statically. It does not fail: the context is created with `runtime`
+ * itself as its default value, so a feature outside the Provider reads the same
+ * runtime and works. The Provider is what makes the boundary *visible* and what
+ * a future per-subtree runtime would hang off; it is not what supplies the
+ * services. The cost of that is the honest half of the old claim: a genuinely
+ * mis-parented subtree looks identical to a correctly parented one.
  */
 export const createRuntime: <RootR, RootE>(
   layer: Layer.Layer<RootR, RootE>,

@@ -201,12 +201,9 @@ export const initialState = Cart.initialState(() => ({
 export const reducer = Cart.reducer({
   Mounted: (_action, { props, state }) => [
     state,
-    Command.stream(
-      Stream.fromEffect(
-        Effect.map(
-          Effect.flatMap(CartApi, (api) => api.restore(props.customerId)),
-          (lines) => ({ _tag: "LinesRestored" as const, lines }),
-        ),
+    Command.effect((dispatch) =>
+      Effect.flatMap(CartApi, (api) => api.restore(props.customerId)).pipe(
+        Effect.flatMap((lines) => dispatch({ _tag: "LinesRestored" as const, lines })),
       ),
     ),
   ],
@@ -225,21 +222,19 @@ export const reducer = Cart.reducer({
     hooks.online
       ? [
           state,
-          Command.stream(
-            Stream.fromEffect(
-              Effect.match(
-                Effect.flatMap(CartApi, (api) => api.redeem(action.code)),
-                {
-                  onFailure: (error) => ({
-                    _tag: "Failed",
-                    reason: `Coupon ${error.code} was rejected.`,
-                  }),
-                  onSuccess: (discount) => ({
-                    _tag: "CouponAccepted",
-                    discount,
-                  }),
-                },
-              ),
+          Command.effect((dispatch) =>
+            Effect.flatMap(CartApi, (api) => api.redeem(action.code)).pipe(
+              Effect.match({
+                onFailure: (error) => ({
+                  _tag: "Failed" as const,
+                  reason: `Coupon ${error.code} was rejected.`,
+                }),
+                onSuccess: (discount) => ({
+                  _tag: "CouponAccepted" as const,
+                  discount,
+                }),
+              }),
+              Effect.flatMap(dispatch),
             ),
           ),
         ]
@@ -249,14 +244,19 @@ export const reducer = Cart.reducer({
 
   CheckoutRequested: (_action, { state, props }) => [
     { ...state, checkout: "reserving" as const, error: null },
-    Command.stream(
-      Stream.flatMap(Stream.fromEffect(CartApi), (api) =>
-        api.checkout(props.customerId, state.lines),
-      ).pipe(
-        Stream.map(progressToAction),
-        Stream.catchTag("CheckoutFailed", (error) =>
-          Stream.succeed({ _tag: "Failed" as const, reason: error.reason }),
+    // A multi-step source, so the whole `Stream` vocabulary is still what
+    // expresses it — one call further in, with `dispatch` as the sink.
+    Command.effect((dispatch) =>
+      Stream.runForEach(
+        Stream.flatMap(Stream.fromEffect(CartApi), (api) =>
+          api.checkout(props.customerId, state.lines),
+        ).pipe(
+          Stream.map(progressToAction),
+          Stream.catchTag("CheckoutFailed", (error) =>
+            Stream.succeed({ _tag: "Failed" as const, reason: error.reason }),
+          ),
         ),
+        dispatch,
       ),
     ),
   ],
@@ -275,7 +275,9 @@ export const reducer = Cart.reducer({
    */
   CheckoutCompleted: (action, { state }) => [
     { ...state, checkout: "idle" as const },
-    Command.stream(Stream.succeed({ _tag: "OrderPlaced" as const, orderId: action.orderId })),
+    Command.effect((dispatch) =>
+      dispatch({ _tag: "OrderPlaced" as const, orderId: action.orderId }),
+    ),
   ],
 
   Failed: (action, { state }) => ({
@@ -301,7 +303,7 @@ export const reducer = Cart.reducer({
 
   Unmounted: (_action, { state, props }) => [
     state,
-    Command.effect(Effect.flatMap(CartApi, (api) => api.release(props.customerId))),
+    Command.effect(() => Effect.flatMap(CartApi, (api) => api.release(props.customerId))),
   ],
 });
 

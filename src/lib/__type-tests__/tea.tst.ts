@@ -7,6 +7,7 @@ import {
   Command,
   createRuntime,
   define,
+  type Dispatcher,
   type Disjoint,
   type Exhaustive,
   type MemberOf,
@@ -345,8 +346,8 @@ test("`ServicesOf` unions services across handlers instead of collapsing to `nev
   const blueprint = Defined.create({
     initialState: () => ({ count: 0 }),
     reducer: {
-      A: () => [{ count: 1 }, Command.effect(fooEffect)] as const,
-      B: () => [{ count: 1 }, Command.effect(barEffect)] as const,
+      A: () => [{ count: 1 }, Command.effect(() => fooEffect)] as const,
+      B: () => [{ count: 1 }, Command.effect(() => barEffect)] as const,
       // Contributes no service, and must not collapse the union to `never`.
       C: () => ({ count: 1 }),
     },
@@ -399,30 +400,288 @@ test("`OutputProps` derives one required `on<Tag>` prop per output, with `_tag` 
 });
 
 // ---------------------------------------------------------------------------
-// Command's Pipeable typing
+// The command leaf — `Command.effect`
 // ---------------------------------------------------------------------------
 
 interface PipeableFooService {
   readonly _foo: unique symbol;
 }
-declare const guarded: Command<{ readonly _tag: "X" }, PipeableFooService>;
+declare const named: Command<{ readonly _tag: "X" }, PipeableFooService>;
 
-test("a command's `A` and `R` survive a policy modifier via `.pipe`", () => {
-  expect(guarded.pipe(Command.restart())).type.toBe<
+const Contextual = define({
+  props: Schema.Struct({}),
+  state: Schema.Struct({ count: Schema.Number }),
+  action: Action.of([Action("Ping", {}), Action("Pong", { at: Schema.Number })]),
+});
+
+test("`Command.effect` carries `R` out of its effect and emits nothing by default", () => {
+  // The parameter is ignored by a command that emits nothing, which is why
+  // there is no second "cannot emit" constructor: it is this one, unused.
+  expect(Command.effect(() => fooEffect)).type.toBe<Command<never, FooService>>();
+  expect(Command.effect(() => Effect.void)).type.toBe<Command<never, never>>();
+
+  // `Command<never>` is the bottom, so a command that emits nothing still fits
+  // a slot expecting the feature's actions — see the covariance test below.
+  expect(Command.effect(() => fooEffect)).type.toBeAssignableTo<
+    Command<{ readonly _tag: "X" }, FooService>
+  >();
+
+  // The leaf is a callback, not an effect. Passing the effect itself — the
+  // shape the pre-redesign surface took — no longer compiles.
+  expect(Command.effect).type.not.toBeCallableWith(fooEffect);
+
+  // The effect's error channel is closed: a command that can fail has to say
+  // what it does about it, inside the effect, before the runtime sees it.
+  expect(Command.effect).type.not.toBeCallableWith(() => Effect.fail("boom"));
+});
+
+test("the leaf's `dispatch` is typed by the feature it is written in", () => {
+  // `A` has no inference site of its own — it sits behind `Dispatcher<A>` in a
+  // parameter position — so it comes from the contextual type of the handler's
+  // return. That is the whole ergonomic bet of the callback leaf: without it
+  // every emission would need an explicit type argument, and the spec's own
+  // examples would not compile as written.
+  //
+  // Written as direct calls rather than `toBeCallableWith`: that matcher types
+  // its arguments on their own, with no contextual type from the signature
+  // under test, so every context-sensitive callback inside one collapses to
+  // `never` and the assertion would be measuring the matcher. A call that
+  // type-checks in this file *is* the positive assertion.
+  Contextual.create({
+    initialState: () => ({ count: 0 }),
+    reducer: {
+      Ping: () =>
+        [{ count: 1 }, Command.effect((dispatch) => dispatch({ _tag: "Pong", at: 1 }))] as const,
+      Pong: (_action, snapshot) => snapshot.state,
+    },
+    render: () => null,
+  });
+
+  // An undeclared tag is rejected, which is the payoff for the above: the
+  // emission is checked against the vocabulary rather than against `unknown`.
+  Contextual.create({
+    initialState: () => ({ count: 0 }),
+    reducer: {
+      Ping: () =>
+        [
+          { count: 1 },
+          // @ts-expect-error is not assignable to type '"Ping" | "Pong"'
+          Command.effect((dispatch) => dispatch({ _tag: "Nope" })),
+        ] as const,
+      Pong: (_action, snapshot) => snapshot.state,
+    },
+    render: () => null,
+  });
+
+  // A declared tag with the wrong payload, too — the fields travel with the tag.
+  Contextual.create({
+    initialState: () => ({ count: 0 }),
+    reducer: {
+      Ping: () =>
+        [
+          { count: 1 },
+          // @ts-expect-error is not assignable to parameter of type
+          Command.effect((dispatch) => dispatch({ _tag: "Pong" })),
+        ] as const,
+      Pong: (_action, snapshot) => snapshot.state,
+    },
+    render: () => null,
+  });
+
+  // Standalone — no contextual type — the type argument is how `A` is fixed.
+  expect(
+    Command.effect<{ readonly _tag: "Pong"; readonly at: number }>((dispatch) =>
+      dispatch({ _tag: "Pong", at: 1 }),
+    ),
+  ).type.toBe<Command<{ readonly _tag: "Pong"; readonly at: number }, never>>();
+});
+
+test("`Dispatcher` is contravariant in `A`, which is what makes `Command` covariant", () => {
+  // A dispatcher accepting the wider union stands in wherever the narrow one
+  // is expected. `Command` puts this in a parameter position a second time,
+  // and two contravariant hops compose to covariant — the property the test
+  // below asserts on `Command` itself.
+  expect<Dispatcher<{ readonly _tag: "X" } | { readonly _tag: "Y" }>>().type.toBeAssignableTo<
+    Dispatcher<{ readonly _tag: "X" }>
+  >();
+  expect<Dispatcher<{ readonly _tag: "X" }>>().type.not.toBeAssignableTo<
+    Dispatcher<{ readonly _tag: "X" } | { readonly _tag: "Y" }>
+  >();
+
+  // It returns an `Effect`, so it composes with the effect that calls it. A
+  // `void` callback would force every call site into `Effect.sync`.
+  expect<ReturnType<Dispatcher<{ readonly _tag: "X" }>>>().type.toBe<Effect.Effect<void>>();
+});
+
+// ---------------------------------------------------------------------------
+// `keyed`, `batch`, `cancel` — the supervisor's whole vocabulary
+// ---------------------------------------------------------------------------
+
+test("`Command.keyed` names a command and preserves `A` and `R`", () => {
+  expect(named.pipe(Command.keyed("query"))).type.toBe<
     Command<{ readonly _tag: "X" }, PipeableFooService>
   >();
-  expect(guarded.pipe(Command.ignore("key"))).type.toBe<
-    Command<{ readonly _tag: "X" }, PipeableFooService>
-  >();
-  expect(guarded.pipe(Command.queue())).type.toBe<
+
+  // Not only through `.pipe`: it is a plain function of a command too.
+  expect(Command.keyed("query")(named)).type.toBe<
     Command<{ readonly _tag: "X" }, PipeableFooService>
   >();
 
   // Chained, since nesting is answerable at runtime (outermost wins) and the
   // types have to survive it too.
-  expect(guarded.pipe(Command.restart("outer")).pipe(Command.ignore("inner"))).type.toBe<
+  expect(named.pipe(Command.keyed("outer")).pipe(Command.keyed("inner"))).type.toBe<
     Command<{ readonly _tag: "X" }, PipeableFooService>
   >();
+
+  // Two arguments, which is the form that keeps contextual inference alive —
+  // see the test below for what it buys.
+  expect(Command.keyed("query", named)).type.toBe<
+    Command<{ readonly _tag: "X" }, PipeableFooService>
+  >();
+
+  // The key is required, and it is a string: the group address is data the
+  // runtime compares, not an arbitrary token.
+  expect(Command.keyed).type.not.toBeCallableWith();
+  expect(Command.keyed).type.not.toBeCallableWith(1);
+  expect(Command.keyed).type.not.toBeCallableWith(named, "query");
+});
+
+test("a leaf keeps its contextual `A` through `keyed(key, command)`, and loses it through `.pipe`", () => {
+  // `Command.keyed(key, command)` puts the leaf in an argument position, where
+  // the contextual type of the enclosing call still reaches it.
+  Contextual.create({
+    initialState: () => ({ count: 0 }),
+    reducer: {
+      Ping: () =>
+        [
+          { count: 1 },
+          Command.keyed(
+            "q",
+            Command.effect((dispatch) => dispatch({ _tag: "Pong", at: 1 })),
+          ),
+        ] as const,
+      Pong: (_action, snapshot) => snapshot.state,
+    },
+    render: () => null,
+  });
+
+  // The same leaf through `.pipe` does not: a `.pipe` receiver is checked
+  // before the contextual type of the `.pipe` call exists, so `A` falls back to
+  // `never` and `dispatch` accepts nothing. A TypeScript rule about receivers,
+  // not something this surface can fix — pinned so the two-argument form is
+  // never "simplified" away.
+  Contextual.create({
+    initialState: () => ({ count: 0 }),
+    reducer: {
+      Ping: () =>
+        [
+          { count: 1 },
+          // @ts-expect-error is not assignable to parameter of type 'never'
+          Command.effect((dispatch) => dispatch({ _tag: "Pong", at: 1 })).pipe(Command.keyed("q")),
+        ] as const,
+      Pong: (_action, snapshot) => snapshot.state,
+    },
+    render: () => null,
+  });
+});
+
+test("`Command.batch` composes commands and preserves `A` and `R`", () => {
+  expect(Command.batch(named, named)).type.toBe<
+    Command<{ readonly _tag: "X" }, PipeableFooService>
+  >();
+
+  // The shape the whole variant exists for: a `Cancel` sequenced ahead of the
+  // command replacing it. `Command.cancel` is `Command<never>` when it stands
+  // alone, so `A` has to come from the other member rather than collapsing the
+  // batch to `never`.
+  expect(Command.batch(Command.cancel("X"), named)).type.toBe<
+    Command<{ readonly _tag: "X" }, PipeableFooService>
+  >();
+
+  // Members must agree on the command type; a batch is not a union builder.
+  expect(Command.batch).type.not.toBeCallableWith(named, Effect.void);
+});
+
+test("a cancel written first in a batch does not pin the batch's `A` to `never`", () => {
+  // The regression this exists for, and the reason `cancel` is generic. A
+  // concrete `Command<never>` argument outranks the contextual return type as
+  // an inference source, so `A` was fixed to `never` before the sibling leaf
+  // was checked — and the leaf's `dispatch` accepted nothing. Cancel-first is
+  // the only order that means anything, so this is *the* case, not a corner.
+  Contextual.create({
+    initialState: () => ({ count: 0 }),
+    reducer: {
+      Ping: () =>
+        [
+          { count: 1 },
+          Command.batch(
+            Command.cancel({ tag: "Ping", key: "q" }),
+            Command.keyed(
+              "q",
+              Command.effect((dispatch) => dispatch({ _tag: "Pong", at: 1 })),
+            ),
+          ),
+        ] as const,
+      Pong: (_action, snapshot) => snapshot.state,
+    },
+    render: () => null,
+  });
+
+  // And the emission is still checked against the vocabulary inside a batch —
+  // the fix widened where `A` comes from, not what it accepts.
+  Contextual.create({
+    initialState: () => ({ count: 0 }),
+    reducer: {
+      Ping: () =>
+        [
+          { count: 1 },
+          Command.batch(
+            Command.cancel({ tag: "Ping", key: "q" }),
+            // @ts-expect-error is not assignable to type '"Ping" | "Pong"'
+            Command.effect((dispatch) => dispatch({ _tag: "Nope" })),
+          ),
+        ] as const,
+      Pong: (_action, snapshot) => snapshot.state,
+    },
+    render: () => null,
+  });
+});
+
+test("`Command.cancel` addresses a group by tag, or by tag and key, and emits nothing", () => {
+  // `Command<never>`, so a cancel fits any feature's slot without widening it.
+  expect(Command.cancel("Search")).type.toBe<Command<never, never>>();
+  expect(Command.cancel({ tag: "Search" })).type.toBe<Command<never, never>>();
+  expect(Command.cancel({ tag: "Search", key: "q" })).type.toBe<Command<never, never>>();
+
+  // `tag` is the address; there is no keyed-only target, because a key only
+  // refines within a tag.
+  expect(Command.cancel).type.not.toBeCallableWith({ key: "q" });
+  expect(Command.cancel).type.not.toBeCallableWith({ tag: "Search", keys: "q" });
+  expect(Command.cancel).type.not.toBeCallableWith({ tag: 1 });
+});
+
+test("the policy vocabulary and the `Stream` leaf are gone from the surface", () => {
+  // Removed with the redesign: concurrency is Effect's, not a second data
+  // vocabulary. Asserted by name so a re-introduction has to argue with a test.
+  expect(Command).type.not.toHaveProperty("restart");
+  expect(Command).type.not.toHaveProperty("ignore");
+  expect(Command).type.not.toHaveProperty("queue");
+  expect(Command).type.not.toHaveProperty("stream");
+
+  // And the whole constructor set, so a node added without a spec change fails
+  // here rather than quietly widening the ADT.
+  expect<keyof typeof Command>().type.toBe<
+    "none" | "effect" | "keyed" | "batch" | "cancel" | "output"
+  >();
+
+  // The `Stream` variant is gone from the ADT itself, not merely from the
+  // constructors: a long-lived source is `Stream.runForEach` inside the leaf.
+  expect<
+    Extract<Command<{ readonly _tag: "X" }>, { readonly _tag: "Stream" }>
+  >().type.toBe<never>();
+  expect<
+    Extract<Command<{ readonly _tag: "X" }>, { readonly _tag: "Guarded" }>
+  >().type.toBe<never>();
 });
 
 test("`Command` is covariant in `A`, so a narrow command satisfies a wide slot", () => {
@@ -499,7 +758,7 @@ test("`component` is closed over the root's `R`", () => {
     action: Action.of([Action("A", {})]),
   }).create({
     initialState: () => ({ count: 0 }),
-    reducer: { A: () => [{ count: 1 }, Command.effect(fooEffect)] as const },
+    reducer: { A: () => [{ count: 1 }, Command.effect(() => fooEffect)] as const },
     render: () => null,
   });
 
@@ -521,8 +780,8 @@ test("`component` is closed over the root's `R`", () => {
   }).create({
     initialState: () => ({ count: 0 }),
     reducer: {
-      A: () => [{ count: 1 }, Command.effect(fooEffect)] as const,
-      B: () => [{ count: 1 }, Command.effect(barEffect)] as const,
+      A: () => [{ count: 1 }, Command.effect(() => fooEffect)] as const,
+      B: () => [{ count: 1 }, Command.effect(() => barEffect)] as const,
     },
     render: () => null,
   });

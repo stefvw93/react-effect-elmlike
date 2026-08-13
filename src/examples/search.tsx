@@ -2,14 +2,19 @@
  * Search-as-you-type: the case Elm has no good answer for.
  *
  * The debounce is not an operator, and not a timer in the state. `TextEdited`
- * is declared `"restart"`, so each keystroke interrupts the pending request
- * from the previous keystroke — mid-delay, before it was ever sent. Debounce,
- * cancellation and last-write-wins all fall out of that one word, and the
- * stale-response race is gone structurally rather than by comparing sequence
- * numbers in the reducer.
+ * cancels its own group before forking the replacement, so each keystroke
+ * interrupts the pending request from the previous keystroke — mid-delay,
+ * before it was ever sent. Debounce, cancellation and last-write-wins all fall
+ * out of those two lines, and the stale-response race is gone structurally
+ * rather than by comparing sequence numbers in the reducer.
+ *
+ * It used to fall out of one *word* — the handler was declared `"restart"` and
+ * the runtime owned a policy vocabulary to make that mean something. The word
+ * was shorter; it was also a fiber supervisor reimplementing combinators Effect
+ * already had. What replaced it is visible in the handler, which is the point.
  */
 
-import { Context, Effect, Schema, Stream } from "effect";
+import { Context, Effect, Schema } from "effect";
 import { Action, Command, define } from "../lib/tea";
 
 // --- service ---------------------------------------------------------------
@@ -67,35 +72,59 @@ const getInitialSearchState = () => ({
   error: null,
 });
 
+/**
+ * Emptying the box is a reset *and* an interrupt.
+ *
+ * The `for` guard on `HitsArrived` already stops a stale response repainting an
+ * emptied box, so leaving the query running is invisible on screen — which is
+ * exactly why it is worth writing down: the request is still sent, 300ms after
+ * the user made it clear they no longer want it. A cancel here is one line, and
+ * without it this file's headline claim — that cancellation is visible in the
+ * handler — is only true of the paths that happen to issue a new query.
+ */
+const cleared = [
+  getInitialSearchState(),
+  Command.cancel({ tag: "TextEdited", key: "query" }),
+] as const;
+
 export const search = Search.create({
   initialState: () => getInitialSearchState(),
 
   reducer: {
     TextEdited: (action, { props, state }) =>
       action.text.length === 0
-        ? getInitialSearchState()
+        ? cleared
         : [
             { ...state, text: action.text, pending: true, error: null },
-            Command.stream(
-              Stream.fromEffect(
-                Effect.match(
-                  // The delay sits inside the interruptible region, which is what
-                  // turns "restart" into a debounce rather than just a cancel.
-                  Effect.delay(
-                    Effect.flatMap(SearchApi, (api) => api.query(action.text, props.filter)),
-                    "300 millis",
-                  ),
-                  {
-                    onFailure: (error: Unreachable) => ({
-                      _tag: "QueryFailed" as const,
-                      status: error.status,
-                    }),
-                    onSuccess: (hits) => ({
-                      _tag: "HitsArrived" as const,
-                      for: action.text,
-                      hits,
-                    }),
-                  },
+            Command.batch(
+              // Restart-on-keystroke, written where the reader can see the
+              // interrupt. The cancel has to run *before* the replacement is
+              // registered, which is the one thing this node does that no
+              // combinator inside the effect below can.
+              Command.cancel({ tag: "TextEdited", key: "query" }),
+              Command.keyed(
+                "query",
+                Command.effect((dispatch) =>
+                  Effect.match(
+                    // The delay sits inside the interruptible region, which is
+                    // what makes the cancel above a debounce rather than just a
+                    // cancel.
+                    Effect.delay(
+                      Effect.flatMap(SearchApi, (api) => api.query(action.text, props.filter)),
+                      "300 millis",
+                    ),
+                    {
+                      onFailure: (error: Unreachable) => ({
+                        _tag: "QueryFailed" as const,
+                        status: error.status,
+                      }),
+                      onSuccess: (hits) => ({
+                        _tag: "HitsArrived" as const,
+                        for: action.text,
+                        hits,
+                      }),
+                    },
+                  ).pipe(Effect.flatMap(dispatch)),
                 ),
               ),
             ),
@@ -112,7 +141,7 @@ export const search = Search.create({
       error: `Search is unavailable (${action.status}).`,
     }),
 
-    Cleared: getInitialSearchState,
+    Cleared: () => cleared,
 
     // Re-dispatch rather than re-issue. The command lives in exactly one
     // handler, and because it is issued *as* `TextEdited` it lands in the same
@@ -123,7 +152,9 @@ export const search = Search.create({
         ? state
         : [
             state,
-            Command.stream(Stream.succeed({ _tag: "TextEdited" as const, text: state.text })),
+            Command.effect((dispatch) =>
+              dispatch({ _tag: "TextEdited" as const, text: state.text }),
+            ),
           ],
   },
 
