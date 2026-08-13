@@ -81,6 +81,37 @@ encode real invariants (`Disjoint`, `NoTransform`, `NoPropCollision`,
 - [x] `run` resolves only once quiescent: nothing queued and nothing in flight (including fibers that settle without ever emitting, e.g. a bare `Command.effect` or an interrupted group).
 - [x] **`run` does not terminate on a never-completing command.** No longer suspected — **confirmed**: a probe asserting that `run` _does_ settle within 100ms on `Command.stream(Stream.never)` timed out. `runGuarded` increments `inFlight` and only decrements after `Fiber.await` settles, so a stream that never completes pins it at 1, the quiescence break (`queueSize === 0 && inFlightCount === 0`) is never taken, and the drain loop blocks on `Queue.take`. Pinned against the **current `Stream` leaf** with `Effect.timeoutOption` — load-bearing, since a plain `it` hangs the suite rather than failing it — and paired with a control (`Stream.empty`, same harness, same budget) so the assertion cannot pass vacuously. **This box records the bug, it does not fix it**: the test asserts today's behavior deliberately, so the deferred `Cmd`/`Sub` split (_Design decisions_, §3) becomes visible when it lands. Whoever fixes it inverts this test rather than deleting it.
 
+### Command grouping: cancellation identity vs concurrency identity
+
+A group key answered two different questions with one string, and a
+policy-wrapped `Command.batch` is where the two answers disagree. `Cancel`
+needs one addressable name for the whole batch; `ignore`/`restart` need to tell
+_"a fiber from an earlier dispatch"_ apart from _"my own sibling, forked
+milliseconds ago"_. Indexing members into `key#0`, `key#1` made the second
+question answerable by destroying the first (see the reverted iteration-2/3
+attempts below). The split is therefore on a second axis, not on `key`:
+
+- [x] **Cancellation identity is `Group` (`{ tag, key }`), unchanged.** It stays the public address, stays what `groups` is keyed by, and stays what `Command.cancel({ tag })` prefix-matches and `Command.cancel({ tag, key })` matches exactly. Every fiber a policy-wrapped batch forks lives under that one key, so a keyed `cancel` reaches all of them.
+- [x] **Concurrency identity is the _occurrence_:** one opaque identity minted per interpretation of a policy-bearing command, shared by every fiber that interpretation forks (all members of a batch, at any nesting depth) and distinct across dispatches. It is internal — nothing in the public surface names it, and it is never part of an address.
+- [x] `"ignore"` defers to a _different_ occurrence only: a new dispatch is dropped while any fiber from an earlier occurrence is in flight, but a batch member is never dropped because its own sibling got there first. Every member of an `ignore`-wrapped batch runs.
+- [x] `"restart"` interrupts fibers of a _different_ occurrence only, and the group bookkeeping it rewrites keeps same-occurrence siblings: members do not interrupt each other, and a member forking does not erase the entries of members that forked before it.
+- [x] `"queue"` waits on _every_ fiber in the group, own occurrence included — the serialisation queue is per-group, not per-occurrence. A `queue`-wrapped batch therefore runs its members one at a time (`a:start a:done b:start b:done`), after everything already queued under that key.
+- [x] Waiting for prior fibers under `"queue"` awaits each prior fiber's `Exit` rather than short-circuiting on the first that failed or was interrupted: a dying prior neither kills the follower nor releases it early while its siblings are still running.
+- [x] `"parallel"` (no wrapper) reads no occurrence and is unchanged: it neither interrupts nor waits.
+
+**`/e2e`: not applicable.** Nothing here is browser-observable — the split lives entirely in fiber bookkeeping, and the unit tests drive the real `createFeatureStore` (not a jsdom stand-in), so a real-browser run would exercise the same code through more indirection. The existing browser suite was run as a regression check and stayed green.
+
+**`/mock`: not applicable.** The split adds no public surface — `Command`,
+`Group`, `Policy` and every constructor keep their exact signatures. The change
+is entirely inside `commandInterpreter`: `CommandContext` gains an internal
+field and `groups` holds a fiber-plus-occurrence record instead of a bare
+fiber. There is nothing to `declare` that a caller could ever name.
+
+**`/type-tests`: not applicable, same reason.** No exported type changes, so
+there is no `expect().type` assertion to make that the existing suite does not
+already make. The behaviour is entirely value-level and is covered by the unit
+tests below.
+
 ### Known bug fixed by this pass
 
 `Blueprint.reduce`'s JSDoc states unhandled lifecycle actions return state
@@ -317,11 +348,189 @@ had just built**, which is the part with no happy-path test to keep it honest.
 - [x] **Joining teardown double-reported it.** Each fiber's `onExit` already reports its own failure; `joinAll` re-raising the same cause into the mount fiber had the terminal `catchCause` raise it again, and killed the fiber instead of letting it return normally.
 - [x] **Commands dispatched before `start` were dropped.** `dispatch` reaches the subtree during render and React runs descendants' layout effects before this component's passive effect, so a child dispatching from `useLayoutEffect` folded before anything was armed: the state moved, the command vanished. Buffered and flushed by `start`.
 
-Open, and deliberately not patched in this pass:
+All three closed in iteration 3:
 
-- [ ] `sync` writes the state cell after `useSyncExternalStore` has already read `getSnapshot`, so React's post-render consistency check can schedule the very re-render the render-body `sync` exists to avoid. The one-render browser test still passes, so the cost is not always paid — but the mechanism is real and the design's headline claim rests on it. Needs its own pass, probably `useSyncExternalStore`'s `getSnapshot` returning a value captured for the render rather than the live cell.
-- [ ] `Command.batch` members share one `CommandContext`, so an outer `restart`/`ignore` wrapping a batch puts every member in one group — contradicting the criterion above that batch members each keep their own policy. Pre-existing in `run`, surfaced by reading the extracted interpreter.
-- [ ] `create` derives the output-tag set twice: `Object.keys(spec.output.cases)` for the internals slot, `Object.hasOwn(spec.output.cases, tag)` in `run`. One rule, two spellings, in one closure.
+- [x] `Command.batch` members shared one `CommandContext`, so an outer `restart`/`ignore` wrapping a batch put every member in one group — each interrupting its siblings, and `restart`'s group replacement dropping their bookkeeping. Contradicted the criterion above that batch members keep their own policy. Each member now gets `key: "<key>#<index>"` **when a policy is in force**; without one the key is untouched, so the unguarded path is unchanged and `Cancel({ tag })` still matches by prefix either way. Two tests: both members complete under an outer `restart`, and a second dispatch restarts each member against its own predecessor.
+- [x] The output-tag set was derived twice inside one `create` closure — `Object.keys(spec.output.cases)` for the internals slot, `Object.hasOwn(spec.output.cases, tag)` in `run`. Derived once now and shared, so the store and `run` cannot drift about what an output is. The prototype-chain guard is preserved and re-pinned: `{ _tag: "constructor" }` still reaches the throw rather than leaving through an `on<Tag>` prop.
+
+- [x] **`sync` writes the state cell after `useSyncExternalStore` has read `getSnapshot`.** Reordered so the subscription comes _after_ the fold: both reads then see the same state. **But the reported extra render could not be reproduced.** A browser test that counts `render` invocations across a props change measures exactly one — and still measures one when the ordering is reverted, so the test does not discriminate and the defect does not manifest in this scenario. The reordering is kept because it is defensively correct and costs nothing; the claim that it _fixed_ an observable extra render is not supported by measurement. Recorded this way rather than as a clean win, because a passing test that passes equally against the bug is worth nothing and should not be counted as coverage.
+
+#### `/review-step` iteration 3: the loop stopped converging
+
+Ten more, and the synthesis is the finding: **every correctness item was a
+regression introduced by iteration 2's fixes.** Three rounds found 10, 9, 10 —
+flat, not decaying. That is a fact about this design, not about needing a fourth
+round.
+
+The clearest case, and the one reverted rather than patched:
+
+- [x] **Per-member batch group keys: reverted.** Iteration 2 gave each `Command.batch` member its own group so an outer `restart` would stop members interrupting each other. It fixed that and broke two documented behaviours doing it — `Command.cancel({ tag, key })` matches a key _exactly_, so indexed members became unreachable and cancelling a keyed batch silently interrupted nothing; and `queue` stopped serialising a batch, because each member then waited only on itself (probe: expected `a:start a:done b:start b:done`, got `a:start b:start b:done a:done`). Both are load-bearing and both are covered by criteria above; the thing it fixed is an edge case. **Reverted, with the original defect accepted as known** — an outer policy wrapping a batch still shares one group. The two tests that pinned the reverted behaviour were replaced by tests for what actually matters: keyed `cancel` reaching a policy-wrapped batch, and `queue` serialising its members. _Superseded: the underlying defect is fixed, and both of those replacement tests still hold — see_ Command grouping: cancellation identity vs concurrency identity _above. Indexing was the wrong axis, not the wrong goal._
+
+Fixed rather than reverted:
+
+- [x] After the mount fiber died, `offer` buffered every later command forever — `stopped` stayed false, so the array grew without bound and the Retry button the `Error` handler rendered did nothing, silently. The gate is now `everStarted`: buffering exists for one window, before the first `start`, where a child's layout effect can dispatch. Outside it, a command with no fiber to run it is dropped.
+- [x] `stop()` skipped the `Unmounted` fold entirely when the mount fiber had already died, so a component with a failed layer unmounted without its teardown handler ever running. The fold is unconditional now; only the _command_ needs a fiber.
+- [x] `joinGroup` matched by `tag::` prefix and waited unbounded, so a teardown hop reusing a tag that already had a long-lived poller waited on the poller — parking the mount fiber forever and holding the scope and layer open for the life of the page. Replaced by `joinSince`, which diffs against a snapshot taken before `interpret` and is bounded.
+- [x] `drainTeardown` tested global `inFlight === 0`, which a subscription from before the unmount pins at 1 — so it burned its full 1000-step × 1 ms budget while the layer's finalizers waited. Teardown work is awaited by `joinSince` before each poll, so an empty queue now ends it.
+- [x] `cleanup` was chained behind `onExit` with `andThen`, so an `onExit` that died skipped the `inFlight` decrement and the `groups` removal — leaving a settled fiber in its group forever, after which every command under an `ignore` policy for that group was silently dropped. `Effect.ensuring` now.
+- [x] `FeatureStore.sync`'s JSDoc described the _old_ ordering after the reorder — the inverse of the code — and called a return value load-bearing that `component` had stopped using.
+- [x] `splitOutputProps` rebuilt a constant `Set` of derived `on<Tag>` names on every props-identity change. Hoisted to per-blueprint scope.
+
+**Where this leaves the store.** Every reported defect is fixed or explicitly
+reverted, and the suite is 92 node + 11 browser + 79 type assertions with
+`vp check` clean. But `/review-step`'s exit gate is a review that comes back
+_empty_, and this one has not: the rate is flat across three rounds and the
+failures cluster in one place — the interaction between a synchronous fold, a
+per-mount Effect scope, and React's two-phase lifecycle. Patching findings one
+at a time is not converging on that. The next pass should be a design pass on
+`createFeatureStore`'s lifetime model, not a fourth review round.
+
+#### `/review-step` iteration 4: the convergence test, and its answer
+
+Run specifically to test the previous section's claim rather than assert it
+again. **Nine findings. The rate across four rounds is 10, 9, 10, 9 — flat.**
+
+Three of iteration 3's changes were _differentially confirmed worse than what
+they replaced_ — the reviewer ran the same probe against both versions:
+
+- [x] **`drainTeardown` ending on an empty poll: reverted.** `joinSince` waits on the _command_ fibers in `groups`, never on the separate watcher `runGuarded` forks to run `onExit` — so a teardown command that died had its defect report, and the `Error` handler's compensating command, land after the loop had already returned. Probe against the previous version: `defects: ['Error: teardown boom']`. Against iteration 3's: `defects: []`. Restored to the `inFlight === 0` test, which waits for the watcher because `inFlight` is decremented in `cleanup`, after `onExit`. The cost it was meant to avoid — a long-lived subscription pinning `inFlight` until the scope interrupts it, so teardown spends its budget before closing — is accepted. **Losing errors is worse than closing late.**
+- [x] **`stop()` folding `Unmounted` on a dead mount: reverted.** `reduce` discards its state and no fiber remains to run its command, so the only observable effect was raising `Error` and notifying `useSyncExternalStore` subscribers on a component React is mid-unmount. The comment claimed it restored cleanup that drops a lock or flushes to localStorage — but every one of those is a side effect, so it lives in the command, which was discarded three lines later.
+- [x] **The 5s join bound was per hop** inside `drainTeardown`'s 1000-step loop — up to ~83 minutes, not 5 seconds, which is the opposite of what a bound is for. Applied once to the whole teardown now.
+
+Genuinely fixed rather than reverted:
+
+- [x] `active` was never cleared when the mount fiber died, so `start` — guarded by `if (active) return` — could never re-arm it. Two rounds found this from opposite directions (an unbounded buffer, then an outright drop); both were downstream of this. The `Effect.ensuring` clears both `mount` and `active`, and a test pins that a caller can re-arm after a reported failure and have the retry actually run.
+
+Accepted as known, not fixed:
+
+- [x] ~~`Command.ignore(key)` around a `Command.batch` drops every member after the first~~ — **fixed by the identity split**, see _Command grouping: cancellation identity vs concurrency identity_ above. The design decision this box asked for was taken: the group key stays the cancellation address and a separate `Occurrence` carries the concurrency one, so `ignore`/`restart` compare against earlier dispatches while `Cancel` and `queue` keep addressing and serialising the whole group. The `restart` residue recorded two boxes up is fixed by the same change.
+- [x] ~~`Fiber.joinAll` short-circuits on the first failing fiber~~ — **fixed by the same pass.** The single `joinAll` was `queue`'s wait-for-predecessors, now `Effect.forEach(running, (entry) => Fiber.await(entry.fiber), { discard: true })`: every prior fiber is awaited to its `Exit`, so a dying predecessor neither takes the follower with it nor releases it while its siblings are still running.
+- [x] ~~A `Teardown` with no command returns without draining~~ — fixed: `teardown` drains to quiescence whether or not there is an `Unmounted` command, and a test pins it. The _other_ half of that box — work dispatched in the same tick as unmount now being interrupted by the sweep rather than allowed to finish — is a live behaviour change and moves to iteration 5's open list below.
+
+### Review iteration 5 — the identity-split pass
+
+Six findings on the working diff (only one of them in the split itself). Fixed:
+
+- [x] **`restart`'s group rewrite dropped occurrences it never interrupted.** `superseded` came from a snapshot taken before `Fiber.interrupt` — a yield point — but the `Ref.update` re-read the map and kept only same-occurrence entries, so an entry that arrived in between was removed from `groups` without being interrupted: a live fiber unreachable from `Command.cancel` and from teardown's sweep. Serialised on one fiber today, but nothing enforces that. Now filtered by the fiber identities this call actually interrupted.
+- [x] **The teardown drain woke the wrong queue after a remount.** `settled` offered through `offer`, which targets whichever mount is _current_. `stop` deliberately leaves the dying mount installed, so StrictMode's `start; stop; start` had every wake-up marker land in the new mount's queue while the drain blocked on `Queue.take` of the old one — holding the scope and the feature layer open for the full 5s bound and reporting a `"did not settle"` defect that had not happened. The marker now goes straight to `cells.queue`. Pinned by a test that fails against the previous version (layer finalizer never ran inside 300ms).
+- [x] **Reporting a command dropped onto a dead mount: tried and reverted _within this pass_.** Round 1 asked for the silent drop to be made loud, so a `died` flag routed it to `defect`. Round 2 probed the result: `component`'s `defect` sink is `setDefect` followed by a throw in the render body, so a feature whose `Error` handler returns a command — log it, clear a lock, schedule a retry, all common — got an error-boundary crash instead of the recovery UI that handler exists to render. The report also told the caller to `start()` again, which `component` (`useEffect(…, [store])`) can never do. **A worse diagnostic beat a fatal one**; the drop is silent again, with the reasoning in the code so the next round does not re-derive it, and a test pins that an `Error` handler's own command is dropped quietly. The round-2 follow-up that `died` also lacked the mount-identity guard its sibling `ensuring` applies is moot — the flag is gone.
+- [x] **`stop`'s dead-mount guard now runs before the `Unmounted` fold**, which is what its comment always claimed. It sat after, so the code was doing the thing the comment described as reverted — dead only because `mount` and `active` are cleared together.
+
+Rejected, with reasons:
+
+- [ ] _"Moving `useSyncExternalStore` after `sync` removes the recovery path for a discarded render."_ True that the post-render consistency check no longer fires, but the failure it protects against needs React to abandon a render **and never re-attempt it with those props** — at which point the props change itself was abandoned. A re-attempt re-runs `sync` as a no-op (value comparison) and reads the moved state correctly. The stale `syncing` JSDoc the same finding flagged **was** wrong and is fixed.
+- [ ] _"The drain forks work it never interrupts, so the 5s bound is reachable."_ Reachable by design: the queued work the drain forks is the teardown chain, and interrupting inside the loop would interrupt the `Unmounted` command itself. This is the already-recorded "cannot terminate on a never-completing command" limitation seen from the unmount side, not a separate defect — the bound exists precisely because it is reachable.
+- [ ] _"Retry is not delivered through `component`."_ Correct, and left open deliberately: `component` arms the store once (`useEffect(…, [store])`) and never re-arms, so a re-arm needs either a store-bumped version driving that effect — which auto-retries a permanently failing layer forever — or a demand-driven re-arm from inside `offer`, which re-enters `fold`. That is a design decision about the React binding, like the batch/policy one was, and it is not a patch. The drop is at least loud now.
+- [ ] `emit` during teardown still routes a follow-up command through `offer`, so a teardown command that emits an action whose handler returns a command has that command run in the **new** mount's scope after a remount. The `Settled` fix removes the wake-up half of this; the routing half needs `fold` to know which mount it is folding for, which is the same design decision as the Retry box above.
+
+Round 2 re-reviewed the same diff plus the whole branch and **cleared the split
+itself** — `ignore`/`restart` against sibling members, `queue` serialising a
+batch, keyed `Cancel` reaching a policy-wrapped batch, the group-rewrite race
+against `Fiber.interrupt`'s yield point, and the `Settled` routing across a
+StrictMode remount were each probed and found sound. Its remaining findings are
+outside this pass and recorded here rather than fixed:
+
+- [ ] **`src/examples/search.tsx` never applies the `restart` policy its own header, its inline comment and its `PropsChanged` comment all describe.** With the default `"parallel"`, every keystroke fires its own delayed request and a filter change races the pending query instead of superseding it — the demo's headline claim is prose only. One `.pipe(Command.restart("query"))` fixes it, but an example is a `/e2e`-mandatory file, so it is its own cycle rather than a drive-by edit here.
+- [ ] **Teardown's interrupt sweep cancels work dispatched in the same tick as unmount** (`start; dispatch; stop` loses a 50ms effect ~0ms in, where the previous `drainTeardown` let it finish). Already an open box above; round 2 established it is a regression from the current teardown rather than a long-standing gap, which raises its priority without changing that it needs the same "what does unmount owe in-flight work" decision.
+- [ ] **`RuntimeOptions.onEvent` is accepted and ignored**, and two examples present it as working. Deliberate and recorded, but the JSDoc callers actually read should say so.
+
+Round 3 re-reviewed the working diff alone and **cleared the split a second
+time**, probing the batch/policy matrix, `cancel`-then-`ignore` in one tick, and
+`ignore` at the exact completion boundary. Four more findings, all fixed:
+
+- [x] **Both drain loops read `Queue.size` before `inFlight`.** A settling fiber offers its follow-up work — `onExit` → `raiseDefect` → `fold` → `offer` — _before_ `cleanup` decrements, so a preemption between the two reads returned a size taken before the offer and a count taken after the decrement: quiescence declared with the `Error` handler's compensating command still queued, scope closed under it. Reading `inFlight` first can only ever be conservative. Fixed in `run`'s loop and in teardown's.
+- [x] **An `Unmounted` handler that _throws_ lost its compensating command.** The defect was raised before the `Teardown` marker was queued, so the `Error` handler's command went in _front_ of it: the main loop forked it, then teardown's interrupt sweep killed it — while the identical command reached through a dying teardown _command_ survived, being queued after the sweep. Same recovery path, two outcomes, decided by which way the handler was reached. The marker now goes first. Pinned by a test that fails against the previous order.
+- [x] **The `active = false` comment claimed a recovery `component` cannot perform.** Rewritten to say what is true: the clear is a precondition for re-arming, a direct driver recovers, a React subtree does not, and which one it should be is the open design question above.
+- [x] **A browser test's comment claimed to guard the `useSyncExternalStore` ordering**, which this same spec records that it does not (the count reads one either way). It pins the one-render claim; the comment now says so. Also: `splitOutputProps`'s JSDoc still described a list parameter that is now a prebuilt `ReadonlySet`.
+
+Round 4 cleared the split a **third** time and closed the box round 1 had to
+leave open:
+
+- [x] **A mount's emissions now route back to that mount.** The `Settled` fix covered the wake-up; the _work_ still went through `offer`, which targets whichever mount is installed. Probe against the previous version: `start; stop; start` with an `Unmounted` command emitting an action whose handler returns a layer-using command gave `["acquired:1", "acquired:2", "finalized:1", "second-hop-used:2"]` — the first mount's scope closed **before** its own teardown chain finished, and the follow-up ran against the second mount's services. A `routing` cell, set around the synchronous fold that a command's `emit`/`onExit` starts and restored after, sends that work to the cells whose command produced it. Sound because `fold` drains `pending` on one stack, so nothing can interleave with the window. Pinned by a test that fails against the previous version. This closes the open box carried from round 1 and 2.
+- [x] The 5s abandoned-teardown path drops the `Error` handler's own command — now documented as the bound doing its job rather than left looking like an oversight: teardown has already had its five seconds, and admitting more work to a closing scope is what "bounded" rules out.
+- [x] The teardown JSDoc presented the unconditional interrupt sweep as "the semantics you want" without saying it _changed_ them. It now says so, and points at the open question.
+- [x] A comment claimed credit for moving `stop`'s dead-mount guard above the fold. Against `HEAD` the guard was always there — only the uncommitted working tree had it below. Reworded to state the invariant rather than a fix.
+
+Round 5 traced the whole concurrency surface — the `Occurrence` split, `restart`
+bookkeeping by fiber identity, `queue` awaiting each `Exit`, the
+`inFlight`-before-`Queue.size` ordering in both drains, `Settled` routing and the
+`routing` cell — against React's mount paths and Effect 4's
+`Fiber.await`/`forkChild`/`timeoutOption` semantics and **found no hole in any of
+them**. Two ordering findings, both fixed:
+
+- [x] **A dying mount now releases before it reports.** `catchCause` raised the defect while `mount` still pointed at the terminating fiber's queue, so the `Error` handler's compensating command was enqueued to a reader that would never take again — not run, and not on `offer`'s dropped-work path either, so swallowed with no report at all. The clear is now a named `release`, run on the failure path before `raiseDefect` and again from `ensuring` (idempotent, identity-guarded). A test pins that the handler runs, the command drops on the documented path, and the store is re-armable afterwards.
+- [x] **The 5s abandoned-teardown defect is routed like its siblings.** It was the one `raiseDefect` on a mount fiber outside `withRouting`, so after a remount it queued the dying mount's compensating command into its _successor_ — the exact cross-mount leak `routing` exists to close. Dropped is the contract on that path; resurrected elsewhere is not.
+
+Round 6 **found no correctness bug** — in the occurrence split, the teardown
+drain, or the `useSyncExternalStore` reorder — and independently confirmed the
+scheduling assumptions the new code rests on rather than taking the comments at
+their word: `Queue.offerUnsafe` in `effect@4.0.0-beta.102` schedules the taker
+through the dispatcher and never resumes it synchronously, which is what makes
+`withRouting`'s "set around the synchronous fold" sound; `Queue.sizeUnsafe` never
+goes negative on pending takers, so `queued === 0 && inFlight === 0` is a valid
+quiescence test; and the group entry is added _before_ the watcher forks, so a
+command that completes inside `forkChild` cannot have its cleanup run before its
+entry exists. Four documentation findings, all fixed — `stop`'s dead-mount guard
+comment (it is narrowing and a backstop, not the dead-mount path), the
+`useSyncExternalStore` comment claiming a fix measurement did not support,
+`createFeatureStore`'s JSDoc still describing `sync`'s return value as
+load-bearing, and its list of extracted helpers naming a `groupId` the
+interpreter no longer returns.
+
+- [ ] Round 6's one non-documentation observation, recorded rather than fixed: `"queue"` awaits every fiber currently in its group, so N rapid dispatches on one key register O(N²) awaiters and each new fiber pins its predecessors until they settle. Correct, and it is the price of "wait for all of them, including a dying one's siblings" — but it is a scaling cliff for a `queue`-keyed command driven by keystrokes, where `restart` is almost always what was meant.
+
+Still open after six rounds: the React-binding re-arm, what unmount owes work
+already in flight, `search.tsx`'s unapplied `restart`, `onEvent`, `queue`'s
+O(N²) awaiter growth, and the fact that the `useSyncExternalStore`-after-`sync`
+ordering ships with no discriminating test (the render count reads one either
+way, so a revert would pass). All are decisions rather than patches, which is
+the same shape the batch/policy problem had before this pass took it.
+
+**Conclusion, with evidence rather than prediction.** Four high-effort rounds,
+38 findings, and a defect rate that did not decay. Every round's findings
+clustered in the same place: the interaction between a synchronous fold, a
+per-mount Effect scope, and React's two-phase lifecycle. Rounds 3 and 4 were
+dominated by regressions from the previous round's fixes, and three iteration-3
+changes had to be reverted as net-negative. That is what a design problem looks
+like from inside a patch loop.
+
+#### The design pass: teardown reuses `run`'s quiescence
+
+Acted on rather than deferred. `joinSince`, `runningFibers` and `drainTeardown`
+— roughly sixty lines of bespoke waiting — are gone, replaced by the loop `run`
+has always used:
+
+```
+interrupt outstanding work
+interpret the Unmounted command
+while (queued > 0 || inFlight > 0) { take; interpret }
+```
+
+Three properties fall out that every hand-rolled version had to chase
+separately, and kept missing one of:
+
+- **The error watcher is waited on.** `inFlight` is decremented in
+  `runGuarded`'s `cleanup`, which runs _after_ `onExit` — so a quiescence test
+  on `inFlight` waits for the reporting fiber by construction. Joining `groups`
+  never could: the watcher is not in it. This is what round 4 caught
+  differentially.
+- **No polling, no step budget.** The `Settled` marker — which `run` has offered
+  all along and the store was discarding as `Effect.void` — wakes a blocked
+  `Queue.take` when a command finishes without emitting. That marker's absence
+  is the entire reason the first drain had to poll.
+- **It terminates.** `run` famously cannot reach quiescence with a
+  never-completing command in flight (recorded above). Teardown can, because
+  unmount interrupts outstanding work _first_ — which is the semantics you want
+  anyway, and is what `OwnershipRule` already promises.
+
+Bounded once, at the top, with an abandoned teardown reported as a defect rather
+than silently closing the scope.
+
+Five tests, one per case a previous design got wrong: a dying teardown command
+is reported; the `Error` handler's compensating command still runs; a slow
+teardown sibling is not cut off when another member dies; a `Teardown` carrying
+no command still drains what is queued; and teardown terminates with a
+never-completing command in flight.
 
 #### Deferred, and recorded rather than silently absent
 
