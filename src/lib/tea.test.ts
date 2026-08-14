@@ -3360,6 +3360,37 @@ describe("createFeatureStore — devtools", () => {
     expect(calls).toBe(1);
   });
 
+  it("stays disabled within the fold that broke it, not merely after it", async () => {
+    // A single fold reports twice — the transition, then the command it
+    // issued. A guard that captured the sink once per fold would call a
+    // broken sink a second time before noticing, so "disabled" has to mean
+    // disabled at the next report and not at the next fold.
+    // `Mounted` is the fold that carries a command here, deliberately: it is
+    // the *first* one, so the throw has to be caught within it. Put the
+    // command on a later action and the earlier `Mounted` transition would
+    // have disabled the sink already, and the test would pass either way.
+    let calls = 0;
+    const { store, defects } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => s.state,
+        Land: (_a: unknown, s: any) => s.state,
+        Mounted: (_a: unknown, s: any) => [s.state, Command.effect(() => Effect.void)],
+      },
+      sink: {
+        onEvent: () => {
+          calls += 1;
+          throw new Error("sink is broken");
+        },
+      },
+    });
+
+    store.start();
+    await settle();
+
+    expect(calls).toBe(1);
+    expect(defects).toEqual([]);
+  });
+
   it("keeps `instance` stable across a remount and distinct between mounts", () => {
     const first = setup({
       reducer: { Bump: (_a: unknown, s: any) => s.state, Land: (_a: unknown, s: any) => s.state },
@@ -3433,6 +3464,86 @@ describe("createFeatureStore — devtools", () => {
     for (const event of recorder.events) {
       expect(JSON.parse(JSON.stringify(event))).toEqual(event);
     }
+  });
+
+  it("reports `HookChanged` as its tag alone, whatever the hooks hold", async () => {
+    // Hooks are `Record<string, unknown>` by design — a `useQuery` result with
+    // a `refetch` function on it, a `Date`, a DOM node. The action the runtime
+    // builds carries the previous record, so reporting it whole would put a
+    // function in the event. That is worse than lossy: `structuredClone`
+    // throws on a function, `report` would catch it and disable the sink, and
+    // the log would go dark for the rest of the page.
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => s.state,
+        Land: (_a: unknown, s: any) => s.state,
+        HookChanged: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+      },
+    });
+
+    store.start();
+    store.sync({ id: "a" }, { refetch: () => {} } as never);
+    recorder.clear();
+    store.sync({ id: "a" }, { refetch: () => {} } as never);
+
+    const changed = only(recorder, "Transition").find(
+      (event) => event.action._tag === "HookChanged",
+    );
+    expect(changed!.action).toEqual({ _tag: "HookChanged" });
+    expect(Object.keys(changed!.action)).toEqual(["_tag"]);
+    expect(JSON.parse(JSON.stringify(changed))).toEqual(changed);
+    expect(() => structuredClone(changed)).not.toThrow();
+  });
+
+  it("keeps `PropsChanged`'s previous props, which are a schema value", async () => {
+    // The other side of the same decision. Props are a schema struct and
+    // `NoTransform` guarantees `Encoded` equals `Type`, so `previous` encodes
+    // and is worth keeping — trimming both would have thrown away the useful
+    // one to fix the unusable one.
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => s.state,
+        Land: (_a: unknown, s: any) => s.state,
+        PropsChanged: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+      },
+    });
+
+    store.start();
+    store.sync({ id: "a" }, {} as never);
+    recorder.clear();
+    store.sync({ id: "b" }, {} as never);
+
+    const changed = only(recorder, "Transition").find(
+      (event) => event.action._tag === "PropsChanged",
+    );
+    expect(changed!.action).toEqual({ _tag: "PropsChanged", previous: { id: "a" } });
+    expect(JSON.parse(JSON.stringify(changed))).toEqual(changed);
+  });
+
+  it("reports the runtime's own `Error` action as its tag alone", async () => {
+    // The one action in the system the runtime builds rather than the user:
+    // `raiseDefect` attaches the live `error` and a `Cause`, and neither
+    // survives `JSON.stringify`. Reporting the tag alone is what keeps the
+    // round-trip above true, and nothing is lost — the `Defect` event just
+    // before it carries the same failure as an encodable summary.
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [
+          s.state,
+          Command.effect(() => Effect.die(new Error("kaboom"))),
+        ],
+        Land: (_a: unknown, s: any) => s.state,
+        Error: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+      },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    const errorFold = only(recorder, "Transition").find((event) => event.action._tag === "Error");
+    expect(errorFold!.action).toEqual({ _tag: "Error" });
+    expect(Object.keys(errorFold!.action)).toEqual(["_tag"]);
   });
 
   it("behaves identically with no devtools layer installed", async () => {

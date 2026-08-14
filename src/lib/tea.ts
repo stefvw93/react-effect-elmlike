@@ -1880,12 +1880,44 @@ const nextInstance = (name: string): string => {
   return String(next);
 };
 
-/** Shared, so the two hottest emission paths allocate no cause object at all. */
-const DISPATCH: DevtoolsCause = { _tag: "Dispatch" };
-const LIFECYCLE: DevtoolsCause = { _tag: "Lifecycle" };
+/**
+ * Shared, so the two hottest emission paths allocate no cause object at all.
+ *
+ * Frozen because they are shared: these three objects reach every sink on the
+ * page, and one sink annotating what it was handed would corrupt every later
+ * event from every other feature.
+ */
+const DISPATCH: DevtoolsCause = Object.freeze({ _tag: "Dispatch" });
+const LIFECYCLE: DevtoolsCause = Object.freeze({ _tag: "Lifecycle" });
 
-/** The `Error` action as a devtools event sees it — see the emission site. */
-const ERROR_ACTION = { _tag: "Error" } as const;
+/**
+ * The two runtime-built actions as a devtools event sees them.
+ *
+ * Every action a *user* declares is a schema value with no escape hatch, so it
+ * encodes. The runtime builds five of its own, and two of those carry payloads
+ * that do not:
+ *
+ *   - `Error` carries the live `error` and a `Cause`. The first
+ *     `JSON.stringify`s to `{}`; the second to an Effect-internal shape that
+ *     does not read back.
+ *   - `HookChanged` carries the previous **hooks**, and hooks are
+ *     `Record<string, unknown>` by design — a `useQuery` result with a
+ *     `refetch` function on it, a `Date`, a DOM node. `structuredClone` throws
+ *     on the function, which is worse than lossy: `report` would catch it,
+ *     disable the sink, and the log would go dark for the rest of the page.
+ *
+ * `PropsChanged` is deliberately *not* here. Props are a schema struct and
+ * `NoTransform` guarantees `Encoded` equals `Type`, so `previous` is as
+ * encodable as the state beside it, and it is worth keeping.
+ */
+const ERROR_ACTION = Object.freeze({ _tag: "Error" as const });
+const HOOK_CHANGED_ACTION = Object.freeze({ _tag: "HookChanged" as const });
+
+const reportableAction = (action: { readonly _tag: string }): { readonly _tag: string } => {
+  if (action._tag === "Error") return ERROR_ACTION;
+  if (action._tag === "HookChanged") return HOOK_CHANGED_ACTION;
+  return action;
+};
 
 const commandCause = (ctx: CommandContext): DevtoolsCause =>
   ctx.key === undefined
@@ -1971,7 +2003,14 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
    * rather than merely swallowing, because a sink that threw once will throw
    * on every fold for the life of the page.
    */
-  const report = (target: DevtoolsSink, event: DevtoolsEvent): void => {
+  const report = (event: DevtoolsEvent): void => {
+    // Re-read rather than trusting the caller's handle. A single fold reports
+    // twice — a transition, then the command it issued — and a sink that threw
+    // on the first must not be called for the second. The call sites still
+    // guard on `devtools()` before building an event, which is what keeps the
+    // no-sink path free of allocation; this is only about staying disabled.
+    const target = sink;
+    if (target === undefined) return;
     try {
       target.onEvent(event);
     } catch {
@@ -2190,7 +2229,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     // ahead of whatever the parent dispatches in response to it.
     const target = devtools();
     if (target !== undefined) {
-      report(target, { _tag: "Output", name, instance, cause, output: action });
+      report({ _tag: "Output", name, instance, cause, output: action });
     }
 
     try {
@@ -2201,7 +2240,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       // bug and must not become this feature's error state.
       const onThrow = devtools();
       if (onThrow !== undefined) {
-        report(onThrow, {
+        report({
           _tag: "Defect",
           name,
           instance,
@@ -2243,18 +2282,17 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     if (target !== undefined) {
       // After a successful reduce and before the command event, so the log
       // reads in the order the runtime did the work.
-      report(target, {
+      report({
         _tag: "Transition",
         name,
         instance,
         cause,
-        // Every *user* action is a schema value and encodes. The one action
-        // the runtime builds itself does not: `raiseDefect` attaches the live
-        // `error` and a `Cause`, and neither survives `JSON.stringify`. Report
-        // the tag alone — the `Defect` event immediately before this one
-        // already carries the same failure as an encodable summary, and this
-        // event's `cause` is the link to it.
-        action: action._tag === "Error" ? ERROR_ACTION : action,
+        // Trimmed for the two runtime-built actions whose payloads do not
+        // encode — see `reportableAction`. Nothing is lost for either: the
+        // `Defect` event just before an `Error` carries the same failure in
+        // encodable form, and a `HookChanged`'s effect is the state move this
+        // very event reports.
+        action: reportableAction(action),
         previous,
         next: nextState,
       });
@@ -2264,7 +2302,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       const ctx = { tag: action._tag };
       const accepted = offer({ _tag: "Run", command, ctx });
       if (target !== undefined) {
-        report(target, {
+        report({
           _tag: "Command",
           name,
           instance,
@@ -2323,7 +2361,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     // here, so emitting there as well would double every one of them.
     const target = devtools();
     if (target !== undefined) {
-      report(target, {
+      report({
         _tag: "Defect",
         name,
         instance,
@@ -2672,7 +2710,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       // `skipUnchanged` that would hide this event on every feature.
       const target = thrown === undefined ? devtools() : undefined;
       if (target !== undefined) {
-        report(target, {
+        report({
           _tag: "Transition",
           name,
           instance,
@@ -2682,7 +2720,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
           next: state,
         });
         if (teardown !== undefined) {
-          report(target, {
+          report({
             _tag: "Command",
             name,
             instance,

@@ -88,10 +88,29 @@ export interface DevtoolsTransition extends DevtoolsEnvelope {
  */
 export interface DevtoolsCommand extends DevtoolsEnvelope {
   readonly _tag: "Command";
-  /** The address a `Cancel` would name to interrupt this work. */
+  /**
+   * The **tag-level** address of this work: `Command.cancel(group.tag)`
+   * interrupts every fiber this command forks.
+   *
+   * Tag-level and not the exact `{ tag, key }`, deliberately. A `Batch` can
+   * hold members under several different keys, so there is no single precise
+   * address for one command in general — and reporting a precise one whenever
+   * it happened to exist would make the field mean different things on
+   * different events. The keys are still in `command`, on each `Keyed` node,
+   * and an action a keyed command dispatches carries its own key in `cause`.
+   */
   readonly group: Group;
   readonly command: CommandSummary;
-  /** No mount was draining the queue; the command was discarded, not run. */
+  /**
+   * Nothing was there to take this work when it was offered.
+   *
+   * Answers what the runtime can know **at the offer**, which is whether a
+   * mount was draining the queue. It is not a promise that accepted work
+   * necessarily ran: a fiber can accept a command and then be torn down before
+   * interpreting it — teardown exceeding its bound is the real case — and a
+   * synchronous event emitted at the offer cannot be revised afterwards. So
+   * `false` means "handed to a live mount", not "ran to completion".
+   */
   readonly dropped: boolean;
 }
 
@@ -532,18 +551,49 @@ export const createConsoleDevtools = (options: ConsoleDevtoolsOptions = {}): Dev
           ? ""
           : `  @ ${clock()}${previous === undefined ? "" : `  (+${Math.round(now - previous)}ms)`}`;
 
-      const open = collapsed ? output.groupCollapsed : output.group;
-      open(`%c${headline(event)}${stamp}`, palette.header);
+      // Called through `output`, not through a hoisted reference to the
+      // method: `const open = output.group` loses the receiver, and a console
+      // implementation whose methods are not pre-bound — which the global one
+      // is not obliged to be — would throw on the first event.
+      const line = `%c${headline(event)}${stamp}`;
+      if (collapsed) output.groupCollapsed(line, palette.header);
+      else output.group(line, palette.header);
 
-      // `finally`, because one throw inside the body — a getter on user state,
-      // a proxy, a `toString` that fails — would otherwise leave the group open
-      // and indent every later console line on the page.
+      // Caught, not merely `finally`'d, and the two do different jobs.
+      //
+      // `finally` is what keeps the group balanced: one throw with an open
+      // group indents every later console line on the page, long after the
+      // feature that opened it unmounted.
+      //
+      // The `catch` is what keeps this sink *alive*. Printing reads user state
+      // — a getter, a Proxy, a `toString` — so a throw here is a property of
+      // one value, not of the sink. Letting it escape would reach `report` in
+      // the store, whose disable rule is justified by "a sink that threw once
+      // will throw on every fold", and that premise is exactly what does not
+      // hold for a value-dependent failure: devtools would go dark for the
+      // rest of the page because one state object was hostile. Reported
+      // through `error` rather than swallowed, so a genuine bug in here is
+      // still visible.
       try {
         body(event, { output, palette, diff });
+      } catch (error) {
+        try {
+          output.error("%cdevtools could not print this event", palette.defect, error);
+        } catch {
+          // The console itself is broken. Nothing left to report it with.
+        }
       } finally {
         output.groupEnd();
         if (unmounting) lastSeen.delete(key);
       }
+
+      // Bounded, because the only other thing that removes an entry is an
+      // `Unmounted` transition — and a mount whose fiber died never folds one,
+      // so a page that churns through such mounts would grow this map without
+      // limit. Clearing wholesale rather than evicting one entry: the map
+      // holds a debugging nicety, and the cost of losing it is that the next
+      // event per mount prints no elapsed figure.
+      if (lastSeen.size > 512) lastSeen.clear();
     },
   };
 };

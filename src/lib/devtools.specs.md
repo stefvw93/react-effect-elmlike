@@ -177,6 +177,8 @@ untouched — no existing `component(bp)` call changes.
 - [ ] `summarizeDefect` produces `{ message }` plus optional `name`/`stack` from an `Error`, from a string, from a symbol, and from `undefined`, and never throws.
 - [ ] Every event is **JSON round-trippable**: `JSON.parse(JSON.stringify(event))` deep-equals the event, given encodable state and actions.
 - [ ] The `Transition` for the runtime's own `Error` action carries `action: { _tag: "Error" }` and not the action object the runtime built, which holds a live `Error` and a `Cause`. See Expected Behavior.
+- [ ] The `Transition` for `HookChanged` carries `action: { _tag: "HookChanged" }`. Hooks are `Record<string, unknown>`, so the previous record the runtime attaches routinely holds functions — `structuredClone` throws on one, which would disable the sink rather than merely losing a field.
+- [ ] `PropsChanged` **keeps** its `previous` props, which are a schema value and encode.
 
 ### The sink service
 
@@ -205,12 +207,14 @@ untouched — no existing `component(bp)` call changes.
 
 - [ ] **A throwing sink does not break the fold**: state still moves, no defect is raised, and the sink is disabled — it is not called again.
 - [ ] With no devtools layer installed, every path above behaves exactly as it does today and nothing throws.
-- [ ] With no sink installed, an emission site **allocates nothing**: no summaries, no event literals, no strings, and no thunk-passing helper.
+- [ ] With no sink installed, an emission site **allocates nothing**: no summaries, no event literals, no strings, and no thunk-passing helper. **Verified by construction, not by a test** — every site is `const target = devtools(); if (target !== undefined) …`, and the absence of an allocation is not observable from outside the fold. A test asserting it would have to mock the module and would then be asserting the mock. What _is_ tested is the observable half: the sink is resolved at most once (`resolves the sink once and reuses it`) and a store with no layer behaves identically.
 
 ### Console logger
 
 - [ ] `collapsed: true` (the default) uses `groupCollapsed`; `collapsed: false` uses `group`.
 - [ ] `groupEnd()` fires **exactly once per group even when the body throws** — a throw inside a group would otherwise nest every subsequent console line for the life of the page.
+- [ ] **A throw while printing does not escape the logger.** It is reported through `console.error` and the sink keeps working. Printing reads user state, so such a throw is a property of one value, not of the sink — and the store disables a sink that throws, which would take devtools dark for the rest of the page because one state object had a hostile getter. If `console.error` throws too, that is swallowed: there is nothing left to report it with.
+- [ ] The elapsed map is **bounded**, independently of the `Unmounted` transition that normally clears an entry — a mount whose fiber died never folds one.
 - [ ] A transition prints `prev state` / `action` / `next state` / `cause` lines with `%c` colour directives.
 - [ ] Defect bodies go through `console.error`, not `console.log`.
 - [ ] The default predicate (`skipUnchangedAmbient`) drops an unchanged `PropsChanged`/`HookChanged`, keeps a `PropsChanged` that moved state, and keeps `Unmounted` and an unchanged **dispatch**.
@@ -342,6 +346,10 @@ Elapsed uses `performance.now()` in a `Map` keyed by `${name}#${instance}`.
 - `diff` is deliberately shallow: deep-diffing unknown state is unbounded work on a value the library does not own — the same argument `hooksEquivalence` already makes.
 
 ## Known limitations
+
+- **`dropped: false` means "handed to a live mount", not "ran".** The flag answers what the runtime can know at the offer. A fiber can accept a command and then be torn down before interpreting it — teardown exceeding its 5s bound is the real case, and `tea.ts` says so at that site — and a synchronous event emitted at the offer cannot be revised afterwards. Making it accurate would mean either deferring the event until the work was interpreted, which loses the ordering the log is for, or a second "and it actually ran" event, which is a bigger surface than the problem.
+- **`group` is the tag-level address, not always the exact one.** `Command.cancel(group.tag)` interrupts everything the command forked, but a `Batch` can hold members under several keys, so no single precise `{ tag, key }` exists in general. Reporting a precise address only when one happened to exist would make the field mean different things on different events. The keys are in `command`, on each `Keyed` node.
+- **A mount whose fiber died emits no `Unmounted`.** A feature layer that fails to build kills the mount fiber, `release()` clears `active`, and the `stop()` React then calls returns at its `active` guard before reaching the emission. The log shows the feature going quiet with no terminal event. This is the devtools face of `tea.specs.md` open work #1 — the store cannot currently re-arm from `component` either — and it is that item's fix to make, not a second emission site here. The console logger's elapsed map no longer depends on the terminal event: it is bounded independently.
 
 - **The blind window before the root context exists.** With a synchronous root layer, only folds _before_ `start()` are lost — a descendant's `useLayoutEffect` dispatch (the buffered path) and the first render's `sync`. With an **asynchronous** root layer, everything until the layer resolves is lost. Warming the context with a `runFork(Effect.void)` inside `createRuntime` would close the sync window, but it moves _when the root layer builds_, which is observable through any layer's acquire side effects — not a debugging tool's call to make.
 - **The console logger prints a stack string, not clickable frames.** The price of an encodable `DefectSummary`.

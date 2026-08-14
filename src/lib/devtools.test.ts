@@ -495,13 +495,18 @@ describe("createConsoleDevtools", () => {
     expect(methods(spy).filter((method) => method === "groupEnd")).toHaveLength(1);
   });
 
-  it("closes the group even when printing the body throws", () => {
-    // The failure this guards is not the throw, it is what a *missing*
-    // `groupEnd` does afterwards: every subsequent console line on the page
-    // stays indented inside a group that will never close, long after the
-    // feature that opened it unmounted.
+  it("closes the group and stays alive when printing the body throws", () => {
+    // Two separate guarantees, and they used to be one.
+    //
+    // The group must close, or every later console line on the page stays
+    // indented inside a group that will never close. And the throw must not
+    // escape: printing reads user state, so a throw here is a property of one
+    // value, not of the sink — and the store's `report` disables a sink that
+    // throws, which would take devtools dark for the rest of the page because
+    // one state object had a hostile getter.
     const spy = spyConsole();
     let opened = false;
+    let thrown = 0;
     const hostile: DevtoolsConsole = {
       ...spy,
       groupCollapsed: (...args) => {
@@ -509,13 +514,41 @@ describe("createConsoleDevtools", () => {
         spy.groupCollapsed(...args);
       },
       log: () => {
+        thrown += 1;
         throw new Error("a getter on user state threw");
       },
     };
 
-    expect(() => createConsoleDevtools({ console: hostile }).onEvent(transition())).toThrow();
+    const sink = createConsoleDevtools({ console: hostile });
+    expect(() => sink.onEvent(transition())).not.toThrow();
     expect(opened).toBe(true);
     expect(methods(spy)).toContain("groupEnd");
+    // Reported rather than swallowed, so a genuine bug in the logger is still
+    // visible to whoever is reading the console.
+    expect(methods(spy)).toContain("error");
+
+    // And it is still working: a second event is printed, not dropped.
+    expect(() => sink.onEvent(transition())).not.toThrow();
+    expect(thrown).toBe(2);
+  });
+
+  it("survives a console whose `error` also throws", () => {
+    // The last resort. If reporting the failure fails too there is nothing
+    // left to report it with, and taking down the fold would be the worst of
+    // all outcomes.
+    const exploding: DevtoolsConsole = {
+      group: () => {},
+      groupCollapsed: () => {},
+      groupEnd: () => {},
+      log: () => {
+        throw new Error("nope");
+      },
+      error: () => {
+        throw new Error("also nope");
+      },
+    };
+
+    expect(() => createConsoleDevtools({ console: exploding }).onEvent(transition())).not.toThrow();
   });
 
   it("sends a defect body through `console.error`", () => {
@@ -719,6 +752,26 @@ describe("createConsoleDevtools", () => {
     );
 
     expect(printed(spy)).toContain("#123456");
+  });
+
+  it("bounds the elapsed map, since a mount whose fiber died never unmounts", () => {
+    // The only other thing that removes an entry is an `Unmounted` transition,
+    // and a store whose mount fiber died — a feature layer that failed to
+    // build — never folds one. Without a bound, a page that churns through
+    // those grows this map for its whole life: a leak in the tool installed to
+    // find leaks.
+    const spy = spyConsole();
+    const sink = createConsoleDevtools({ console: spy });
+
+    for (let index = 0; index < 600; index += 1) {
+      sink.onEvent(transition({ instance: String(index) }));
+    }
+
+    // Observable proxy for the bound: after the clear, an instance seen before
+    // it prints no elapsed figure, because its entry is gone.
+    const before = printed(spy);
+    sink.onEvent(transition({ instance: "0" }));
+    expect(printed(spy).slice(before.length)).not.toMatch(/\+\d/);
   });
 
   it("never throws on an event it cannot pretty-print", () => {
