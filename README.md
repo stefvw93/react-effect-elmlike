@@ -94,6 +94,55 @@ caught at every call site.
 the runtime, driveable without a DOM. `component` is the only intended caller —
 they are exported so the live fold is testable directly.
 
+## Devtools
+
+Every transition, command, output and defect, as a redux-logger-style console
+group. It is a **service in the root layer**, not an option on the runtime:
+
+```ts
+import { consoleDevtoolsLayer } from "./lib";
+
+const { Provider, component } = createRuntime(
+  Layer.mergeAll(AppLayer, import.meta.env.DEV ? consoleDevtoolsLayer() : Layer.empty),
+);
+```
+
+Both branches are `Layer<never>`, so merging it moves neither the root's `R` nor
+any `component(bp)` call, and a production build keeps only the ternary.
+
+Being a service is the point: `devtoolsLayer(sink)` installs any
+`{ onEvent: (event: DevtoolsEvent) => void }`, so the console logger swaps for a
+`postMessage` transport or, in a test, `createRecorder()`:
+
+```ts
+const recorder = createRecorder();
+const store = createFeatureStore({
+  ...args,
+  runtime: ManagedRuntime.make(devtoolsLayer(recorder.sink)),
+});
+store.start();
+recorder.events; // every event, in emission order
+```
+
+**The sink is synchronous, because the fold is.** An `Effect`-returning sink
+would put a forked fiber and a scheduler hop on the hottest path in the library,
+and the log could land after the state it describes had already moved. When no
+sink is installed the emission sites allocate nothing at all.
+
+Every event is encodable, which is what makes a transport sink possible: a
+command's effect is erased to a `CommandSummary` and a defect's `Error` to a
+`DefectSummary`, because an `Error` `JSON.stringify`s to `{}` and a function
+makes `structuredClone` refuse the whole message.
+
+Two things it does not see. Nothing is reported before `start()` — the root
+context does not exist until the runtime's first `runFork` — so a first-render
+`sync` and a descendant's layout-effect dispatch fall in that window, and an
+asynchronous root layer widens it until the layer resolves. And an output
+crossing into a parent's `on<Tag>` prop is reported as an `Output` event, but
+whatever the parent dispatches next is _not_ attributed to it: the output leaves
+through a plain React callback into arbitrary user code, so the runtime cannot
+see what happened there and does not guess.
+
 ## Testing
 
 - `vp test` — unit and reducer tests (node, no DOM).

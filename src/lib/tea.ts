@@ -27,6 +27,15 @@ import {
   Schema,
   SchemaParser,
 } from "effect";
+import {
+  Devtools,
+  noopDevtools,
+  summarizeCommand,
+  summarizeDefect,
+  type DevtoolsCause,
+  type DevtoolsEvent,
+  type DevtoolsSink,
+} from "./devtools";
 
 // ---------------------------------------------------------------------------
 // Display
@@ -820,8 +829,15 @@ type CommandContext = {
  * terminates. Everything below — the fiber bookkeeping — is identical.
  */
 const commandInterpreter = (deps: {
-  /** Where a command's emissions go: back to the reducer, or out as an output. */
-  readonly emit: (message: { readonly _tag: string }) => Effect.Effect<void>;
+  /**
+   * Where a command's emissions go: back to the reducer, or out as an output.
+   *
+   * The `ctx` is the emitting command's group — the address a `Cancel` would
+   * name. It is passed so the store can attribute what it folds to the command
+   * that caused it; `run` ignores it, and a one-parameter function is still
+   * assignable here, which is why `run`'s sink needed no change.
+   */
+  readonly emit: (message: { readonly _tag: string }, ctx: CommandContext) => Effect.Effect<void>;
   /**
    * Run after a command's fiber settles, however it settled. `run` needs it to
    * wake a `Queue.take` that quiescence would otherwise never unblock; the
@@ -932,8 +948,18 @@ const commandInterpreter = (deps: {
    * what lets a long-lived source be `Stream.runForEach(source, dispatch)` and
    * a one-shot be `Effect.flatMap(load, dispatch)`, with no separate variant
    * for either.
+   *
+   * Built per leaf rather than once for the interpreter, because the ctx it
+   * closes over is what tells the store which command emitted. A single shared
+   * closure cannot carry it: `Keyed` refines the ctx on the way down, so by the
+   * time a leaf runs, its ctx is not the one the interpreter was constructed
+   * with. One extra closure per forked leaf, which is nothing beside forking
+   * the fiber it belongs to.
    */
-  const dispatch: Dispatcher<any> = (action) => deps.emit(action);
+  const dispatchFor =
+    (ctx: CommandContext): Dispatcher<any> =>
+    (action) =>
+      deps.emit(action, ctx);
 
   const interpret = (
     command: Command<any, any>,
@@ -950,7 +976,7 @@ const commandInterpreter = (deps: {
           // has no business catching it.
           return yield* forkLeaf(
             ctx,
-            Effect.asVoid(Effect.suspend(() => command.effect(dispatch))),
+            Effect.asVoid(Effect.suspend(() => command.effect(dispatchFor(ctx)))),
           );
         case "Keyed":
           // Outermost wins: an inner `Keyed` under an outer one keeps `ctx`
@@ -1687,51 +1713,6 @@ export const define: <
 // Root
 // ---------------------------------------------------------------------------
 
-/**
- * Emitted for every state change in every mounted feature. Loosely typed on
- * purpose — a root observer sees features it knows nothing about. Because
- * actions, outputs, state *and* props are all schemas with no escape hatch left
- * in them, every field here encodes: this is a devtools transport, a replay log
- * or a `postMessage` away from being useful, with no schema-aware serialiser in
- * between.
- *
- * `instance` and `cause` are what turn a flat log into something usable once
- * there are N independent machines instead of one.
- *
- * Without `instance`, two `<Presence roomId="…">` are indistinguishable in the
- * stream, because `name` is a *blueprint* name. Without `cause`, order is all
- * you have — and in a decentralised architecture order tells you almost nothing
- * while causality tells you everything. `cause` is what renders
- * `cart#3/OrderPlaced → presence#1/RosterSynced` as an edge rather than as two
- * unrelated lines that happened to be adjacent.
- *
- * This is also the argument for outputs over a shared bus, restated as a data
- * structure: an output has a declared tag, a schema, and a known recipient, so
- * the edge is derivable. Bus traffic is opaque and the edge is not.
- *
- * Note what is *not* here: a `Query` variant. It was in the sketch, and cutting
- * queries removed it — which is the second-order reason they went. An externally
- * sent message has no origin the runtime can name, so the one variant that could
- * not be filled in was also the only one crossing a boundary inbound.
- */
-export interface DevtoolsEvent {
-  readonly name: string;
-  /** Which mount. */
-  readonly instance: string;
-  readonly action: unknown;
-  readonly previous: unknown;
-  readonly next: unknown;
-  /** What caused this action, when the runtime knows. */
-  readonly cause?:
-    | { readonly _tag: "Dispatch" }
-    | { readonly _tag: "Command"; readonly action: string }
-    | { readonly _tag: "Output"; readonly from: string; readonly output: string };
-}
-
-export interface RuntimeOptions {
-  readonly onEvent?: (event: DevtoolsEvent) => void;
-}
-
 // ---------------------------------------------------------------------------
 // Mounting a blueprint
 // ---------------------------------------------------------------------------
@@ -1882,6 +1863,67 @@ export interface FeatureStore<Props, State, Action, H extends AnyHooks> {
  *   - The feature `layer` builds once per `start`, inside the mount scope, so
  *     its finalizers run on `stop`.
  */
+/**
+ * One counter per blueprint name, so `cart#1` and `cart#2` are distinguishable
+ * in a devtools stream.
+ *
+ * Module-global rather than per runtime: the ids only have to be unique within
+ * a page, and threading a counter through `createRuntime` would put a
+ * debugging concern into the DI surface. Unique, not gapless — StrictMode
+ * double-invokes the `useState` initialiser that builds a store, burning one.
+ */
+const instanceCounts = new Map<string, number>();
+
+const nextInstance = (name: string): string => {
+  const next = (instanceCounts.get(name) ?? 0) + 1;
+  instanceCounts.set(name, next);
+  return String(next);
+};
+
+/**
+ * Shared, so the two hottest emission paths allocate no cause object at all.
+ *
+ * Frozen because they are shared: these three objects reach every sink on the
+ * page, and one sink annotating what it was handed would corrupt every later
+ * event from every other feature.
+ */
+const DISPATCH: DevtoolsCause = Object.freeze({ _tag: "Dispatch" });
+const LIFECYCLE: DevtoolsCause = Object.freeze({ _tag: "Lifecycle" });
+
+/**
+ * The two runtime-built actions as a devtools event sees them.
+ *
+ * Every action a *user* declares is a schema value with no escape hatch, so it
+ * encodes. The runtime builds five of its own, and two of those carry payloads
+ * that do not:
+ *
+ *   - `Error` carries the live `error` and a `Cause`. The first
+ *     `JSON.stringify`s to `{}`; the second to an Effect-internal shape that
+ *     does not read back.
+ *   - `HookChanged` carries the previous **hooks**, and hooks are
+ *     `Record<string, unknown>` by design — a `useQuery` result with a
+ *     `refetch` function on it, a `Date`, a DOM node. `structuredClone` throws
+ *     on the function, which is worse than lossy: `report` would catch it,
+ *     disable the sink, and the log would go dark for the rest of the page.
+ *
+ * `PropsChanged` is deliberately *not* here. Props are a schema struct and
+ * `NoTransform` guarantees `Encoded` equals `Type`, so `previous` is as
+ * encodable as the state beside it, and it is worth keeping.
+ */
+const ERROR_ACTION = Object.freeze({ _tag: "Error" as const });
+const HOOK_CHANGED_ACTION = Object.freeze({ _tag: "HookChanged" as const });
+
+const reportableAction = (action: { readonly _tag: string }): { readonly _tag: string } => {
+  if (action._tag === "Error") return ERROR_ACTION;
+  if (action._tag === "HookChanged") return HOOK_CHANGED_ACTION;
+  return action;
+};
+
+const commandCause = (ctx: CommandContext): DevtoolsCause =>
+  ctx.key === undefined
+    ? { _tag: "Command", action: ctx.tag }
+    : { _tag: "Command", action: ctx.tag, key: ctx.key };
+
 export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(args: {
   readonly blueprint: Blueprint<Props, State, Action, any, H, any>;
   readonly props: Props;
@@ -1903,9 +1945,78 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
   readonly emit: (output: { readonly _tag: string }) => void;
   /** A defect no `Error` handler took. `component` rethrows it during render. */
   readonly defect: (error: unknown) => void;
+  /**
+   * What the devtools stream calls this feature. `component` passes the `name`
+   * it already has, which today only sets `displayName`.
+   *
+   * Optional, and it stays optional: a store constructed directly — which is
+   * how most of this library's own tests reach it — has no name to give, and
+   * requiring one would be a signature change to every one of them for a field
+   * only a debugger reads. Defaults to `"TeaFeature"`, matching `displayName`.
+   */
+  readonly name?: string;
+  /**
+   * Which mount, within the name. Optional for the same reason, and defaulted
+   * from a module-global counter so two mounts of one blueprint are
+   * distinguishable in the stream.
+   */
+  readonly instance?: string;
 }): FeatureStore<Props, State, Action, H> => {
   const { blueprint, equivalence, runtime, layer, emit, defect } = args;
   const { initialState, outputTags, handles } = blueprint[internals];
+
+  const name = args.name ?? "TeaFeature";
+  const instance = args.instance ?? nextInstance(name);
+
+  /**
+   * The installed devtools sink, or `undefined` when nobody installed one.
+   *
+   * Resolved lazily and cached behind `resolved`, because `cachedContext` is
+   * `undefined` until the root runtime's first `runFork`. `start` forks
+   * immediately before folding `Mounted`, and for a synchronous root layer the
+   * context is populated by then — so `Mounted` is captured. An **asynchronous**
+   * root layer is a genuine blind window; see `devtools.specs.md`. Returning
+   * `undefined` without latching `resolved` is what lets a later fold retry.
+   */
+  let resolved = false;
+  let sink: DevtoolsSink | undefined;
+
+  const devtools = (): DevtoolsSink | undefined => {
+    if (!resolved) {
+      const context = runtime.cachedContext;
+      if (context === undefined) return undefined;
+      const installed = Context.getReferenceUnsafe(context, Devtools);
+      // Against the exported constant, never against `Devtools.defaultValue()`:
+      // that re-invokes the thunk.
+      sink = installed === noopDevtools ? undefined : installed;
+      resolved = true;
+    }
+    return sink;
+  };
+
+  /**
+   * Hand one event to the sink, and disable the sink if it throws.
+   *
+   * Without the guard, a throw here is caught by `fold` and routed into the
+   * *feature's* `Error` handler — a devtools bug becoming a feature error
+   * state, which is the exact mistake `emitOutput` exists to avoid. Disabling
+   * rather than merely swallowing, because a sink that threw once will throw
+   * on every fold for the life of the page.
+   */
+  const report = (event: DevtoolsEvent): void => {
+    // Re-read rather than trusting the caller's handle. A single fold reports
+    // twice — a transition, then the command it issued — and a sink that threw
+    // on the first must not be called for the second. The call sites still
+    // guard on `devtools()` before building an event, which is what keeps the
+    // no-sink path free of allocation; this is only about staying disabled.
+    const target = sink;
+    if (target === undefined) return;
+    try {
+      target.onEvent(event);
+    } catch {
+      sink = undefined;
+    }
+  };
 
   // Own-keys semantics without the prototype hazard: `outputTags` is already a
   // plain array of own keys taken from `cases`, so membership is a lookup in a
@@ -2011,7 +2122,17 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
   // would otherwise re-enter mid-write and have the outer fold overwrite it on
   // the way out.
   let folding = false;
-  const pending: Array<{ readonly _tag: string }> = [];
+  /**
+   * Queued folds, each with the cause the emitting site knew.
+   *
+   * The cause travels with the action rather than being recomputed at the fold,
+   * because by then it is gone: `fold` drains a queue and cannot tell a
+   * dispatch from a command's emission. Mirrors `run`'s own `Entry` shape.
+   */
+  const pending: Array<{
+    readonly action: { readonly _tag: string };
+    readonly cause: DevtoolsCause;
+  }> = [];
 
   /**
    * Set while `sync` is folding, which is to say: while React is rendering.
@@ -2063,10 +2184,22 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     }
   };
 
-  const offer = (work: Work): void => {
+  /**
+   * Returns whether anything will ever run this work — which is what the
+   * devtools `dropped` flag reports. Buffered work counts as accepted: `start`
+   * flushes it, so it is delayed rather than discarded.
+   */
+  const offer = (work: Work): boolean => {
     const target = routing ?? mount;
-    if (target !== undefined) Queue.offerUnsafe(target.queue, work);
-    else if (!everStarted) buffered.push(work);
+    if (target !== undefined) {
+      Queue.offerUnsafe(target.queue, work);
+      return true;
+    }
+    if (!everStarted) {
+      buffered.push(work);
+      return true;
+    }
+    return false;
     // No fiber to run it: either the component is gone, or its mount died.
     // Dropping is correct — buffering here is what grew without bound.
     //
@@ -2090,10 +2223,33 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
    * swallowed its caller's mistake and transitioned into an error state instead
    * of anybody finding out. It goes straight to the boundary, like a bad prop.
    */
-  const emitOutput = (action: { readonly _tag: string }): void => {
+  const emitOutput = (action: { readonly _tag: string }, cause: DevtoolsCause): void => {
+    // Before `emit`, so the log records the message leaving even if the
+    // parent's handler then throws — and so a devtools UI sees the output
+    // ahead of whatever the parent dispatches in response to it.
+    const target = devtools();
+    if (target !== undefined) {
+      report({ _tag: "Output", name, instance, cause, output: action });
+    }
+
     try {
       emit(action);
     } catch (error) {
+      // Its own emission, because this path deliberately never goes through
+      // `raiseDefect`: a missing or throwing `on<Tag>` handler is the parent's
+      // bug and must not become this feature's error state.
+      const onThrow = devtools();
+      if (onThrow !== undefined) {
+        report({
+          _tag: "Defect",
+          name,
+          instance,
+          cause,
+          from: action._tag,
+          defect: summarizeDefect(error),
+          handled: false,
+        });
+      }
       defect(error);
     }
   };
@@ -2102,12 +2258,13 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
    * One action, folded. Returns whether the state reference moved, so the
    * caller can notify exactly once for a run of them.
    */
-  const foldOne = (action: { readonly _tag: string }): boolean => {
+  const foldOne = (action: { readonly _tag: string }, cause: DevtoolsCause): boolean => {
     if (outputs.has(action._tag)) {
-      emitOutput(action);
+      emitOutput(action, cause);
       return false;
     }
 
+    const previous = state;
     const next = blueprint.reduce(action as never, snapshot());
     const command = Next.command(next);
     const nextState = Next.state(next);
@@ -2117,12 +2274,50 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     // cannot disagree with a test that folds `Unmounted` through `reduce`.
     const moved = nextState !== state;
     if (moved) state = nextState;
-    if (command) offer({ _tag: "Run", command, ctx: { tag: action._tag } });
+
+    // Read once and branched on, so a store with no sink allocates nothing
+    // here: no event literal, no summary, no string, and no thunk-passing
+    // helper — a closure would allocate whether or not it were ever called.
+    const target = devtools();
+    if (target !== undefined) {
+      // After a successful reduce and before the command event, so the log
+      // reads in the order the runtime did the work.
+      report({
+        _tag: "Transition",
+        name,
+        instance,
+        cause,
+        // Trimmed for the two runtime-built actions whose payloads do not
+        // encode — see `reportableAction`. Nothing is lost for either: the
+        // `Defect` event just before an `Error` carries the same failure in
+        // encodable form, and a `HookChanged`'s effect is the state move this
+        // very event reports.
+        action: reportableAction(action),
+        previous,
+        next: nextState,
+      });
+    }
+
+    if (command) {
+      const ctx = { tag: action._tag };
+      const accepted = offer({ _tag: "Run", command, ctx });
+      if (target !== undefined) {
+        report({
+          _tag: "Command",
+          name,
+          instance,
+          cause,
+          group: ctx,
+          command: summarizeCommand(command),
+          dropped: !accepted,
+        });
+      }
+    }
     return moved;
   };
 
-  const fold = (action: { readonly _tag: string }): void => {
-    pending.push(action);
+  const fold = (action: { readonly _tag: string }, cause: DevtoolsCause): void => {
+    pending.push({ action, cause });
     if (folding) return;
 
     folding = true;
@@ -2131,9 +2326,9 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       while (pending.length > 0) {
         const next = pending.shift()!;
         try {
-          if (foldOne(next)) moved = true;
+          if (foldOne(next.action, next.cause)) moved = true;
         } catch (error) {
-          raiseDefect(error, next._tag);
+          raiseDefect(error, next.action._tag, next.cause);
         }
       }
     } finally {
@@ -2159,12 +2354,31 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
    * A defect raised *by* the `Error` handler goes straight out, or the two
    * would feed each other forever.
    */
-  function raiseDefect(error: unknown, from: string): void {
-    if (from === "Error" || !handles("Error")) {
+  function raiseDefect(error: unknown, from: string, cause: DevtoolsCause): void {
+    const handled = from !== "Error" && handles("Error");
+
+    // The single emission site for a dying command: `onExit` already routes
+    // here, so emitting there as well would double every one of them.
+    const target = devtools();
+    if (target !== undefined) {
+      report({
+        _tag: "Defect",
+        name,
+        instance,
+        cause,
+        from,
+        defect: summarizeDefect(error),
+        handled,
+      });
+    }
+
+    if (!handled) {
       defect(error);
       return;
     }
-    fold({ _tag: "Error", error, cause: Cause.die(error) } as never);
+    // The `Transition` this produces is a *second* event and not a duplicate:
+    // one says a defect occurred, the other says the feature's recovery ran.
+    fold({ _tag: "Error", error, cause: Cause.die(error) } as never, { _tag: "Defect", from });
   }
 
   const run = (cells: Mount) => {
@@ -2214,7 +2428,8 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       // forked by *this* mount emitting must have its follow-up work run on
       // *this* mount's fiber, with this mount's services, inside this mount's
       // scope. See `routing`.
-      emit: (message) => Effect.sync(() => withRouting(cells, () => fold(message))),
+      emit: (message, ctx) =>
+        Effect.sync(() => withRouting(cells, () => fold(message, commandCause(ctx)))),
       // Teardown waits for quiescence exactly as `run` does, so it needs the
       // same wake-up. Ignored by the main loop; load-bearing during the drain.
       //
@@ -2241,7 +2456,9 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
             // Routed like `emit`, and for the same reason: the `Error`
             // handler's compensating command belongs to the mount whose
             // command died, not to its successor.
-            withRouting(cells, () => raiseDefect(Cause.squash(exit.cause), ctx.tag));
+            withRouting(cells, () =>
+              raiseDefect(Cause.squash(exit.cause), ctx.tag, commandCause(ctx)),
+            );
           }
         }),
     });
@@ -2346,6 +2563,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
                       raiseDefect(
                         new Error("Unmounted did not settle within 5s; scope closed anyway"),
                         "Unmounted",
+                        LIFECYCLE,
                       ),
                     ),
                   )
@@ -2372,7 +2590,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
           // branch either — swallowed with no report at all. Released first,
           // the same command takes the documented drop path.
           release();
-          raiseDefect(Cause.squash(cause), "Mounted");
+          raiseDefect(Cause.squash(cause), "Mounted", LIFECYCLE);
         }),
       ),
       // Whatever happened, this fiber is no longer draining anything. Leaving
@@ -2392,7 +2610,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
 
     getSnapshot: () => state,
 
-    dispatch: (action) => fold(action as { readonly _tag: string }),
+    dispatch: (action) => fold(action as { readonly _tag: string }, DISPATCH),
 
     sync: (nextProps, nextHooks) => {
       const previousProps = props;
@@ -2419,8 +2637,8 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
 
       syncing = true;
       try {
-        if (propsMoved) fold({ _tag: "PropsChanged", previous: previousProps } as never);
-        if (hooksMoved) fold({ _tag: "HookChanged", previous: previousHooks } as never);
+        if (propsMoved) fold({ _tag: "PropsChanged", previous: previousProps } as never, LIFECYCLE);
+        if (hooksMoved) fold({ _tag: "HookChanged", previous: previousHooks } as never, LIFECYCLE);
       } finally {
         syncing = false;
       }
@@ -2447,7 +2665,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       // Anything a layout effect dispatched before this ran.
       for (const work of buffered.splice(0)) Queue.offerUnsafe(cells.queue, work);
       runtime.runFork(run(cells));
-      fold({ _tag: "Mounted" });
+      fold({ _tag: "Mounted" }, LIFECYCLE);
     },
 
     stop: () => {
@@ -2482,6 +2700,48 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
 
       Queue.offerUnsafe(cells.queue, { _tag: "Teardown", command: teardown });
 
+      // Teardown bypasses `fold` entirely — it calls `blueprint.reduce`
+      // directly, just above — so without these two the last thing every
+      // feature does would be missing from the log.
+      //
+      // `previous` and `next` are the same reference on purpose: `reduce`
+      // discards `Unmounted`'s returned state, which is why the default
+      // console predicate is `skipUnchangedAmbient` and not the blunter
+      // `skipUnchanged` that would hide this event on every feature.
+      //
+      // Emitted even when the handler above threw. There is no next state to
+      // be wrong about — `reduce` discards it either way — and the transition
+      // reports the fact that matters, that this instance is gone. The
+      // adjacent `Defect` reports that the handler threw. Suppressing it was
+      // worse than a missing line: the console logger evicts its elapsed entry
+      // on exactly this event, so a feature whose teardown threw left one
+      // behind.
+      const target = devtools();
+      if (target !== undefined) {
+        report({
+          _tag: "Transition",
+          name,
+          instance,
+          cause: LIFECYCLE,
+          action: { _tag: "Unmounted" },
+          previous: state,
+          next: state,
+        });
+        if (teardown !== undefined) {
+          report({
+            _tag: "Command",
+            name,
+            instance,
+            cause: LIFECYCLE,
+            group: { tag: "Unmounted" },
+            command: summarizeCommand(teardown),
+            // Queued straight onto the dying mount's own queue above, so it
+            // always has a reader.
+            dropped: false,
+          });
+        }
+      }
+
       // Reported *after* the marker is queued, so the `Error` handler's own
       // compensating command lands behind `Teardown` rather than in front of
       // it. Raised first, that command was interpreted by the main loop and
@@ -2489,7 +2749,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       // identical command reached through a *dying teardown command* survived,
       // because that one is queued after the sweep. Same recovery path, two
       // outcomes, decided by which way the handler was reached.
-      if (thrown !== undefined) raiseDefect(thrown.error, "Unmounted");
+      if (thrown !== undefined) raiseDefect(thrown.error, "Unmounted", LIFECYCLE);
 
       // `mount` deliberately stays pointed at these cells. The teardown chain
       // is not necessarily one hop — a teardown command may emit an action
@@ -2612,7 +2872,6 @@ const noHooks: AnyHooks = Object.freeze({});
  */
 export const createRuntime: <RootR, RootE>(
   layer: Layer.Layer<RootR, RootE>,
-  options?: RuntimeOptions,
 ) => {
   readonly Provider: FC<{ readonly children?: ReactNode }>;
 
@@ -2666,13 +2925,14 @@ export const createRuntime: <RootR, RootE>(
    * services without being rewritten.
    */
   readonly useRuntime: () => ManagedRuntime.ManagedRuntime<RootR, RootE>;
-  // `_options` is deliberate: `RuntimeOptions.onEvent` is declared and
-  // deliberately unwired for now, so no `DevtoolsEvent` is emitted. Deferred
-  // rather than half-built — the `cause: "Output"` variant needs a parent↔child
-  // channel that does not exist, and the obvious substitute (blaming whatever
-  // the parent dispatches next) invents causality it cannot verify. Recorded in
-  // specs.md so the gap is visible rather than looking like an oversight.
-} = (layer, _options) => {
+  // One parameter. Observation used to be a second one — a `RuntimeOptions`
+  // with an `onEvent` that nothing ever called — and it is now a service
+  // installed through `layer` itself: `Layer.mergeAll(AppLayer,
+  // consoleDevtoolsLayer())`. A `Context.Reference` is `Layer<never>`, so it
+  // moves neither `RootR` nor any `component(bp)` call, and being in the layer
+  // makes it swappable per environment the same way every other service is.
+  // See `devtools.specs.md`.
+} = (layer) => {
   const runtime = ManagedRuntime.make(layer);
   const context = createContext(runtime);
 
@@ -2764,6 +3024,10 @@ export const createRuntime: <RootR, RootE>(
             handler(payload);
           },
           defect: (error) => setDefect({ error }),
+          // The same `name` that becomes `displayName`. One name for the
+          // component in React's tree and for the feature in the event stream,
+          // so a reader looking at both is looking at the same thing.
+          name,
         }),
       );
 

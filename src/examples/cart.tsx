@@ -28,6 +28,7 @@
 
 import { useState, type ReactNode } from "react";
 import { Context, Effect, Layer, Schema, Stream, Struct } from "effect";
+import { consoleDevtoolsLayer } from "../lib/devtools";
 import { Action, Command, createRuntime, define } from "../lib/tea";
 
 // --- domain (unchanged) -------------------------------------------------------
@@ -369,13 +370,9 @@ export type CartOutput = typeof CartOutputs.Type;
 
 declare const AppLayer: Layer.Layer<CartApi>;
 
-const { Provider, component } = createRuntime(AppLayer, {
-  onEvent: (event) => {
-    if (import.meta.env.DEV) {
-      console.debug(`[${event.name}#${event.instance}]`, event.cause, event.action);
-    }
-  },
-});
+const { Provider, component } = createRuntime(
+  Layer.mergeAll(AppLayer, import.meta.env.DEV ? consoleDevtoolsLayer() : Layer.empty),
+);
 
 export const Cart_ = component(cart, { name: "cart" });
 

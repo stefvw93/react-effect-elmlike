@@ -87,9 +87,10 @@ Mounted: (_action, { props, state }) => [
 
 ## Acceptance Criteria
 
-`[x]` holds today. Every box is checked: the command-leaf pass landed, and what
-it did not do is in Open work and Deferred decisions rather than left as an
-unchecked criterion here.
+`[x]` holds today. The command-leaf pass landed, and what it did not do is in
+Open work and Deferred decisions rather than left as an unchecked criterion
+here. Every box is checked again: the devtools pass closed the last two, and
+its own criteria live in `devtools.specs.md`.
 
 ### Vocabularies (`Action`, `Action.output`, `Action.of`)
 
@@ -151,6 +152,8 @@ unchecked criterion here.
 - [x] `store.sync` is idempotent: called twice with equivalent props and hooks it raises nothing the second time, so a discarded render costs nothing.
 - [x] A defect from a command, or a feature `layer` that fails to build, reaches the `Error` handler; with none declared it is rethrown during render, the only place a boundary can catch it.
 - [x] Services come from the root `ManagedRuntime`; `component(bp, { layer })` satisfies the residue `Exclude<R, RootR>`.
+- [x] `createRuntime` takes **one** parameter. `RuntimeOptions` and its unwired `onEvent` are removed; observation is a service installed through the root layer instead. Spec'd in `devtools.specs.md`.
+- [x] The store reports transitions, commands issued, outputs emitted and defects to a synchronously-resolved `Devtools` sink, and allocates nothing at those sites when no sink is installed. Emission points are listed in `devtools.specs.md`.
 
 ### Type-level (TSTyche)
 
@@ -269,14 +272,19 @@ function` and no implementation, deliberately: they are illustrations of the
   fix is the `Cmd`/`Sub` split — see Deferred decisions. Its test asserts today's
   behaviour on purpose; whoever fixes it inverts that test rather than deleting
   it.
-- **`RuntimeOptions.onEvent` is declared and unwired.** The
-  `cause: { _tag: "Output" }` variant needs a parent↔child channel that does not
-  exist, and attributing whatever the parent dispatches next to the child's
-  output invents causality it cannot verify. See open work #3.
+- **An action a parent takes in response to a child's output is not attributable
+  to that output.** An output leaves through a plain React callback into
+  arbitrary user code, so the runtime cannot know what the parent did next. The
+  devtools event stream therefore carries an `Output` event and a `Dispatch`
+  cause on whatever the parent dispatched, and never claims an edge between
+  them — a devtools UI can draw that edge, the runtime cannot assert it. This is
+  the residue of the old `cause: { _tag: "Output" }` variant, which was deleted
+  rather than left as an unfillable optional field. See `devtools.specs.md`.
 
 ## Open work
 
-Five items, each needing a decision before it needs code. Items 4 and 5 were
+Five items. Item 3 now has its decision and its own spec; the other four each
+still need a decision before they need code. Items 4 and 5 were
 found by the review of the command-leaf pass and **rejected for that pass**: both
 are byte-identical at the commit before it, so neither is a regression the leaf
 change introduced, and both need a decision about intended behaviour rather than
@@ -316,15 +324,24 @@ current de-facto answer.
 Must not break: teardown termination, and the teardown bound staying a
 whole-teardown bound rather than a per-hop one.
 
-### 3. `RuntimeOptions.onEvent` is accepted and ignored
+### 3. `RuntimeOptions.onEvent` is accepted and ignored — **closed**
 
-`createRuntime` never emits a `DevtoolsEvent`, but `src/examples/app.tsx` and
-`cart.tsx` present it as working, so a reader copying the example installs an
-observer that never fires and gets no signal.
+`createRuntime` never emitted a `DevtoolsEvent`, but `src/examples/app.tsx` and
+`cart.tsx` presented it as working, so a reader copying the example installed an
+observer that never fired and got no signal.
 
-Cheapest first: say so in the JSDoc callers read and stop the examples
-advertising it; or drop it from the signature until the stream exists; or wire
-it, which is a feature.
+Closed by the third option — wire it, as a feature. `RuntimeOptions` and the
+second parameter are **removed outright**; observation is a `Context.Reference`
+sink installed through the root layer, resolved synchronously because the fold
+is synchronous. `src/lib/devtools.ts`, spec'd in `src/lib/devtools.specs.md`.
+The number is kept rather than the item deleted, so the cross-references to
+items #2, #4 and #5 elsewhere in this file keep meaning what they say.
+
+Two things it did **not** close, both recorded under Known limitations in
+`devtools.specs.md` rather than here: nothing is reported before `start()`
+(the root context does not exist until the first `runFork`), and a mount whose
+fiber _died_ emits no `Unmounted` — which is item #1's to fix, since the same
+`release()` is why the store cannot re-arm from `component` either.
 
 ### 4. `Blueprint.run` discards a dying command
 

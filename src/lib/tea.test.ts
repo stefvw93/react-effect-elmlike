@@ -21,6 +21,13 @@ import {
   Stream,
 } from "effect";
 import { describe, expect, it } from "vite-plus/test";
+import {
+  createRecorder,
+  devtoolsLayer,
+  type DevtoolsEvent,
+  type DevtoolsRecorder,
+  type DevtoolsSink,
+} from "./devtools";
 import { Action, Command, createFeatureStore, define, Next } from "./tea";
 
 // ---------------------------------------------------------------------------
@@ -2930,5 +2937,770 @@ describe("Blueprint.run — the effect leaf", () => {
 
     // Subject: identical but for the effect, and it never settles.
     expect(await runWith(Command.effect(() => Effect.never))).toEqual(Option.none());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Devtools emission
+//
+// What the store reports, and when. The module's own surface — the summaries,
+// the reference, the recorder, the console logger — is covered in
+// `devtools.test.ts`; this block is only about emission points, which live
+// here because the store does.
+// ---------------------------------------------------------------------------
+
+describe("createFeatureStore — devtools", () => {
+  const equivalence = {
+    props: Schema.toEquivalence(Schema.Struct({ id: Schema.String })),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as any;
+
+  const Placed = Action.output("Placed", { at: Schema.Number });
+
+  const setup = (
+    options: {
+      readonly reducer: Record<string, any>;
+      readonly sink?: DevtoolsSink;
+      readonly outputs?: boolean;
+      readonly name?: string;
+      readonly emit?: (output: { readonly _tag: string }) => void;
+    } & Record<string, unknown>,
+  ) => {
+    const recorder = createRecorder();
+    const sink = options.sink ?? recorder.sink;
+    const defects: Array<unknown> = [];
+    const emitted: Array<{ readonly _tag: string }> = [];
+
+    const blueprint = define({
+      props: Schema.Struct({ id: Schema.String }),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Bump", {}), Action("Land", {})]),
+      ...(options.outputs ? { output: Action.of([Placed]) } : {}),
+    } as any).create({
+      initialState: () => ({ count: 0 }),
+      reducer: options.reducer as any,
+      render: () => null,
+    } as any);
+
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: { id: "a" },
+      equivalence,
+      runtime: ManagedRuntime.make(devtoolsLayer(sink)) as unknown as ManagedRuntime.ManagedRuntime<
+        any,
+        any
+      >,
+      layer: undefined,
+      emit: options.emit ?? ((output: { readonly _tag: string }) => void emitted.push(output)),
+      defect: (error: unknown) => void defects.push(error),
+      ...(options.name === undefined ? {} : { name: options.name }),
+    } as any);
+
+    return { store, recorder, defects, emitted };
+  };
+
+  const settle = () => Effect.runPromise(Effect.sleep("20 millis"));
+
+  const only = <T extends DevtoolsEvent["_tag"]>(
+    recorder: DevtoolsRecorder,
+    tag: T,
+  ): ReadonlyArray<Extract<DevtoolsEvent, { readonly _tag: T }>> =>
+    recorder.events.filter(
+      (event): event is Extract<DevtoolsEvent, { readonly _tag: T }> => event._tag === tag,
+    );
+
+  it("emits the `Mounted` transition from `start`", () => {
+    // Locks in the probed ordering: `start` calls `runFork`, which populates
+    // `cachedContext` synchronously for a sync root layer, *before* it folds
+    // `Mounted`. If an Effect beta ever deferred that, `Mounted` would silently
+    // vanish from every log and nothing else would notice.
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => s.state,
+        Land: (_a: unknown, s: any) => s.state,
+        Mounted: (_a: unknown, s: any) => s.state,
+      },
+      name: "cart",
+    });
+
+    store.start();
+
+    const transitions = only(recorder, "Transition");
+    expect(transitions).toHaveLength(1);
+    expect(transitions[0]!.action._tag).toBe("Mounted");
+    expect(transitions[0]!.cause).toEqual({ _tag: "Lifecycle" });
+    expect(transitions[0]!.name).toBe("cart");
+  });
+
+  it("emits a dispatch transition carrying the real state references", () => {
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+        Land: (_a: unknown, s: any) => s.state,
+      },
+      name: "cart",
+    });
+
+    store.start();
+    recorder.clear();
+    const before = store.getSnapshot();
+    store.dispatch({ _tag: "Bump" } as never);
+
+    const [event] = only(recorder, "Transition");
+    expect(event!.action).toEqual({ _tag: "Bump" });
+    expect(event!.cause).toEqual({ _tag: "Dispatch" });
+    expect(event!.name).toBe("cart");
+    expect(event!.instance).toEqual(expect.any(String));
+    // The actual objects, not copies. A sink that wants to keep them copies
+    // them itself; the store does not pay for a snapshot nobody may read.
+    expect(event!.previous).toBe(before);
+    expect(event!.next).toBe(store.getSnapshot());
+  });
+
+  it("falls back to `TeaFeature` when the caller named nothing", () => {
+    const { store, recorder } = setup({
+      reducer: { Bump: (_a: unknown, s: any) => s.state, Land: (_a: unknown, s: any) => s.state },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+
+    expect(recorder.events[0]!.name).toBe("TeaFeature");
+  });
+
+  it("emits a `PropsChanged` transition with a lifecycle cause", () => {
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => s.state,
+        Land: (_a: unknown, s: any) => s.state,
+        // A handler that looks at the change and decides to do nothing — the
+        // real noise floor the default console predicate exists to filter.
+        PropsChanged: (_a: unknown, s: any) => s.state,
+      },
+    });
+
+    store.start();
+    store.sync({ id: "a" }, {} as never);
+    recorder.clear();
+    store.sync({ id: "b" }, {} as never);
+
+    const [event] = only(recorder, "Transition");
+    expect(event!.action._tag).toBe("PropsChanged");
+    expect(event!.cause).toEqual({ _tag: "Lifecycle" });
+    expect(event!.previous).toBe(event!.next);
+  });
+
+  it("reports nothing before `start`, which is the documented blind window", () => {
+    // The root context does not exist until the first `runFork`, and `start`
+    // is what does that. So a `sync` in the first render body, and a
+    // descendant's layout-effect dispatch, are both invisible. Asserted rather
+    // than left implicit, because the alternative — warming the context inside
+    // `createRuntime` — moves when the root layer builds, which is observable
+    // through any layer's acquire and is not a debugging tool's call to make.
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+        Land: (_a: unknown, s: any) => s.state,
+      },
+    });
+
+    store.dispatch({ _tag: "Bump" } as never);
+    expect(recorder.events).toHaveLength(0);
+
+    // And it recovers: the window closes at `start`, it does not latch.
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    expect(recorder.events.length).toBeGreaterThan(0);
+  });
+
+  it("emits one `Command` event per issued command, summarized and addressed", async () => {
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [
+          s.state,
+          Command.batch(
+            Command.cancel("Bump"),
+            Command.keyed(
+              "k",
+              Command.effect(() => Effect.void),
+            ),
+          ),
+        ],
+        Land: (_a: unknown, s: any) => s.state,
+      },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    const commands = only(recorder, "Command");
+    expect(commands).toHaveLength(1);
+    expect(commands[0]!.group).toEqual({ tag: "Bump" });
+    expect(commands[0]!.dropped).toBe(false);
+    expect(commands[0]!.command).toEqual({
+      _tag: "Batch",
+      commands: [
+        { _tag: "Cancel", target: { tag: "Bump" } },
+        { _tag: "Keyed", key: "k", command: { _tag: "Effect" } },
+      ],
+    });
+  });
+
+  it("reports a command nobody was there to run as dropped", async () => {
+    // After the mount is gone, no fiber will ever take this work. The feature
+    // is told nothing — deliberately, because reporting the drop through the
+    // defect sink replaced a recovery UI with a boundary crash — but a log
+    // that showed the command as issued would be lying.
+    //
+    // Not the pre-`start` case: work dispatched then is *buffered* and `start`
+    // flushes it, so it is delayed rather than discarded, and `dropped` says
+    // so.
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [s.state, Command.effect(() => Effect.void)],
+        Land: (_a: unknown, s: any) => s.state,
+      },
+    });
+
+    store.start();
+    store.stop();
+    await settle();
+    recorder.clear();
+    store.dispatch({ _tag: "Bump" } as never);
+
+    const commands = only(recorder, "Command");
+    expect(commands).toHaveLength(1);
+    expect(commands[0]!.dropped).toBe(true);
+  });
+
+  it("attributes a command-emitted action to the command, key included", async () => {
+    // The key is the load-bearing half: it can only be present if `Keyed`
+    // refined the ctx on the way down and the leaf's own `dispatchFor` closed
+    // over the refined one. A single shared dispatch closure cannot produce it.
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [
+          s.state,
+          Command.keyed(
+            "k",
+            Command.effect((dispatch: any) => dispatch({ _tag: "Land" })),
+          ),
+        ],
+        Land: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+      },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    const landed = only(recorder, "Transition").find((event) => event.action._tag === "Land");
+    expect(landed!.cause).toEqual({ _tag: "Command", action: "Bump", key: "k" });
+  });
+
+  it("omits the key when the command was not keyed", async () => {
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [
+          s.state,
+          Command.effect((dispatch: any) => dispatch({ _tag: "Land" })),
+        ],
+        Land: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+      },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    const landed = only(recorder, "Transition").find((event) => event.action._tag === "Land");
+    expect(landed!.cause).toEqual({ _tag: "Command", action: "Bump" });
+  });
+
+  it("emits an `Output` event before the handler runs, with the tag intact", async () => {
+    const order: Array<string> = [];
+    const recorder = createRecorder();
+    const sink: DevtoolsSink = {
+      onEvent: (event) => {
+        recorder.sink.onEvent(event);
+        if (event._tag === "Output") order.push("event");
+      },
+    };
+
+    const { store } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [s.state, Command.output(Placed, { at: 1 })],
+        Land: (_a: unknown, s: any) => s.state,
+      },
+      outputs: true,
+      sink,
+      emit: () => void order.push("handler"),
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    const outputs = only(recorder, "Output");
+    expect(outputs).toHaveLength(1);
+    // The whole message, unlike the `on<Tag>` prop, which has `_tag` stripped
+    // because the prop's name already carries it. A log has no such context.
+    expect(outputs[0]!.output).toEqual({ _tag: "Placed", at: 1 });
+    expect(order).toEqual(["event", "handler"]);
+  });
+
+  it("emits exactly one `Defect` for a dying command, then the `Error` transition", async () => {
+    // The double-emission guard. `onExit` routes through `raiseDefect`, which
+    // is the single emission site; adding one to `onExit` as well would double
+    // every dying command. And the `Error` transition that follows is *not* a
+    // duplicate — a defect occurred, and then the feature's recovery ran.
+    const { store, recorder, defects } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [
+          s.state,
+          Command.effect(() => Effect.die(new Error("kaboom"))),
+        ],
+        Land: (_a: unknown, s: any) => s.state,
+        Error: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+      },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    const raised = only(recorder, "Defect");
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.from).toBe("Bump");
+    expect(raised[0]!.handled).toBe(true);
+    expect(raised[0]!.defect.message).toContain("kaboom");
+
+    const errorFold = only(recorder, "Transition").find((event) => event.action._tag === "Error");
+    expect(errorFold!.cause).toEqual({ _tag: "Defect", from: "Bump" });
+    expect(defects).toEqual([]);
+  });
+
+  it("marks a defect unhandled when no `Error` handler exists, and still reports it", async () => {
+    const { store, recorder, defects } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [
+          s.state,
+          Command.effect(() => Effect.die(new Error("kaboom"))),
+        ],
+        Land: (_a: unknown, s: any) => s.state,
+      },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    const raised = only(recorder, "Defect");
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.handled).toBe(false);
+    // The devtools event does not replace the store's own contract.
+    expect(defects).toHaveLength(1);
+  });
+
+  it("emits an unhandled `Defect` for a throwing output handler, bypassing `Error`", async () => {
+    // `emitOutput` calls the defect sink directly and never `raiseDefect`, so
+    // it needs its own emission. The parent's bug must not become the
+    // feature's error state, which is the reason that path exists at all.
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [s.state, Command.output(Placed, { at: 1 })],
+        Land: (_a: unknown, s: any) => s.state,
+        Error: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+      },
+      outputs: true,
+      emit: () => {
+        throw new Error("parent blew up");
+      },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    const raised = only(recorder, "Defect");
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.handled).toBe(false);
+    expect(raised[0]!.defect.message).toContain("parent blew up");
+    expect(only(recorder, "Transition").some((event) => event.action._tag === "Error")).toBe(false);
+  });
+
+  it("keeps a hostile output-handler error out of the feature's `Error` handler", async () => {
+    // The chain this guards, which is three steps and only visible end to end:
+    // `emitOutput`'s catch summarizes the error before calling `defect`. If
+    // summarizing threw, `defect` never ran, the original error escaped
+    // `emitOutput` into `fold`'s catch, and `raiseDefect` routed it into the
+    // *feature's* `Error` handler — which is precisely what `emitOutput`
+    // exists to prevent, since a missing or throwing `on<Tag>` prop is the
+    // parent's bug and belongs at the boundary.
+    class Hostile extends Error {
+      override get message(): string {
+        throw new TypeError("getter blew up");
+      }
+    }
+
+    const { store, recorder, defects } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [s.state, Command.output(Placed, { at: 1 })],
+        Land: (_a: unknown, s: any) => s.state,
+        Error: () => ({ count: -1 }),
+      },
+      outputs: true,
+      emit: () => {
+        throw new Hostile();
+      },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    // Straight to the boundary, exactly as a bad prop would go.
+    expect(defects).toHaveLength(1);
+    // And not into the feature's recovery state.
+    expect(store.getSnapshot()).toEqual({ count: 0 });
+    expect(only(recorder, "Transition").some((event) => event.action._tag === "Error")).toBe(false);
+    expect(only(recorder, "Defect")).toHaveLength(1);
+  });
+
+  it("keeps a hostile command defect on the documented error path", async () => {
+    // Same failure one funnel over: `raiseDefect` summarizes before it routes,
+    // so a throwing summarizer skipped both `defect()` and the `Error` fold
+    // and surfaced as a raw throw out of the interpreter's exit hook.
+    class Hostile extends Error {
+      override get message(): string {
+        throw new TypeError("getter blew up");
+      }
+    }
+
+    const { store, recorder, defects } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [s.state, Command.effect(() => Effect.die(new Hostile()))],
+        Land: (_a: unknown, s: any) => s.state,
+        Error: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+      },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    expect(store.getSnapshot()).toEqual({ count: 1 });
+    expect(defects).toEqual([]);
+    expect(only(recorder, "Defect")).toHaveLength(1);
+  });
+
+  it("emits `Unmounted` even when the teardown reducer throws", async () => {
+    // The criterion is unconditional, and the silence was worse than a missing
+    // line: the console logger's elapsed map evicts on this event, so a
+    // feature whose `Unmounted` handler throws left an entry behind. `reduce`
+    // discards `Unmounted`'s state anyway, so there is no next state to be
+    // wrong about — the transition says the feature went away, and the
+    // adjacent `Defect` says the handler threw.
+    const { store, recorder, defects } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => s.state,
+        Land: (_a: unknown, s: any) => s.state,
+        Unmounted: () => {
+          throw new Error("teardown blew up");
+        },
+      },
+    });
+
+    store.start();
+    recorder.clear();
+    store.stop();
+    await settle();
+
+    const unmounted = only(recorder, "Transition").filter(
+      (event) => event.action._tag === "Unmounted",
+    );
+    expect(unmounted).toHaveLength(1);
+    expect(unmounted[0]!.cause).toEqual({ _tag: "Lifecycle" });
+    expect(defects).toHaveLength(1);
+  });
+
+  it("survives a throwing sink: state still moves and the sink is disabled", async () => {
+    // Without the guard, a throw inside `foldOne` is caught by `fold` and
+    // routed into the *feature's* `Error` handler — a devtools bug becoming a
+    // feature error state, which is the exact mistake `emitOutput` exists to
+    // avoid.
+    let calls = 0;
+    const { store, defects } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+        Land: (_a: unknown, s: any) => s.state,
+        Error: () => ({ count: -1 }),
+      },
+      sink: {
+        onEvent: () => {
+          calls += 1;
+          throw new Error("sink is broken");
+        },
+      },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    expect(store.getSnapshot()).toEqual({ count: 2 });
+    expect(defects).toEqual([]);
+    expect(calls).toBe(1);
+  });
+
+  it("stays disabled within the fold that broke it, not merely after it", async () => {
+    // A single fold reports twice — the transition, then the command it
+    // issued. A guard that captured the sink once per fold would call a
+    // broken sink a second time before noticing, so "disabled" has to mean
+    // disabled at the next report and not at the next fold.
+    // `Mounted` is the fold that carries a command here, deliberately: it is
+    // the *first* one, so the throw has to be caught within it. Put the
+    // command on a later action and the earlier `Mounted` transition would
+    // have disabled the sink already, and the test would pass either way.
+    let calls = 0;
+    const { store, defects } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => s.state,
+        Land: (_a: unknown, s: any) => s.state,
+        Mounted: (_a: unknown, s: any) => [s.state, Command.effect(() => Effect.void)],
+      },
+      sink: {
+        onEvent: () => {
+          calls += 1;
+          throw new Error("sink is broken");
+        },
+      },
+    });
+
+    store.start();
+    await settle();
+
+    expect(calls).toBe(1);
+    expect(defects).toEqual([]);
+  });
+
+  it("keeps `instance` stable across a remount and distinct between mounts", () => {
+    const first = setup({
+      reducer: { Bump: (_a: unknown, s: any) => s.state, Land: (_a: unknown, s: any) => s.state },
+      name: "cart",
+    });
+
+    first.store.start();
+    first.store.stop();
+    first.store.start();
+    const instances = new Set(first.recorder.events.map((event) => event.instance));
+    expect(instances.size).toBe(1);
+
+    const second = setup({
+      reducer: { Bump: (_a: unknown, s: any) => s.state, Land: (_a: unknown, s: any) => s.state },
+      name: "cart",
+    });
+    second.store.start();
+
+    expect(second.recorder.events[0]!.instance).not.toBe(first.recorder.events[0]!.instance);
+  });
+
+  it("emits the `Unmounted` transition and the teardown command", () => {
+    // `stop` bypasses `fold` entirely and calls `blueprint.reduce` directly, so
+    // this needs its own emission site or teardown never appears in the log.
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => s.state,
+        Land: (_a: unknown, s: any) => s.state,
+        Unmounted: (_a: unknown, s: any) => [s.state, Command.effect(() => Effect.void)],
+      },
+    });
+
+    store.start();
+    recorder.clear();
+    store.stop();
+
+    const [transition] = only(recorder, "Transition");
+    expect(transition!.action._tag).toBe("Unmounted");
+    expect(transition!.cause).toEqual({ _tag: "Lifecycle" });
+
+    const commands = only(recorder, "Command");
+    expect(commands).toHaveLength(1);
+    expect(commands[0]!.group).toEqual({ tag: "Unmounted" });
+  });
+
+  it("every emitted event survives `JSON.stringify`", async () => {
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [
+          s.state,
+          Command.batch(
+            Command.output(Placed, { at: 1 }),
+            Command.keyed(
+              "k",
+              Command.effect(() => Effect.die(new Error("kaboom"))),
+            ),
+          ),
+        ],
+        Land: (_a: unknown, s: any) => s.state,
+        Mounted: (_a: unknown, s: any) => s.state,
+        Error: (_a: unknown, s: any) => s.state,
+      },
+      outputs: true,
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    expect(recorder.events.length).toBeGreaterThan(3);
+    for (const event of recorder.events) {
+      expect(JSON.parse(JSON.stringify(event))).toEqual(event);
+    }
+  });
+
+  it("reports `HookChanged` as its tag alone, whatever the hooks hold", async () => {
+    // Hooks are `Record<string, unknown>` by design — a `useQuery` result with
+    // a `refetch` function on it, a `Date`, a DOM node. The action the runtime
+    // builds carries the previous record, so reporting it whole would put a
+    // function in the event. That is worse than lossy: `structuredClone`
+    // throws on a function, `report` would catch it and disable the sink, and
+    // the log would go dark for the rest of the page.
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => s.state,
+        Land: (_a: unknown, s: any) => s.state,
+        HookChanged: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+      },
+    });
+
+    store.start();
+    store.sync({ id: "a" }, { refetch: () => {} } as never);
+    recorder.clear();
+    store.sync({ id: "a" }, { refetch: () => {} } as never);
+
+    const changed = only(recorder, "Transition").find(
+      (event) => event.action._tag === "HookChanged",
+    );
+    expect(changed!.action).toEqual({ _tag: "HookChanged" });
+    expect(Object.keys(changed!.action)).toEqual(["_tag"]);
+    expect(JSON.parse(JSON.stringify(changed))).toEqual(changed);
+    expect(() => structuredClone(changed)).not.toThrow();
+  });
+
+  it("keeps `PropsChanged`'s previous props, which are a schema value", async () => {
+    // The other side of the same decision. Props are a schema struct and
+    // `NoTransform` guarantees `Encoded` equals `Type`, so `previous` encodes
+    // and is worth keeping — trimming both would have thrown away the useful
+    // one to fix the unusable one.
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => s.state,
+        Land: (_a: unknown, s: any) => s.state,
+        PropsChanged: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+      },
+    });
+
+    store.start();
+    store.sync({ id: "a" }, {} as never);
+    recorder.clear();
+    store.sync({ id: "b" }, {} as never);
+
+    const changed = only(recorder, "Transition").find(
+      (event) => event.action._tag === "PropsChanged",
+    );
+    expect(changed!.action).toEqual({ _tag: "PropsChanged", previous: { id: "a" } });
+    expect(JSON.parse(JSON.stringify(changed))).toEqual(changed);
+  });
+
+  it("reports the runtime's own `Error` action as its tag alone", async () => {
+    // The one action in the system the runtime builds rather than the user:
+    // `raiseDefect` attaches the live `error` and a `Cause`, and neither
+    // survives `JSON.stringify`. Reporting the tag alone is what keeps the
+    // round-trip above true, and nothing is lost — the `Defect` event just
+    // before it carries the same failure as an encodable summary.
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [
+          s.state,
+          Command.effect(() => Effect.die(new Error("kaboom"))),
+        ],
+        Land: (_a: unknown, s: any) => s.state,
+        Error: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+      },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    const errorFold = only(recorder, "Transition").find((event) => event.action._tag === "Error");
+    expect(errorFold!.action).toEqual({ _tag: "Error" });
+    expect(Object.keys(errorFold!.action)).toEqual(["_tag"]);
+  });
+
+  it("behaves identically with no devtools layer installed", async () => {
+    const defects: Array<unknown> = [];
+    const blueprint = define({
+      props: Schema.Struct({ id: Schema.String }),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Bump", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Bump: (_a: unknown, s: any) => [
+          { count: s.state.count + 1 },
+          Command.effect(() => Effect.void),
+        ],
+        Mounted: (_a: unknown, s: any) => s.state,
+      } as any,
+      render: () => null,
+    } as any);
+
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: { id: "a" },
+      equivalence,
+      runtime: testRuntime(),
+      layer: undefined,
+      emit: () => {},
+      defect: (error) => void defects.push(error),
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+    store.stop();
+
+    expect(store.getSnapshot()).toEqual({ count: 1 });
+    expect(defects).toEqual([]);
+  });
+
+  it("resolves the sink once and reuses it", async () => {
+    // The resolution is cached behind a boolean, so the reference is read at
+    // most once per store rather than on every fold — the hot-path claim.
+    let reads = 0;
+    const recorder = createRecorder();
+    const counting: DevtoolsSink = {
+      get onEvent() {
+        reads += 1;
+        return recorder.sink.onEvent;
+      },
+    };
+
+    const { store } = setup({
+      reducer: { Bump: (_a: unknown, s: any) => s.state, Land: (_a: unknown, s: any) => s.state },
+      sink: counting,
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    expect(recorder.events.length).toBeGreaterThan(1);
+    expect(reads).toBe(recorder.events.length);
   });
 });
