@@ -7,6 +7,13 @@ export default defineConfig({
     "*": "vp check --fix",
   },
   fmt: {},
+  // Browser tests are the other half of the suite and run under
+  // `vitest.browser.config.ts`. They need a real DOM and a Chromium binary, so
+  // leaving them in the default run would make the fast inner loop depend on
+  // both. Excluded here, included there — the two globs are complements.
+  test: {
+    exclude: ["**/node_modules/**", "**/dist/**", "**/*.browser.test.{ts,tsx}"],
+  },
   lint: {
     plugins: ["react", "typescript", "oxc"],
     rules: {

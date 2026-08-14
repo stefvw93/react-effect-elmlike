@@ -1,17 +1,41 @@
-import type { FC, ReactNode } from "react";
 import {
+  createContext,
+  createElement,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type FC,
+  type ReactNode,
+} from "react";
+import {
+  Cause,
+  Context,
   Effect,
+  Equivalence,
+  Exit,
   Fiber,
   identity,
+  Layer,
+  ManagedRuntime,
+  Option,
   Pipeable,
   Queue,
   Ref,
   Schema,
-  Stream,
-  type Cause,
-  type Layer,
-  type ManagedRuntime,
+  SchemaParser,
 } from "effect";
+import {
+  Devtools,
+  noopDevtools,
+  summarizeCommand,
+  summarizeDefect,
+  type DevtoolsCause,
+  type DevtoolsEvent,
+  type DevtoolsSink,
+} from "./devtools";
 
 // ---------------------------------------------------------------------------
 // Display
@@ -50,6 +74,49 @@ export type LifecycleTag = "Mounted" | "PropsChanged" | "Error" | "Unmounted" | 
 export type NotLifecycleTag<Tag extends string> = Tag extends LifecycleTag ? never : unknown;
 
 /**
+ * The runtime counterpart of `LifecycleTag`, kept exhaustive by the compiler:
+ * a `Record` literal missing (or misspelling) a key fails to satisfy the
+ * `Record<LifecycleTag, true>` annotation.
+ *
+ * What this exists to prevent: `reduce`/`step` treat a missing handler as a
+ * no-op only for *lifecycle* actions — every `LifecycleHandlers` entry is
+ * optional by design. A missing handler for a *declared* action is a
+ * different thing entirely — the `Reducer` type requires one for every tag in
+ * `A["cases"]`, so reaching this branch for one means the action arrived
+ * without going through the typed `dispatch`/`reduce` surface (a bad cast, a
+ * malformed devtools replay). That case still throws, on purpose.
+ */
+const LifecycleTags: Record<LifecycleTag, true> = {
+  Mounted: true,
+  PropsChanged: true,
+  Error: true,
+  Unmounted: true,
+  HookChanged: true,
+};
+
+/**
+ * `Object.hasOwn` rather than `in`, and the same for the reducer lookup at both
+ * call sites — because both objects inherit from `Object.prototype` and both
+ * lookups would otherwise resolve keys nobody declared.
+ *
+ * `"toString" in LifecycleTags` is `true`, so an action tagged `"toString"`
+ * would be treated as a lifecycle action and silently no-op. Worse,
+ * `reducer["constructor"]` resolves to `Object`, which is truthy, so it would
+ * be *called* as a handler and its return value used as the next state.
+ * Neither is a declared handler and neither is a `LifecycleTag`, so both have
+ * to reach the throw.
+ *
+ * Only reachable by bypassing the typed surface — a bad cast, a malformed
+ * devtools replay — which is exactly the case that branch exists to catch, and
+ * the case where failing loudly matters most.
+ */
+const isLifecycleTag = (tag: string): tag is LifecycleTag => Object.hasOwn(LifecycleTags, tag);
+
+/** Own properties only. See `isLifecycleTag` for why. */
+const handlerFor = <Handler>(handlers: Record<string, Handler>, tag: string): Handler | undefined =>
+  Object.hasOwn(handlers, tag) ? handlers[tag] : undefined;
+
+/**
  * A message is a tagged struct and nothing more, in both directions. The
  * difference between the two vocabularies is *where a message may go*, which is
  * a fact about the boundary and not about the payload — so they are one type
@@ -73,6 +140,10 @@ export type NotLifecycleTag<Tag extends string> = Tag extends LifecycleTag ? nev
  * because a bare `Schema.TaggedStruct` could bypass the constructor and land in
  * the list unchecked. There is now no unbranded way in, so the guard on the
  * string literal in `Vocabularies` is the only gate that has to exist.
+ *
+ * The brand is load-bearing a third way now: `Action.of` reads the channel off
+ * its members rather than being told, so the phantom is an *inference site* and
+ * not only a check. See `ChannelOf`.
  */
 const channel: unique symbol = Symbol("@tea/channel");
 
@@ -111,9 +182,48 @@ export type AnyMessage<Ch extends Channel> = Schema.Codec<any, any> & {
  * devtools transport.
  */
 export type Vocabulary<
-  Members extends ReadonlyArray<AnyMessage<Ch>>,
+  Members extends ReadonlyArray<AnyMessage<Channel>>,
   Ch extends Channel,
 > = Schema.toTaggedUnion<"_tag", Members> & { readonly [channel]: Ch };
+
+/**
+ * The channel a member list belongs to, read off the members' own brand.
+ *
+ * This is what lets `of` be written once for both channels instead of being
+ * instantiated per channel — the members already say where they go, so asking
+ * the caller to say it again is a second source of truth and a second place to
+ * get it wrong.
+ *
+ * Both guards test *assignability of the whole tuple*, which is elementwise, so
+ * a mixed list satisfies neither and lands on `never`. The empty list satisfies
+ * both, which is the one genuinely ambiguous case: it also resolves to `never`,
+ * so `Action.of([])` fails at `define` rather than picking a channel by coin
+ * toss. Nobody writes it — `output` defaults to `NoOutputs` — and the failure is
+ * loud if they do.
+ */
+export type ChannelOf<Members extends ReadonlyArray<AnyMessage<Channel>>> =
+  Members extends ReadonlyArray<AnyMessage<"internal">>
+    ? Members extends ReadonlyArray<AnyMessage<"outbound">>
+      ? never
+      : "internal"
+    : "outbound";
+
+/**
+ * Rejects a member list that straddles both channels, at the `of` call rather
+ * than wherever the resulting vocabulary is used.
+ *
+ * Without it a mixed list still fails — `ChannelOf` gives `"outbound"`, and the
+ * internal members make the vocabulary wrong in a way `define` eventually
+ * notices — but it fails one hop away from the mistake, naming the vocabulary
+ * instead of the member that does not belong. Intersected onto the parameter
+ * like every other guard here, so bare `Members` stays the inference site.
+ */
+export type SameChannel<Members extends ReadonlyArray<AnyMessage<Channel>>> =
+  Members extends ReadonlyArray<AnyMessage<"internal">>
+    ? unknown
+    : Members extends ReadonlyArray<AnyMessage<"outbound">>
+      ? unknown
+      : never;
 
 /**
  * The constraint everything downstream is written against, and it is structural
@@ -137,19 +247,38 @@ export type TagsOf<V extends AnyVocabulary<Channel>> = keyof V["cases"] & string
 export type MemberOf<V extends AnyVocabulary<Channel>> = V["Type"];
 
 /**
- * One primitive, two channels — written once and instantiated twice, so the
- * claim that an output is *an action with an external destination* is a line of
- * code rather than a comment.
+ * The thin wrapper on `Schema.TaggedStruct` that everything else in this file is
+ * built from. Its only addition is the reserved-tag guard, which lands on the
+ * string literal where the error reads best.
+ */
+export interface MessageConstructor<Ch extends Channel> {
+  <const Tag extends Capitalize<string>, const Fields extends Schema.Struct.Fields>(
+    tag: Tag & NotLifecycleTag<Tag>,
+    fields: Fields,
+  ): Message<Tag, Fields, Ch>;
+}
+
+/**
+ * One primitive, two channels, **one namespace** — so the claim that an output
+ * is *an action with an external destination* is the shape of the API rather
+ * than a comment attached to two sibling constants.
  *
- * The call signature is the thin wrapper on `Schema.TaggedStruct` that
- * everything else in this file is built from; its only addition is the
- * reserved-tag guard, which lands on the string literal where the error reads
- * best. `of` is `Schema.Union(members).pipe(Schema.toTaggedUnion("_tag"))`,
- * which takes messages and vocabularies interchangeably and flattens the nested
- * ones:
+ * `Action` and `Output` as peers said the opposite: two names, equal weight,
+ * and nothing in the surface admitting they were the same constructor called
+ * twice. Nesting the rarer one states the relationship and prices it correctly —
+ * internal is unqualified because it is almost everything, outbound pays one
+ * segment.
+ *
+ * `of` is channel-*polymorphic*, not duplicated per channel: the members carry
+ * the brand, so `ChannelOf` reads it back and `SameChannel` rejects a mixed
+ * list. That is the whole reason there is no `Action.output.of` — it would be
+ * asking for a fact the argument already contains. It is
+ * `Schema.Union(members).pipe(Schema.toTaggedUnion("_tag"))`, which takes
+ * messages and vocabularies interchangeably and flattens the nested ones:
  *
  *     const Async = Action.of([Started, Failed])            // shared, its own module
  *     const CartActions = Action.of([Async, CheckoutRequested, CheckoutCompleted])
+ *     const CartOutputs = Action.of([Action.output("OrderPlaced", { orderId: Schema.String })])
  *
  * The reducer for `CartActions` then requires all four keys. A record-of-fields
  * constructor was tried first and dropped here: it reads well and composes only
@@ -162,41 +291,45 @@ export type MemberOf<V extends AnyVocabulary<Channel>> = V["Type"];
  * site — so the action union can never be recovered from `reducer`. It would
  * collapse to `{_tag: string}` and every handler parameter would become `never`.
  */
-export interface Vocabularies<Ch extends Channel> {
-  <const Tag extends Capitalize<string>, const Fields extends Schema.Struct.Fields>(
-    tag: Tag & NotLifecycleTag<Tag>,
-    fields: Fields,
-  ): Message<Tag, Fields, Ch>;
+export interface Vocabularies extends MessageConstructor<"internal"> {
+  /**
+   * Announced, never handled here. An output has no reducer handler — its tag is
+   * not in the reducer's key set — and it is not in `dispatch`'s union, so it
+   * cannot be sent by hand: the structural trick `LifecycleTag` uses for
+   * inbound-only lifecycle actions, run in the other direction.
+   *
+   * Delivered as one `on<Tag>` prop per output — see `OutputProps`.
+   */
+  readonly output: MessageConstructor<"outbound">;
 
-  readonly of: <const Members extends ReadonlyArray<AnyMessage<Ch>>>(
-    members: Members,
-  ) => Vocabulary<Members, Ch>;
+  readonly of: <const Members extends ReadonlyArray<AnyMessage<Channel>>>(
+    members: Members & SameChannel<Members>,
+  ) => Vocabulary<Members, ChannelOf<Members>>;
 }
 
-function defineVocabularies<Ch extends Channel>(ch: Ch): Vocabularies<Ch> {
-  return Object.assign(
-    function Action(tag: string, fields: Schema.Struct.Fields) {
-      return Object.assign(Schema.TaggedStruct(tag, fields), { [channel]: ch });
-    },
-    {
-      of: (members: ReadonlyArray<AnyMessage<Ch>>) =>
-        Object.assign(Schema.Union(members).pipe(Schema.toTaggedUnion("_tag")), { [channel]: ch }),
-    },
-  ) as Vocabularies<Ch>;
-}
-
-/** Handled here, never seen outside. */
-export const Action = defineVocabularies("internal");
+const messages = <Ch extends Channel>(ch: Ch) =>
+  function message(tag: string, fields: Schema.Struct.Fields) {
+    return Object.assign(Schema.TaggedStruct(tag, fields), { [channel]: ch });
+  };
 
 /**
- * Announced, never handled here. An output has no reducer handler — its tag is
- * not in the reducer's key set — and it is not in `dispatch`'s union, so it
- * cannot be sent by hand: the structural trick `LifecycleTag` uses for
- * inbound-only lifecycle actions, run in the other direction.
- *
- * Delivered as one `on<Tag>` prop per output — see `OutputProps`.
+ * Declared vocabularies. `Action(…)` is handled here and never seen outside;
+ * `Action.output(…)` is the reverse.
  */
-export const Output = defineVocabularies("outbound");
+export const Action: Vocabularies = Object.assign(messages("internal"), {
+  output: messages("outbound"),
+
+  /**
+   * The runtime brand comes off the first member rather than from an argument,
+   * which is the value-level half of what `ChannelOf` does in the type. Both
+   * halves are safe on the same premise — `SameChannel` has already rejected a
+   * list whose members disagree, so member zero speaks for all of them.
+   */
+  of: (members: ReadonlyArray<AnyMessage<Channel>>) =>
+    Object.assign(Schema.Union(members).pipe(Schema.toTaggedUnion("_tag")), {
+      [channel]: members[0]?.[channel],
+    }),
+}) as unknown as Vocabularies;
 
 /** The empty vocabulary, so a leaf feature declares nothing. `Type` is `never`. */
 export type NoOutputs = Vocabulary<readonly [], "outbound">;
@@ -432,69 +565,103 @@ export type ServicesOf<U> = {
 // ---------------------------------------------------------------------------
 
 /**
+ * Where a command's emissions go.
+ *
+ * Not `Dispatch`, which is the *React-facing* one handed to `render` and
+ * returns `void` because it is called from an event handler. This one is handed
+ * to a command's effect and returns an `Effect`, so it composes with the effect
+ * that calls it: `Effect.flatMap(load, dispatch)`, `Stream.runForEach(source,
+ * dispatch)`, `Effect.forEach(batch, dispatch)`. A `void` callback would force
+ * every call site into `Effect.sync` and make a long-lived source impossible to
+ * express without leaving Effect's vocabulary.
+ *
+ * Contravariant in `A`, which is what keeps `Command` covariant — see the
+ * variance note on `Command`.
+ */
+export type Dispatcher<A> = (action: A) => Effect.Effect<void>;
+
+/**
  * The async work a state change kicks off.
  *
- * An ADT rather than a bare `Stream`, because a command carries two things the
- * stream itself cannot: a concurrency policy, and the ability to *be* a
- * cancellation rather than to perform one. Composition still happens on the
- * `Stream` before it is wrapped, so nothing in Effect's vocabulary is lost —
- * `Stream.merge`, `Stream.catchTag`, `Stream.callback` are all used as before,
- * one `Command.stream(…)` from the end.
+ * The leaf is an `Effect` handed a `dispatch`, so **everything Effect can
+ * already express is left to Effect**: debounce, retry, timeout, racing,
+ * running two things at once, running at most one at a time. This library used
+ * to ship a `restart`/`ignore`/`queue`/`parallel` policy vocabulary as ADT
+ * nodes, which meant owning a fiber supervisor — a group map, a per-dispatch
+ * occurrence, one supersession rule per policy — to reimplement combinators
+ * Effect already had. Every defect that surface ever produced was in the
+ * supervisor, never in the ADT walking around it.
  *
- * `Pipeable`, so a policy reads as a modifier chained onto the command it
- * governs — see `Command.restart` / `.ignore` / `.queue`.
+ * What is left is the one thing a handler genuinely cannot do for itself:
+ * naming a running fiber so a *different* action's handler can interrupt it.
+ * That is `Keyed` plus `Cancel`.
+ *
+ * Variance: `A` appears only inside `Dispatch<A>`, which is contravariant in
+ * `A`, and `Dispatch<A>` sits in the leaf callback's parameter position, which
+ * is contravariant again. The two compose to covariant, so `Command<Narrow>`
+ * stays assignable to `Command<Wide>` and `Command.none: Command<never>` stays
+ * the bottom.
+ *
+ * `Pipeable`, so `keyed` reads as a modifier on the command it names.
  */
 export type Command<A, R = never> = Pipeable.Pipeable &
   /** Explicit no-op, for when a bare `state` return reads worse. */
   (
     | { readonly _tag: "None" }
 
-    /** Run for effects; emit nothing. */
-    | { readonly _tag: "Effect"; readonly effect: Effect.Effect<unknown, never, R> }
-
-    /** Emit actions and outputs over time. Cannot fail — conversion is userland. */
-    | { readonly _tag: "Stream"; readonly stream: Stream.Stream<A, never, R> }
+    /**
+     * The leaf. Runs for effects, and emits by calling `dispatch` — zero times,
+     * once, or forever. A command that emits nothing simply ignores the
+     * parameter, which is why there is no separate "effect that cannot emit"
+     * variant: it is this one with an unused argument.
+     */
+    | {
+        readonly _tag: "Effect";
+        readonly effect: (dispatch: Dispatcher<A>) => Effect.Effect<unknown, never, R>;
+      }
 
     /**
-     * Several commands at once, each keeping its own policy. `Stream.merge`
-     * covers this only while both halves want the same group.
+     * Names the fiber this command forks, so `Cancel` can address it. Nothing
+     * else: it does not interrupt, defer, or serialise anything. Nesting
+     * resolves outermost-first, matching the wrapper it replaced.
+     */
+    | { readonly _tag: "Keyed"; readonly key: string; readonly command: Command<A, R> }
+
+    /**
+     * Several commands, interpreted in order under one group.
+     *
+     * Composing two *effects* is `Effect.all` and does not belong here — it
+     * forks one fiber instead of two and brings its own `concurrency` and
+     * `mode` options. What `Effect.all` cannot do is sequence a `Cancel` ahead
+     * of the command replacing it, because the cancel has to run *before* the
+     * new fiber is registered and nothing running inside that fiber can do it.
+     * That is what this variant is for.
      */
     | { readonly _tag: "Batch"; readonly commands: ReadonlyArray<Command<A, R>> }
 
     /**
-     * Interrupt a running group. A command in its own right, so a handler can
-     * invalidate work another action started — the cross-tag case no policy can
-     * express.
+     * Interrupt running work by name. A command in its own right, so a handler
+     * can invalidate work *another* action started — the cross-tag case no
+     * combinator inside a single handler's effect can reach.
      */
     | { readonly _tag: "Cancel"; readonly target: Group }
-
-    /**
-     * Policy as a wrapper rather than a field, so it exists in exactly one place,
-     * the variants that fork nothing cannot carry a meaningless one, and nesting
-     * is answerable: the outermost wins.
-     */
-    | {
-        readonly _tag: "Guarded";
-        readonly policy: Policy;
-        /** Refines the group within the issuing action's tag. */
-        readonly key?: string;
-        readonly command: Command<A, R>;
-      }
   );
 
 /**
- * What a policy governs and what `Cancel` addresses. The tag is the issuing
- * action's and is filled by the runtime, never written by hand; `key` refines
- * within it, so `"restart"` on `QuantityChanged` can mean per-sku.
+ * What `Cancel` addresses.
  *
- * An omitted `key` on `Cancel` targets every group under the tag.
+ * The tag is the issuing action's and is filled by the runtime, never written by
+ * hand; `key` refines within it, so cancelling `QuantityChanged` can mean
+ * per-sku. An omitted `key` targets every keyed and unkeyed group under the tag.
+ *
+ * An address and nothing more. Nothing in the runtime decides on a feature's
+ * behalf whether new work supersedes what it finds already running — that is a
+ * `Cancel` the handler writes, where the reader can see it.
  */
 export interface Group {
   readonly tag: string;
   readonly key?: string;
 }
-
-export type Policy = "restart" | "ignore" | "queue" | "parallel";
 
 const pipeable = <T extends object>(value: T): T & Pipeable.Pipeable =>
   Object.assign(value, {
@@ -503,16 +670,85 @@ const pipeable = <T extends object>(value: T): T & Pipeable.Pipeable =>
     },
   });
 
+/**
+ * Discharges only the `R` channel of an effect, keeping its success type
+ * exactly as inferred. Used once, by `run` — see the call site for why `R`
+ * specifically cannot be verified in that scope.
+ */
+const discharge = <T>(effect: Effect.Effect<T, never, any>): Effect.Effect<T, never, never> =>
+  effect as Effect.Effect<T, never, never>;
+
+/**
+ * The constructors, and the whole vocabulary a reducer has for describing work.
+ *
+ * Five of them, and the count is the design: one leaf (`effect`), one no-op
+ * (`none`), one name (`keyed`), one sequencer (`batch`), one interrupt
+ * (`cancel`). `output` is the leaf again with its message filled in, kept as a
+ * constructor only because the channel brand is still checked at its call site
+ * — see the deferred decision in `tea.specs.md`.
+ *
+ * What is deliberately absent is a concurrency vocabulary. Debounce, throttle,
+ * switch-to-latest and run-at-most-N are Effect combinators the handler writes
+ * inside its own effect, because Effect already has them and a second set
+ * written as data can only be a worse copy of it.
+ */
 export const Command: {
   readonly none: Command<never>;
 
-  readonly effect: <R>(effect: Effect.Effect<unknown, never, R>) => Command<never, R>;
+  /**
+   * The only leaf. `dispatch` is how the command emits; a command that emits
+   * nothing ignores it, which is why there is no second constructor for that
+   * case.
+   *
+   * Concurrency lives in the effect you pass, not around it: `Effect.all` for
+   * two things at once, `Effect.race` for first-wins, a `Semaphore` for
+   * at-most-N, `Effect.sleep` ahead of the work for a debounce that a `Cancel`
+   * can still interrupt mid-delay.
+   */
+  readonly effect: <A = never, R = never>(
+    effect: (dispatch: Dispatcher<A>) => Effect.Effect<unknown, never, R>,
+  ) => Command<A, R>;
 
-  readonly stream: <A, R>(stream: Stream.Stream<A, never, R>) => Command<A, R>;
+  /**
+   * Names the fiber a command forks so `Cancel` can find it, and does nothing
+   * else.
+   *
+   * Naming is not reserving — two commands may hold the same key at once, and
+   * neither displaces the other. Replacing one is a `Cancel` in front of it.
+   *
+   * Two forms, and the choice is not stylistic. `Command.keyed(key, command)`
+   * puts the command in an argument position, where the contextual type that
+   * types a leaf's `dispatch` still reaches it. `cmd.pipe(Command.keyed(key))`
+   * is a `.pipe` receiver, which TypeScript checks *before* the contextual type
+   * of the `.pipe` call exists — so a leaf written inline there gets
+   * `Dispatcher<never>` and cannot emit. Pipe a command whose `A` is already
+   * fixed; pass one that still needs it.
+   */
+  readonly keyed: {
+    (key: string): <A, R>(command: Command<A, R>) => Command<A, R>;
+    <A, R>(key: string, command: Command<A, R>): Command<A, R>;
+  };
 
+  /**
+   * Commands in order, under one group. For composing *effects*, reach for
+   * `Effect.all` inside a single `Command.effect` instead — see the `Batch`
+   * variant for why this exists at all.
+   */
   readonly batch: <A, R>(...commands: ReadonlyArray<Command<A, R>>) => Command<A, R>;
 
-  readonly cancel: (target: Group | string) => Command<never>;
+  /**
+   * A bare string targets every group under that action tag.
+   *
+   * Generic in `A` with a `never` default, which looks like decoration and is
+   * not. A cancel is written *first* in a batch — sequencing it ahead of the
+   * command replacing it is the node's entire purpose — and a concrete
+   * `Command<never>` argument outranks the contextual return type as an
+   * inference source, so it fixed the batch's `A` to `never` before the sibling
+   * leaf was checked and left that leaf's `dispatch` accepting nothing. Generic,
+   * it adopts the batch's `A` instead of pinning it; alone, the default still
+   * makes it `Command<never>`.
+   */
+  readonly cancel: <A = never>(target: Group | string) => Command<A, never>;
 
   /**
    * Outbound announcement. The phantom on `Message` does the work here: passing
@@ -524,17 +760,15 @@ export const Command: {
     message: Message<Tag, Fields, "outbound">,
     payload: Simplify<Omit<Schema.Struct<Fields>["Type"], "_tag">>,
   ) => Command<{ readonly _tag: Tag } & Schema.Struct<Fields>["Type"]>;
-
-  /** Pipeable, so the policy reads as a modifier: `cmd.pipe(Command.restart())`. */
-  readonly restart: (key?: string) => <A, R>(command: Command<A, R>) => Command<A, R>;
-  readonly ignore: (key?: string) => <A, R>(command: Command<A, R>) => Command<A, R>;
-  readonly queue: (key?: string) => <A, R>(command: Command<A, R>) => Command<A, R>;
 } = {
   none: pipeable({ _tag: "None" }),
 
   effect: (effect) => pipeable({ _tag: "Effect", effect }),
 
-  stream: (stream) => pipeable({ _tag: "Stream", stream }),
+  keyed: ((key: string, command?: Command<any, any>) =>
+    command === undefined
+      ? (inner: Command<any, any>) => pipeable({ _tag: "Keyed", key, command: inner })
+      : pipeable({ _tag: "Keyed", key, command })) as (typeof Command)["keyed"],
 
   batch: (...commands) => pipeable({ _tag: "Batch", commands }),
 
@@ -544,12 +778,227 @@ export const Command: {
       target: typeof target === "string" ? { tag: target } : target,
     }),
 
+  // One `dispatch` inside an ordinary leaf, which is what leaves `Effect` as
+  // the only leaf. Routing is by `_tag` at the sink — the same routing that
+  // sends an internal action back to the reducer — so an outbound message
+  // needs no variant of its own, and never did.
+  // The type argument is load-bearing: `A` is only ever inferred from a call's
+  // contextual type, and there is none here — the result is cast to the
+  // declared signature. Left off, `A` defaults to `never` and `dispatch`
+  // accepts nothing.
   output: (message, payload) =>
-    Command.stream(Stream.succeed((message as any).make(payload))) as any,
+    Command.effect<{ readonly _tag: string }>((dispatch) =>
+      dispatch((message as any).make(payload)),
+    ) as any,
+};
 
-  restart: (key) => (command) => pipeable({ _tag: "Guarded", policy: "restart", key, command }),
-  ignore: (key) => (command) => pipeable({ _tag: "Guarded", policy: "ignore", key, command }),
-  queue: (key) => (command) => pipeable({ _tag: "Guarded", policy: "queue", key, command }),
+/**
+ * A forked command fiber, held so `Cancel` and unmount can reach it.
+ *
+ * A bare fiber and nothing beside it. The previous surface needed a second
+ * identity here — which *interpretation* forked the fiber — because `ignore`
+ * and `restart` had to tell an earlier dispatch apart from a sibling forked
+ * three lines ago. With no policy to make that judgement, there is no judgement
+ * to inform, and the map is a plain address book again.
+ */
+type GroupEntry = {
+  readonly fiber: Fiber.Fiber<void>;
+};
+
+/**
+ * The group a command's fibers belong to. `tag` is the issuing action's, filled
+ * by the runtime; `key` is whatever a `Keyed` node named it. See `Group`.
+ */
+type CommandContext = {
+  readonly tag: string;
+  readonly key?: string;
+};
+
+/**
+ * The command interpreter, shared by `Blueprint.run` and `createFeatureStore`.
+ *
+ * This is the headless core `Blueprint.run`'s JSDoc names — the thing that has
+ * to exist exactly once, because it is where grouping and cancellation are
+ * decided. Two copies would have to agree forever about what a `Cancel` reaches
+ * and when a group is empty, and the one that is not under test drifts. `run`'s
+ * suite is what guards this.
+ *
+ * Parameterised only by its two sinks, which is the entire difference between
+ * the two callers. `run` points `emit` at its own queue and terminates at
+ * quiescence; the store points `emit` at a synchronous fold and never
+ * terminates. Everything below — the fiber bookkeeping — is identical.
+ */
+const commandInterpreter = (deps: {
+  /**
+   * Where a command's emissions go: back to the reducer, or out as an output.
+   *
+   * The `ctx` is the emitting command's group — the address a `Cancel` would
+   * name. It is passed so the store can attribute what it folds to the command
+   * that caused it; `run` ignores it, and a one-parameter function is still
+   * assignable here, which is why `run`'s sink needed no change.
+   */
+  readonly emit: (message: { readonly _tag: string }, ctx: CommandContext) => Effect.Effect<void>;
+  /**
+   * Run after a command's fiber settles, however it settled. `run` needs it to
+   * wake a `Queue.take` that quiescence would otherwise never unblock; the
+   * store has nothing to wake and passes `Effect.void`.
+   */
+  readonly settled: Effect.Effect<void>;
+  /**
+   * How a command's fiber ended.
+   *
+   * `forkLeaf` forks and returns, so a command that *dies* dies on a fiber
+   * nobody is awaiting — an enclosing `catchCause` around `interpret` sees
+   * nothing, because `interpret` has already returned by the time the command
+   * runs. Without this hook the store's whole documented error contract is
+   * unreachable: every defect from a command is discarded silently.
+   *
+   * Interruption is normal here (that is what `Cancel` and unmount do), so a
+   * caller filters on it rather than treating every non-success as a defect.
+   */
+  readonly onExit?: (exit: Exit.Exit<void>, ctx: CommandContext) => Effect.Effect<void>;
+  readonly inFlight: Ref.Ref<number>;
+  readonly groups: Ref.Ref<Map<string, ReadonlyArray<GroupEntry>>>;
+}): {
+  /**
+   * Walk a command, forking its leaves into the mount scope.
+   *
+   * `None` returns. `Effect` forks the leaf, handing it a `dispatch` bound to
+   * `deps.emit`, and registers the fiber under the context's group. `Keyed`
+   * sets the key for everything below it, outermost winning. `Batch`
+   * interprets its members in order under one context. `Cancel` interrupts
+   * every fiber at the address it names.
+   */
+  readonly interpret: (
+    command: Command<any, any>,
+    ctx: CommandContext,
+  ) => Effect.Effect<void, never, any>;
+} => {
+  const groupId = (target: Group): string => `${target.tag}::${target.key ?? ""}`;
+
+  const cancelGroup = (target: Group) =>
+    Effect.gen(function* () {
+      const map = yield* Ref.get(deps.groups);
+      const ids =
+        target.key !== undefined
+          ? [groupId(target)]
+          : Array.from(map.keys()).filter((id) => id.startsWith(`${target.tag}::`));
+
+      // Every fiber at the address, deliberately: `Cancel` addresses a group,
+      // and a batch's members are all of them at that address.
+      for (const id of ids) {
+        for (const entry of map.get(id) ?? []) yield* Fiber.interrupt(entry.fiber);
+      }
+    });
+
+  /**
+   * Fork one leaf, register it under `ctx`'s group, and arrange for it to be
+   * unregistered however it ends.
+   *
+   * What is *not* here is the whole point of the redesign: no policy, no
+   * supersession rule, no per-interpretation occurrence to tell an earlier
+   * dispatch from a sibling forked three lines ago. A leaf forks, and the map
+   * is a plain address book.
+   */
+  const forkLeaf = (ctx: CommandContext, run: Effect.Effect<void, never, any>) =>
+    Effect.gen(function* () {
+      const id = groupId(ctx);
+
+      yield* Ref.update(deps.inFlight, (n) => n + 1);
+
+      const fiber: Fiber.Fiber<void> = yield* Effect.forkChild(run);
+
+      yield* Ref.update(deps.groups, (m) => new Map(m).set(id, [...(m.get(id) ?? []), { fiber }]));
+
+      const cleanup = Effect.gen(function* () {
+        yield* Ref.update(deps.inFlight, (n) => n - 1);
+        yield* Ref.update(deps.groups, (m) => {
+          const next = new Map(m);
+          const remaining = (next.get(id) ?? []).filter((entry) => entry.fiber !== fiber);
+          if (remaining.length > 0) next.set(id, remaining);
+          else next.delete(id);
+          return next;
+        });
+        yield* deps.settled;
+      });
+
+      // A fiber interrupted before the scheduler has started it never runs its
+      // own body — including an `Effect.ensuring` baked into that body — so
+      // cleanup cannot live there. A separate watcher on `Fiber.await` observes
+      // the Exit whether or not the fiber ever got to start.
+      //
+      // `ensuring`, not `andThen`: chaining `cleanup` behind `onExit` meant an
+      // `onExit` that died skipped the `inFlight` decrement and the `groups`
+      // removal, leaving a settled fiber in its group forever. The bookkeeping
+      // has to survive a reporting failure.
+      yield* Fiber.await(fiber).pipe(
+        Effect.flatMap((exit) =>
+          deps.onExit === undefined ? Effect.void : deps.onExit(exit, ctx),
+        ),
+        Effect.ensuring(cleanup),
+        Effect.forkChild,
+      );
+    });
+
+  /**
+   * What a leaf emits with. Bound to `deps.emit`, which is the whole difference
+   * between the two callers — `run`'s queue, or the store's synchronous fold.
+   *
+   * Returns an `Effect`, so it composes with the effect that called it. That is
+   * what lets a long-lived source be `Stream.runForEach(source, dispatch)` and
+   * a one-shot be `Effect.flatMap(load, dispatch)`, with no separate variant
+   * for either.
+   *
+   * Built per leaf rather than once for the interpreter, because the ctx it
+   * closes over is what tells the store which command emitted. A single shared
+   * closure cannot carry it: `Keyed` refines the ctx on the way down, so by the
+   * time a leaf runs, its ctx is not the one the interpreter was constructed
+   * with. One extra closure per forked leaf, which is nothing beside forking
+   * the fiber it belongs to.
+   */
+  const dispatchFor =
+    (ctx: CommandContext): Dispatcher<any> =>
+    (action) =>
+      deps.emit(action, ctx);
+
+  const interpret = (
+    command: Command<any, any>,
+    ctx: CommandContext,
+  ): Effect.Effect<void, never, any> =>
+    Effect.gen(function* () {
+      switch (command._tag) {
+        case "None":
+          return;
+        case "Effect":
+          // `suspend`, so a leaf builder that throws synchronously dies on the
+          // command's own fiber and is reported through `onExit`, rather than
+          // escaping into whoever called `interpret` — which is the fold, and
+          // has no business catching it.
+          return yield* forkLeaf(
+            ctx,
+            Effect.asVoid(Effect.suspend(() => command.effect(dispatchFor(ctx)))),
+          );
+        case "Keyed":
+          // Outermost wins: an inner `Keyed` under an outer one keeps `ctx`
+          // whole. Nesting is answerable rather than an error because a keyed
+          // command composes into a batch that is itself keyed.
+          return yield* interpret(
+            command.command,
+            ctx.key === undefined ? { tag: ctx.tag, key: command.key } : ctx,
+          );
+        case "Batch":
+          // One `ctx`, so every member shares the issuing action's group — the
+          // address `Cancel` names. In order, because the one thing this node
+          // can do that `Effect.all` cannot is put a `Cancel` before the
+          // command replacing it.
+          for (const member of command.commands) yield* interpret(member, ctx);
+          return;
+        case "Cancel":
+          return yield* cancelGroup(command.target);
+      }
+    });
+
+  return { interpret } as const;
 };
 
 /**
@@ -766,6 +1215,9 @@ export interface LifecycleHandlers<Props, State, Action, H extends AnyHooks, R =
    * nowhere to go and an emitted action has nowhere to land — return
    * `snapshot.state` and put the work in the command.
    *
+   * `blueprint.reduce` discards it identically, so a teardown test folded
+   * through `reduce` and the same feature under the runtime cannot disagree.
+   *
    * Uniformity is free here. `ManagedRuntime.make` sets
    * `onFiberStart: Fiber.runIn(scope)`, so `runFork` already forks into the root
    * scope: an unmount command takes the same path as any other command. It therefore
@@ -845,6 +1297,53 @@ export type Reducer<
 } & LifecycleHandlers<Props, State, Emit<A, O>, H, R>;
 
 /**
+ * The pieces `component` needs and a *test* never should.
+ *
+ * `reduce` and `run` are the whole public surface of a blueprint, and that is
+ * deliberate — they are the two things a test drives. But mounting needs four
+ * more: the initial state, the render function, the hook spec, and the two
+ * schemas (props to validate against, outputs to strip `on<Tag>` props by and
+ * to route emissions through). All four are `define`'s inputs, and none of them
+ * survives into `Blueprint` today, which is why `component` has nothing to work
+ * with.
+ *
+ * Behind a `unique symbol` rather than a named property: it keeps them off
+ * hovers, off `Object.keys`, and unreachable by name from userland, so the
+ * public surface stays exactly the two methods above. `component` is in this
+ * module, so it can read the symbol; nobody else can spell it.
+ *
+ * Every member is contravariant in `Props`, which is what keeps `in Props` on
+ * `Blueprint` true.
+ */
+const internals: unique symbol = Symbol("@tea/internals");
+
+export interface BlueprintInternals<Props, State, Action, H extends AnyHooks> {
+  readonly initialState: (props: Props) => State;
+  readonly render: Render<Props, State, Action, H>;
+  readonly useHooks: HookSpec<Props, State, H> | undefined;
+  /** Validated on mount and on every props-identity change. See `define`. */
+  readonly props: AnyPropsSchema;
+  /**
+   * The declared output tags, as strings. Two uses, both in `component`: strip
+   * exactly `on${tag}` from incoming props before the schema runs, and decide
+   * whether an emitted message re-enters the reducer or leaves through a prop.
+   * `NoPropCollision` is what makes stripping by derived name safe.
+   */
+  readonly outputTags: ReadonlyArray<string>;
+
+  /**
+   * Whether the feature declared a handler for this tag.
+   *
+   * `reduce` deliberately cannot answer this: it no-ops for an undeclared
+   * *lifecycle* handler, so "handled and returned the same state" and "nobody
+   * declared one" come back identical. The store has to tell them apart for
+   * exactly one tag — a defect with an `Error` handler is handled, and one
+   * without has to reach React's error boundary instead of vanishing.
+   */
+  readonly handles: (tag: string) => boolean;
+}
+
+/**
  * A feature's behaviour, before it is wired to a runtime. `component` turns one
  * into an `FC<Props>`; until then it is an inert value you can unit-test.
  */
@@ -856,6 +1355,9 @@ export interface Blueprint<
   H extends AnyHooks = {},
   out R = never,
 > {
+  /** @internal Not part of the surface — see `BlueprintInternals`. */
+  readonly [internals]: BlueprintInternals<Props, State, Action, H>;
+
   /**
    * The whole reducer as one pure function — Elm's `Msg -> Model -> Model`,
    * with the snapshot standing in for the state.
@@ -864,7 +1366,14 @@ export interface Blueprint<
    * constant; annotating it would replace the literal type that `R` is computed
    * from, and that degradation is silent. Takes lifecycle actions too, so
    * "what happens when this prop changes" is a direct call rather than a
-   * mounted component. Unhandled lifecycle actions return the state unchanged.
+   * mounted component. Unhandled lifecycle actions return the state unchanged —
+   * every `LifecycleHandlers` entry is optional by design. `Unmounted` is the
+   * one handled action whose returned state is dropped rather than returned,
+   * matching what the runtime does with it; only its command survives. Nothing
+   * else is optional:
+   * `action`'s type requires a handler for every declared tag, so a missing one
+   * outside the lifecycle set means the value reaching `reduce` didn't come
+   * from the typed surface, and that throws rather than swallowing the defect.
    *
    * No React, no runtime, no mounting.
    */
@@ -954,7 +1463,7 @@ export interface Definition<
  *       props: Props,
  *       state: State,
  *       action: Action.of([…]),
- *       output: Output.of([OrderPlaced]),
+ *       output: Action.of([OrderPlaced]),
  *       useHooks: …,
  *     })
  *
@@ -1025,163 +1534,171 @@ export const define: <
     reducer: identity,
     render: identity,
     create: (parts) => {
+      /**
+       * The declared output tags, derived **once** and shared by everything
+       * that needs to know what an output is.
+       *
+       * `create` used to compute this for the internals slot while `run`
+       * separately asked `Object.hasOwn(spec.output.cases, tag)` — one rule,
+       * two spellings, inside one closure, and nothing keeping them agreed. A
+       * change to how outputs are enumerated (nested vocabularies, aliasing)
+       * had two places to land and no failure if it only landed in one.
+       *
+       * Own keys only, for the reason given on `isLifecycleTag`: `cases`
+       * inherits from `Object.prototype`, so an `in` test would report
+       * `"constructor"` and `"toString"` as declared outputs — and routing an
+       * unknown tag outbound is worse than the lifecycle case, since it leaves
+       * the feature through an `on<Tag>` prop instead of reaching the throw.
+       */
+      const outputTags = spec.output ? Object.keys(spec.output.cases) : [];
+      const outputTagSet = new Set(outputTags);
+
       return {
-        reduce: (action, snapshot) => parts.reducer[action._tag](action, snapshot),
+        [internals]: {
+          initialState: parts.initialState,
+          render: parts.render,
+          useHooks: spec.useHooks,
+          props: spec.props,
+          outputTags,
+          handles: (tag) => handlerFor(parts.reducer, tag) !== undefined,
+        },
+
+        /**
+         * A missing handler is the documented no-op only for a *lifecycle*
+         * tag — every `LifecycleHandlers` entry is optional by design. A
+         * missing handler for anything else is a defect: `Reducer` requires
+         * one for every declared action tag, so reaching this branch means
+         * the action arrived without going through the typed surface (a bad
+         * cast, a malformed devtools replay) — that case still throws, same
+         * as calling `undefined` always did.
+         */
+        reduce: (action, snapshot) => {
+          const handler = handlerFor(parts.reducer, action._tag);
+          if (handler) {
+            const next = handler(action, snapshot);
+            if (action._tag !== "Unmounted") return next;
+
+            /**
+             * `Unmounted`'s returned state is discarded here for the same
+             * reason `run`'s `step` discards it: the component is gone, so the
+             * state has nowhere to go. Only the command survives.
+             *
+             * The alternative — returning the handler's `Next` verbatim and
+             * leaving the discard to the runtime — made the library answer the
+             * same question two ways. That matters because `reduce` is sold, a
+             * few lines up, as the way to test teardown *without mounting
+             * anything*: a test folding `Unmounted` through `reduce` saw
+             * `{ count: 999 }` while the same feature under `run` saw the state
+             * before it, and the disagreement was silent in both directions.
+             *
+             * The cost is that `reduce` is no longer a plain "look up the
+             * handler and return what it said", and that a handler's returned
+             * state becomes unobservable. Both are the point: it is already
+             * unobservable in the runtime, so being able to observe it here
+             * only ever meant asserting a value production can never produce.
+             */
+            const command = Next.command(next);
+            return command === undefined ? snapshot.state : [snapshot.state, command];
+          }
+          if (isLifecycleTag(action._tag)) return snapshot.state;
+          throw new TypeError(`No reducer handler for action "${action._tag}"`);
+        },
 
         run: (actions, options) =>
-          Effect.gen(function* () {
-            type Entry = {
-              readonly msg: { _tag: string };
-              readonly origin: "seed" | "command" | "settled";
-            };
+          discharge(
+            Effect.gen(function* () {
+              type Entry = {
+                readonly msg: { _tag: string };
+                readonly origin: "seed" | "command" | "settled";
+              };
 
-            type Ctx = { readonly tag: string; readonly key?: string; readonly policy?: Policy };
+              const queue = yield* Queue.unbounded<Entry>();
+              const inFlight = yield* Ref.make(0);
+              const groups = yield* Ref.make(new Map<string, ReadonlyArray<GroupEntry>>());
+              const emitted: { _tag: string }[] = [];
+              const outputs: { _tag: string }[] = [];
+              // Named fields rather than `{ ...options }`: `options` also
+              // carries `layer`, and spreading it whole put a `Layer` on every
+              // handler's `Snapshot`. The type never saw it — excess-property
+              // checking does not fire on a non-fresh spread — so the object
+              // this file elsewhere describes as entirely encodable was
+              // carrying the one value in the API that cannot be.
+              const snapshot = { props: options.props, hooks: options.hooks };
+              let state = parts.initialState(options.props);
 
-            const queue = yield* Queue.unbounded<Entry>();
-            const inFlight = yield* Ref.make(0);
-            const groups = yield* Ref.make(new Map<string, ReadonlyArray<Fiber.Fiber<void>>>());
-            const emitted: { _tag: string }[] = [];
-            const outputs: { _tag: string }[] = [];
-            const snapshot = { ...options };
-            let state = parts.initialState(options.props);
+              for (const action of actions) {
+                yield* Queue.offer(queue, { msg: action, origin: "seed" });
+              }
 
-            for (const action of actions) {
-              yield* Queue.offer(queue, { msg: action, origin: "seed" });
-            }
+              // The same set `component` routes against — see `outputTags`.
+              const isOutput = (action: { _tag: string }): boolean => outputTagSet.has(action._tag);
 
-            const isOutput = (action: { _tag: string }): boolean => {
-              return spec.output?.cases ? action._tag in spec.output.cases : false;
-            };
-
-            const groupId = (target: Group): string => `${target.tag}::${target.key ?? ""}`;
-
-            const cancelGroup = (target: Group) =>
-              Effect.gen(function* () {
-                const map = yield* Ref.get(groups);
-                const ids =
-                  target.key !== undefined
-                    ? [groupId(target)]
-                    : Array.from(map.keys()).filter((id) => id.startsWith(`${target.tag}::`));
-
-                for (const id of ids) {
-                  for (const fiber of map.get(id) ?? []) yield* Fiber.interrupt(fiber);
-                }
+              // The interpreter is `commandInterpreter`'s, not a local copy —
+              // see it for why there is exactly one. `run` points `emit` at its
+              // own queue (so emissions re-enter this fold) and supplies the
+              // settled-marker its quiescence check depends on.
+              const { interpret } = commandInterpreter({
+                inFlight,
+                groups,
+                emit: (msg) => Queue.offer(queue, { msg, origin: "command" }).pipe(Effect.asVoid),
+                // A command that settles without ever emitting (a `Command.effect`,
+                // an interrupted/cancelled group) still has to wake the drain loop's
+                // `Queue.take` — otherwise quiescence is reached but nothing is left
+                // to unblock it. A no-op entry does that uniformly.
+                settled: Queue.offer(queue, {
+                  msg: { _tag: "__settled__" },
+                  origin: "settled",
+                }).pipe(Effect.asVoid),
               });
 
-            const runGuarded = (ctx: Ctx, run: Effect.Effect<void, never, any>) =>
-              Effect.gen(function* () {
-                const policy = ctx.policy ?? "parallel";
-                const id = groupId(ctx);
-                const running = (yield* Ref.get(groups)).get(id) ?? [];
+              const step = ({ msg: action, origin }: Entry) =>
+                Effect.gen(function* () {
+                  if (origin === "settled") return;
 
-                if (policy === "ignore" && running.length > 0) return;
-                if (policy === "restart")
-                  for (const fiber of running) yield* Fiber.interrupt(fiber);
+                  if (isOutput(action)) return void outputs.push(action);
 
-                const awaitPrior =
-                  policy === "queue" && running.length > 0
-                    ? Fiber.joinAll(running).pipe(Effect.asVoid)
-                    : Effect.void;
+                  const handler = handlerFor(parts.reducer, action._tag);
+                  if (!handler) {
+                    if (isLifecycleTag(action._tag)) return;
+                    throw new TypeError(`No reducer handler for action "${action._tag}"`);
+                  }
 
-                yield* Ref.update(inFlight, (n) => n + 1);
-
-                // A fiber `Fiber.interrupt`ed before the scheduler has started it never
-                // runs its own body — including an `Effect.ensuring` baked into that
-                // body — so cleanup can't live there. A separate watcher, waiting on
-                // `Fiber.await`, observes the Exit regardless of whether the fiber ever
-                // got to start.
-                const fiber: Fiber.Fiber<void> = yield* awaitPrior.pipe(
-                  Effect.andThen(run),
-                  Effect.forkChild,
-                );
-
-                yield* Ref.update(groups, (m) =>
-                  new Map(m).set(
-                    id,
-                    policy === "restart" ? [fiber] : [...(m.get(id) ?? []), fiber],
-                  ),
-                );
-
-                const cleanup = Effect.gen(function* () {
-                  yield* Ref.update(inFlight, (n) => n - 1);
-                  yield* Ref.update(groups, (m) => {
-                    const next = new Map(m);
-                    const remaining = (next.get(id) ?? []).filter((f) => f !== fiber);
-                    if (remaining.length > 0) next.set(id, remaining);
-                    else next.delete(id);
-                    return next;
-                  });
-                  // A command that settles without ever emitting (a `Command.effect`,
-                  // an interrupted/cancelled group) still has to wake the drain loop's
-                  // `Queue.take` — otherwise quiescence is reached but nothing is left
-                  // to unblock it. A no-op entry does that uniformly.
-                  yield* Queue.offer(queue, { msg: { _tag: "__settled__" }, origin: "settled" });
+                  const next = handler(action, { ...snapshot, state });
+                  const command = Next.command(next);
+                  if (action._tag !== "Unmounted") state = Next.state(next);
+                  if (command) yield* interpret(command, { tag: action._tag });
                 });
 
-                yield* Fiber.await(fiber).pipe(Effect.andThen(cleanup), Effect.forkChild);
-              });
+              // drain until quiescent: nothing queued and nothing running.
+              //
+              // `inFlight` first, then the queue: a fiber offers its follow-up
+              // work *before* `cleanup` decrements, so reading in that order
+              // means a fiber that slips between the two reads can only make
+              // the check more conservative. The other order has a real hole —
+              // see the teardown drain, which had the same one.
+              while (true) {
+                const inFlightCount = yield* Ref.get(inFlight);
+                const queueSize = yield* Queue.size(queue);
+                if (queueSize === 0 && inFlightCount === 0) break;
+                const entry = yield* Queue.take(queue);
+                if (entry.origin === "command" && !isOutput(entry.msg)) emitted.push(entry.msg);
+                yield* step(entry);
+              }
 
-            const interpret = (
-              command: Command<any, any>,
-              ctx: Ctx,
-            ): Effect.Effect<void, never, any> =>
-              Effect.gen(function* () {
-                switch (command._tag) {
-                  case "None":
-                    return;
-                  case "Effect":
-                    return yield* runGuarded(ctx, Effect.asVoid(command.effect));
-                  case "Stream":
-                    return yield* runGuarded(
-                      ctx,
-                      Stream.runForEach(command.stream, (msg) =>
-                        Queue.offer(queue, { msg, origin: "command" }),
-                      ),
-                    );
-                  case "Batch":
-                    for (const member of command.commands) yield* interpret(member, ctx);
-                    return;
-                  case "Cancel":
-                    return yield* cancelGroup(command.target);
-                  case "Guarded": {
-                    const next: Ctx =
-                      ctx.policy === undefined
-                        ? { tag: ctx.tag, key: command.key, policy: command.policy }
-                        : ctx;
-                    return yield* interpret(command.command, next);
-                  }
-                }
-              });
-
-            const step = ({ msg: action, origin }: Entry) =>
-              Effect.gen(function* () {
-                if (origin === "settled") return;
-
-                yield* Effect.log("step", action);
-
-                if (isOutput(action)) return void outputs.push(action);
-
-                const handler = parts.reducer[action._tag];
-                // if (!handler) return; // unhandled lifecycle: no-op
-
-                const next = handler(action, { ...snapshot, state });
-                const command = Next.command(next);
-                if (action._tag !== "Unmounted") state = Next.state(next);
-                if (command) yield* interpret(command, { tag: action._tag });
-              });
-
-            // drain until quiescent: nothing queued and nothing running
-            while (true) {
-              const queueSize = yield* Queue.size(queue);
-              const inFlightCount = yield* Ref.get(inFlight);
-              if (queueSize === 0 && inFlightCount === 0) break;
-              const entry = yield* Queue.take(queue);
-              if (entry.origin === "command" && !isOutput(entry.msg)) emitted.push(entry.msg);
-              yield* step(entry);
-            }
-
-            return { state, emitted, outputs };
-          }).pipe(Effect.provide(options.layer)),
+              return { state, emitted, outputs };
+            }).pipe(Effect.provide(options.layer)),
+            /**
+             * Only `R` needs discharging here, not the success value.
+             *
+             * `interpret`/`runGuarded` type every command's requirement `any`
+             * internally, because the real `R` is computed the same way
+             * `ServicesOf<U>` is — by walking handler return types this scope
+             * cannot name (see `ServiceOf`) — so TS can't see that
+             * `options.layer` (typed `Layer.Layer<R>` by the caller) actually
+             * discharges it. `discharge` asserts exactly that one channel;
+             * `state`/`emitted`/`outputs` stay inferred and checked.
+             */
+          ),
       };
     },
   };
@@ -1196,50 +1713,1139 @@ export const define: <
 // Root
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Mounting a blueprint
+// ---------------------------------------------------------------------------
+
 /**
- * Emitted for every state change in every mounted feature. Loosely typed on
- * purpose — a root observer sees features it knows nothing about. Because
- * actions, outputs, state *and* props are all schemas with no escape hatch left
- * in them, every field here encodes: this is a devtools transport, a replay log
- * or a `postMessage` away from being useful, with no schema-aware serialiser in
- * between.
+ * The live half of `run`, and the seam the React binding is written against.
  *
- * `instance` and `cause` are what turn a flat log into something usable once
- * there are N independent machines instead of one.
+ * `run` is already the fold — queue, groups, policies, quiescence — with a
+ * synchronous drain and an array of seed actions. Mounting is the same fold with
+ * React's clock: actions arrive from `dispatch` and from lifecycle effects
+ * rather than from an iterable, there is no quiescence to reach because the
+ * component is alive, and every state change has to reach React instead of a
+ * local `let`.
  *
- * Without `instance`, two `<Presence roomId="…">` are indistinguishable in the
- * stream, because `name` is a *blueprint* name. Without `cause`, order is all
- * you have — and in a decentralised architecture order tells you almost nothing
- * while causality tells you everything. `cause` is what renders
- * `cart#3/OrderPlaced → presence#1/RosterSynced` as an edge rather than as two
- * unrelated lines that happened to be adjacent.
+ * Naming that seam is what stops there being two implementations of the drain
+ * loop. The docs on `Blueprint.run` already call this out as the honest
+ * factoring: a headless core plus a React binding, where `run` is the core with
+ * a synchronous clock. Everything below the line in `FeatureStore` is that core;
+ * everything above it is React.
  *
- * This is also the argument for outputs over a shared bus, restated as a data
- * structure: an output has a declared tag, a schema, and a known recipient, so
- * the edge is derivable. Bus traffic is opaque and the edge is not.
+ * **Two lifetimes, and the split is forced by StrictMode.** The store *object*
+ * — state cell, subscribers, pending queue — is created in `useState`'s
+ * initialiser and lives as long as the component instance. Its Effect *scope*
+ * is opened by `start` and closed by `stop`, once per mount.
  *
- * Note what is *not* here: a `Query` variant. It was in the sketch, and cutting
- * queries removed it — which is the second-order reason they went. An externally
- * sent message has no origin the runtime can name, so the one variant that could
- * not be filled in was also the only one crossing a boundary inbound.
+ * Collapsing the two was the obvious first shape and is wrong: React's
+ * simulated unmount → remount reuses the same store object, so a single
+ * `dispose` in the cleanup leaves the remounted component holding a closed
+ * scope, and every command after that point forks into nothing and silently
+ * does not run. That is not the cosmetic double-build already documented for
+ * the root runtime — it breaks development outright. Split, a remount re-arms
+ * the store and state survives it, which is what React means by remounting the
+ * same instance.
+ *
+ * `OwnershipRule` still holds and is what the split preserves: a real unmount
+ * discards the `useState` cell along with the scope, so state is still born at
+ * mount and gone at unmount, with no registry and no retain.
  */
-export interface DevtoolsEvent {
-  readonly name: string;
-  /** Which mount. */
-  readonly instance: string;
-  readonly action: unknown;
-  readonly previous: unknown;
-  readonly next: unknown;
-  /** What caused this action, when the runtime knows. */
-  readonly cause?:
-    | { readonly _tag: "Dispatch" }
-    | { readonly _tag: "Command"; readonly action: string }
-    | { readonly _tag: "Output"; readonly from: string; readonly output: string };
+export interface FeatureStore<Props, State, Action, H extends AnyHooks> {
+  /** The `useSyncExternalStore` pair. `getSnapshot` must be reference-stable
+   *  between changes, or React re-renders forever. */
+  readonly subscribe: (onStoreChange: () => void) => () => void;
+  readonly getSnapshot: () => State;
+
+  /** The declared vocabulary, from `render`. Stable identity — it lands in props. */
+  readonly dispatch: Dispatch<Action>;
+
+  /**
+   * The snapshot's ambient half, and — because it is the only thing that sees
+   * both the old and new values — the place `PropsChanged` and `HookChanged`
+   * are detected and raised.
+   *
+   * **Called from an effect, not from the render body.** It used to fold during
+   * render and hand the new state straight back, so a props-driven change
+   * painted on the render that carried the props rather than the one after it.
+   * That saved a render on paper and never on a measurement: `getSnapshot` is a
+   * stable method and the pre-fold read equalled the previous render's
+   * snapshot, so React had nothing to schedule a second render over, and a
+   * render count reads the same with the fold moved. What it cost was real —
+   * mutating a store during render, a rule inside `fold` suppressing the
+   * notification that mutation would otherwise trigger, and an ordering
+   * constraint between this call and `useSyncExternalStore` that no test could
+   * catch a violation of. Removed on that trade.
+   *
+   * Returns nothing: the state it produces arrives through `getSnapshot` on the
+   * render React schedules from the store notification, like every other fold.
+   *
+   * **Must be idempotent, and the equivalences are what make it so.** An effect
+   * can re-run — StrictMode double-invokes them, props identity can change
+   * without any value changing — and this raises actions, so it will be called
+   * twice with the same values. The second call compares equal and does
+   * nothing. A change detected by identity rather than by value would forfeit
+   * that.
+   *
+   * The first call **seeds the baseline** rather than raising: the store is
+   * built from `initialState(props)` before any hook has run, so there is no
+   * previous `H` to compare against and nothing has changed yet.
+   *
+   * `props` and `hooks` are still reads, per `Snapshot` — the store keeps the
+   * latest values only to hand to a handler when a command-emitted action lands
+   * between renders, never accumulating them into state.
+   */
+  readonly sync: (props: Props, hooks: H) => void;
+
+  /**
+   * Open the mount scope, build the feature layer inside it, raise `Mounted`.
+   *
+   * Idempotent while already started, so React's effect running twice cannot
+   * open two scopes. Calling it after `stop` re-arms the store — the dev
+   * remount path — reusing the existing state rather than reprojecting
+   * `initialState`.
+   */
+  readonly start: () => void;
+
+  /**
+   * Raise `Unmounted`, fork its command into the **root** scope, and close the
+   * mount scope once that command settles.
+   *
+   * The ordering is the whole point, and it is what keeps
+   * `LifecycleHandlers.Unmounted`'s promise honest now that a mount scope
+   * exists. Forking teardown into the mount scope would have `stop` interrupt
+   * the command it just issued; closing the mount scope immediately would
+   * release the feature's own layer out from under a teardown command that
+   * needs it — which is exactly the feature that had a reason to bring a layer.
+   *
+   * Returns synchronously, because React's cleanup is synchronous. The drain
+   * happens on a fiber, so a `start` that follows must not have its new scope
+   * torn down by the previous `stop` completing late.
+   */
+  readonly stop: () => void;
 }
 
-export interface RuntimeOptions {
-  readonly onEvent?: (event: DevtoolsEvent) => void;
-}
+/**
+ * The live fold: the headless half of the runtime, exported so it is testable
+ * without a DOM. `component` is the only intended caller.
+ *
+ * **The fold is synchronous and only commands are Effects.** A fold cannot
+ * round-trip through the queue — the value would arrive a render late, which is
+ * the extra cycle the design exists to avoid. Every action therefore folds in a
+ * plain call: read state, run the handler, write state, notify, fork the
+ * command, and `component` reads the result through `getSnapshot` on the same
+ * render. (`sync` still returns the folded state; its one caller stopped using
+ * the return value when the `useSyncExternalStore` read moved below it.)
+ *
+ * A re-entrancy guard serialises them. Without it a command emitting on the
+ * forking stack — a leaf whose whole body is `dispatch(…)`, which is what
+ * `Command.output` is — re-enters the fold mid-write and the outer fold writes
+ * stale state on the way out. Actions arriving while a fold is on the stack
+ * queue behind it.
+ *
+ * What has to be true, and what `run` already answers for the synchronous case:
+ *
+ *   - `interpret` and the fiber bookkeeping under it are the same code, lifted
+ *     out of `run` rather than written twice. Two implementations of
+ *     policy, group and cancellation semantics would have to agree forever,
+ *     which is the replica problem `run`'s own docs cite. The existing `run`
+ *     suite is the gate on that extraction.
+ *   - The drain loop loses its exit condition. `run` stops at quiescence; this
+ *     one runs until the mount scope closes, so it is a forked `Queue.take`.
+ *   - `getSnapshot` returns the *same reference* until the next write, or
+ *     `useSyncExternalStore` re-renders forever.
+ *   - Routing is `outputTags`: a message whose tag is in it leaves through
+ *     `emit`, everything else re-enters the reducer. Own-keys only.
+ *   - `Unmounted` discards the returned state and keeps only the command —
+ *     matching `reduce` and `run`, both of which document why.
+ *   - A defect reaches the `Error` handler; with none declared it reaches
+ *     `defect`, which `component` rethrows during render.
+ *   - The feature `layer` builds once per `start`, inside the mount scope, so
+ *     its finalizers run on `stop`.
+ */
+/**
+ * One counter per blueprint name, so `cart#1` and `cart#2` are distinguishable
+ * in a devtools stream.
+ *
+ * Module-global rather than per runtime: the ids only have to be unique within
+ * a page, and threading a counter through `createRuntime` would put a
+ * debugging concern into the DI surface. Unique, not gapless — StrictMode
+ * double-invokes the `useState` initialiser that builds a store, burning one.
+ */
+const instanceCounts = new Map<string, number>();
+
+const nextInstance = (name: string): string => {
+  const next = (instanceCounts.get(name) ?? 0) + 1;
+  instanceCounts.set(name, next);
+  return String(next);
+};
+
+/**
+ * Shared, so the two hottest emission paths allocate no cause object at all.
+ *
+ * Frozen because they are shared: these three objects reach every sink on the
+ * page, and one sink annotating what it was handed would corrupt every later
+ * event from every other feature.
+ */
+const DISPATCH: DevtoolsCause = Object.freeze({ _tag: "Dispatch" });
+const LIFECYCLE: DevtoolsCause = Object.freeze({ _tag: "Lifecycle" });
+
+/**
+ * The two runtime-built actions as a devtools event sees them.
+ *
+ * Every action a *user* declares is a schema value with no escape hatch, so it
+ * encodes. The runtime builds five of its own, and two of those carry payloads
+ * that do not:
+ *
+ *   - `Error` carries the live `error` and a `Cause`. The first
+ *     `JSON.stringify`s to `{}`; the second to an Effect-internal shape that
+ *     does not read back.
+ *   - `HookChanged` carries the previous **hooks**, and hooks are
+ *     `Record<string, unknown>` by design — a `useQuery` result with a
+ *     `refetch` function on it, a `Date`, a DOM node. `structuredClone` throws
+ *     on the function, which is worse than lossy: `report` would catch it,
+ *     disable the sink, and the log would go dark for the rest of the page.
+ *
+ * `PropsChanged` is deliberately *not* here. Props are a schema struct and
+ * `NoTransform` guarantees `Encoded` equals `Type`, so `previous` is as
+ * encodable as the state beside it, and it is worth keeping.
+ */
+const ERROR_ACTION = Object.freeze({ _tag: "Error" as const });
+const HOOK_CHANGED_ACTION = Object.freeze({ _tag: "HookChanged" as const });
+
+const reportableAction = (action: { readonly _tag: string }): { readonly _tag: string } => {
+  if (action._tag === "Error") return ERROR_ACTION;
+  if (action._tag === "HookChanged") return HOOK_CHANGED_ACTION;
+  return action;
+};
+
+const commandCause = (ctx: CommandContext): DevtoolsCause =>
+  ctx.key === undefined
+    ? { _tag: "Command", action: ctx.tag }
+    : { _tag: "Command", action: ctx.tag, key: ctx.key };
+
+export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(args: {
+  readonly blueprint: Blueprint<Props, State, Action, any, H, any>;
+  readonly props: Props;
+  /**
+   * Derived once per blueprint and passed in, not derived here: `sync` runs on
+   * every render of every mount, and `Schema.toEquivalence` walks the whole AST.
+   */
+  readonly equivalence: {
+    readonly props: Equivalence.Equivalence<Props>;
+    readonly hooks: Equivalence.Equivalence<H>;
+  };
+  readonly runtime: ManagedRuntime.ManagedRuntime<any, any>;
+  readonly layer: Layer.Layer<any, any, any> | undefined;
+  /**
+   * Where a routed output goes. `component` points this at the `on<Tag>` props.
+   * Throws when no handler exists for the tag, and that throw is **not** the
+   * feature's to catch — see `emitOutput` below.
+   */
+  readonly emit: (output: { readonly _tag: string }) => void;
+  /** A defect no `Error` handler took. `component` rethrows it during render. */
+  readonly defect: (error: unknown) => void;
+  /**
+   * What the devtools stream calls this feature. `component` passes the `name`
+   * it already has, which today only sets `displayName`.
+   *
+   * Optional, and it stays optional: a store constructed directly — which is
+   * how most of this library's own tests reach it — has no name to give, and
+   * requiring one would be a signature change to every one of them for a field
+   * only a debugger reads. Defaults to `"TeaFeature"`, matching `displayName`.
+   */
+  readonly name?: string;
+  /**
+   * Which mount, within the name. Optional for the same reason, and defaulted
+   * from a module-global counter so two mounts of one blueprint are
+   * distinguishable in the stream.
+   */
+  readonly instance?: string;
+}): FeatureStore<Props, State, Action, H> => {
+  const { blueprint, equivalence, runtime, layer, emit, defect } = args;
+  const { initialState, outputTags, handles } = blueprint[internals];
+
+  const name = args.name ?? "TeaFeature";
+  const instance = args.instance ?? nextInstance(name);
+
+  /**
+   * The installed devtools sink, or `undefined` when nobody installed one.
+   *
+   * Resolved lazily and cached behind `resolved`, because `cachedContext` is
+   * `undefined` until the root runtime's first `runFork`. `start` forks
+   * immediately before folding `Mounted`, and for a synchronous root layer the
+   * context is populated by then — so `Mounted` is captured. An **asynchronous**
+   * root layer is a genuine blind window; see `devtools.specs.md`. Returning
+   * `undefined` without latching `resolved` is what lets a later fold retry.
+   */
+  let resolved = false;
+  let sink: DevtoolsSink | undefined;
+
+  const devtools = (): DevtoolsSink | undefined => {
+    if (!resolved) {
+      const context = runtime.cachedContext;
+      if (context === undefined) return undefined;
+      const installed = Context.getReferenceUnsafe(context, Devtools);
+      // Against the exported constant, never against `Devtools.defaultValue()`:
+      // that re-invokes the thunk.
+      sink = installed === noopDevtools ? undefined : installed;
+      resolved = true;
+    }
+    return sink;
+  };
+
+  /**
+   * Hand one event to the sink, and disable the sink if it throws.
+   *
+   * Without the guard, a throw here is caught by `fold` and routed into the
+   * *feature's* `Error` handler — a devtools bug becoming a feature error
+   * state, which is the exact mistake `emitOutput` exists to avoid. Disabling
+   * rather than merely swallowing, because a sink that threw once will throw
+   * on every fold for the life of the page.
+   */
+  const report = (event: DevtoolsEvent): void => {
+    // Re-read rather than trusting the caller's handle. A single fold reports
+    // twice — a transition, then the command it issued — and a sink that threw
+    // on the first must not be called for the second. The call sites still
+    // guard on `devtools()` before building an event, which is what keeps the
+    // no-sink path free of allocation; this is only about staying disabled.
+    const target = sink;
+    if (target === undefined) return;
+    try {
+      target.onEvent(event);
+    } catch {
+      sink = undefined;
+    }
+  };
+
+  // Own-keys semantics without the prototype hazard: `outputTags` is already a
+  // plain array of own keys taken from `cases`, so membership is a lookup in a
+  // Set rather than an `in` against an object that inherits `Object.prototype`.
+  const outputs = new Set(outputTags);
+
+  /**
+   * A unit of work for the mount fiber.
+   *
+   * `Teardown` is a queue entry rather than an interrupt from outside, and that
+   * is what makes `LifecycleHandlers.Unmounted`'s promise keepable. Forking
+   * teardown externally and then interrupting the mount fiber raced two ways —
+   * the teardown could run before `Layer.build` had produced the context it
+   * needed, and the interrupt could land on the *next* mount's work. Delivered
+   * in-band it runs on the fiber that owns the scope, with the feature's own
+   * services still alive, and the loop then returns so `Effect.scoped` releases
+   * them.
+   */
+  type Work =
+    | { readonly _tag: "Run"; readonly command: Command<any, any>; readonly ctx: CommandContext }
+    | { readonly _tag: "Teardown"; readonly command: Command<any, any> | undefined }
+    /**
+     * A command's fiber settled. Carries nothing — its only job is to wake a
+     * blocked `Queue.take` so the teardown drain can re-test quiescence.
+     *
+     * This is `run`'s trick, and not having it is why the first teardown drain
+     * had to poll: with no wake-up, a command that finishes without emitting
+     * leaves the drain asleep on a queue that will never receive anything, so
+     * the only way to notice was to wake up periodically and look. `run` has
+     * offered this marker all along; the store passed `Effect.void` and then
+     * reinvented the wait badly.
+     */
+    | { readonly _tag: "Settled" };
+
+  /**
+   * Per *mount*, not per store — the second half of the split lifetime.
+   *
+   * These were per store, and it was wrong in a way only a remount showed: the
+   * fiber draining the queue is per mount, so after `stop` the previous fiber
+   * was still parked on `Queue.take` when the next `start` offered its
+   * `Mounted` command. The queue handed it to the longest-waiting taker, which
+   * was the *dying* fiber, and the interrupt that followed killed it. A feature
+   * whose `Mounted` command loads its data never loaded it in development.
+   *
+   * A fresh set per mount means a stale fiber can only ever take from a queue
+   * nobody offers to again.
+   */
+  type Mount = {
+    readonly queue: Queue.Queue<Work>;
+    readonly groups: Ref.Ref<Map<string, ReadonlyArray<GroupEntry>>>;
+    readonly inFlight: Ref.Ref<number>;
+  };
+
+  let mount: Mount | undefined;
+
+  /**
+   * Whether `start` has been called and `stop` has not.
+   *
+   * Tracked apart from `mount` because the two spans differ at both ends.
+   * `mount` stays set through teardown — a teardown command that emits an
+   * action whose handler returns another command has to reach the fiber that
+   * is still draining, and clearing `mount` in `stop` dropped exactly that
+   * second hop. And it stays clear until `start`, so this is what makes
+   * `start` idempotent rather than the presence of cells.
+   */
+  let active = false;
+
+  /**
+   * Whether a mount has ever been armed.
+   *
+   * This, not "has been stopped", is what gates buffering. Keying it on
+   * `stopped` meant a mount fiber that *died* — a feature layer that failed to
+   * build — left `stopped` false forever, so every later command piled into
+   * `buffered` and nothing ever drained it: the Retry button the `Error`
+   * handler rendered did nothing, silently, while the array grew without
+   * bound. Buffering exists for exactly one window — before the first `start`,
+   * where a child's layout effect can dispatch — and outside it a command with
+   * no fiber to run it is dropped.
+   */
+  let everStarted = false;
+
+  /**
+   * Commands issued while no mount is draining.
+   *
+   * `dispatch` reaches the subtree during render, and React runs every
+   * descendant's layout effects before this component's own passive effect —
+   * so a child dispatching from `useLayoutEffect` folds before `start` has
+   * armed anything. Dropping those was silent: the state moved and the command
+   * vanished. Buffered here and flushed by `start`.
+   */
+  const buffered: Array<Work> = [];
+
+  let state = initialState(args.props);
+  let props = args.props;
+  // `undefined` until the first `sync`, which is what makes that call seed the
+  // baseline instead of raising: there is no previous `H` to compare against.
+  let hooks: H | undefined;
+
+  const subscribers = new Set<() => void>();
+
+  // The re-entrancy guard. A command emitting on the forking stack — a leaf
+  // whose whole body is `dispatch(…)`, which is what `Command.output` is —
+  // would otherwise re-enter mid-write and have the outer fold overwrite it on
+  // the way out.
+  let folding = false;
+  /**
+   * Queued folds, each with the cause the emitting site knew.
+   *
+   * The cause travels with the action rather than being recomputed at the fold,
+   * because by then it is gone: `fold` drains a queue and cannot tell a
+   * dispatch from a command's emission. Mirrors `run`'s own `Entry` shape.
+   */
+  const pending: Array<{
+    readonly action: { readonly _tag: string };
+    readonly cause: DevtoolsCause;
+  }> = [];
+
+  /**
+   * Set while `sync` is folding, which is to say: while React is rendering.
+   *
+   * A fold that moves state normally notifies subscribers, and the only
+   * subscriber is `useSyncExternalStore`. Doing that from the render body is a
+   * setState during render — React says so out loud ("Cannot update a component
+   * while rendering a different component") — and it is redundant besides:
+   * `component` subscribes *after* calling `sync`, so the render that asked for
+   * the fold reads the folded state and the paint is already happening.
+   * Notifying would schedule a second one.
+   *
+   * Only ambient changes take this path. A `dispatch` or a command emission
+   * arrives outside render and must still notify.
+   */
+  let syncing = false;
+
+  const snapshot = (): Snapshot<Props, State, H> => ({
+    state,
+    props,
+    hooks: hooks ?? ({} as H),
+  });
+
+  /**
+   * The mount a fold currently belongs to, when it belongs to one.
+   *
+   * A command emits, `fold` runs it through the reducer, and whatever the
+   * handler returns has to go back to *the mount whose command emitted it* —
+   * not to whichever mount happens to be installed. Those are the same thing
+   * right up until a remount: `stop` deliberately leaves the dying cells in
+   * place, so StrictMode's `start; stop; start` had a teardown chain's second
+   * hop queued into the new mount and run against the new mount's services,
+   * while the dying drain saw an empty queue, declared quiescence and closed
+   * the scope out from under it.
+   *
+   * Set around the synchronous fold and restored after, which is sound because
+   * `fold` drains `pending` on one stack: a nested `fold` re-enters while the
+   * scope is still standing, and nothing else can interleave with it.
+   */
+  let routing: Mount | undefined;
+
+  const withRouting = <T>(target: Mount, body: () => T): T => {
+    const previous = routing;
+    routing = target;
+    try {
+      return body();
+    } finally {
+      routing = previous;
+    }
+  };
+
+  /**
+   * Returns whether anything will ever run this work — which is what the
+   * devtools `dropped` flag reports. Buffered work counts as accepted: `start`
+   * flushes it, so it is delayed rather than discarded.
+   */
+  const offer = (work: Work): boolean => {
+    const target = routing ?? mount;
+    if (target !== undefined) {
+      Queue.offerUnsafe(target.queue, work);
+      return true;
+    }
+    if (!everStarted) {
+      buffered.push(work);
+      return true;
+    }
+    return false;
+    // No fiber to run it: either the component is gone, or its mount died.
+    // Dropping is correct — buffering here is what grew without bound.
+    //
+    // Silently, and that was checked rather than assumed. Reporting the drop
+    // was tried and reverted: `component`'s `defect` sink throws to the nearest
+    // error boundary, so any feature whose `Error` handler returns a command —
+    // log it, clear a lock, schedule a retry — had its recovery UI replaced by
+    // a boundary crash on the very failure the handler exists to handle. A
+    // silent drop is a worse diagnostic and a much better outcome. Making the
+    // dropped work *run* is the open design question; see `tea.specs.md`.
+  };
+
+  /**
+   * An output leaving through `emit`, and the one throw the feature must not be
+   * able to catch.
+   *
+   * A missing `on<Tag>` prop is the *parent's* bug — `OutputProps` makes every
+   * one required, so an absent handler means a cast or a spread bypassed the
+   * type. Letting it fall into the generic `catch` below routed it into this
+   * feature's own `Error` handler, so a feature with error handling quietly
+   * swallowed its caller's mistake and transitioned into an error state instead
+   * of anybody finding out. It goes straight to the boundary, like a bad prop.
+   */
+  const emitOutput = (action: { readonly _tag: string }, cause: DevtoolsCause): void => {
+    // Before `emit`, so the log records the message leaving even if the
+    // parent's handler then throws — and so a devtools UI sees the output
+    // ahead of whatever the parent dispatches in response to it.
+    const target = devtools();
+    if (target !== undefined) {
+      report({ _tag: "Output", name, instance, cause, output: action });
+    }
+
+    try {
+      emit(action);
+    } catch (error) {
+      // Its own emission, because this path deliberately never goes through
+      // `raiseDefect`: a missing or throwing `on<Tag>` handler is the parent's
+      // bug and must not become this feature's error state.
+      const onThrow = devtools();
+      if (onThrow !== undefined) {
+        report({
+          _tag: "Defect",
+          name,
+          instance,
+          cause,
+          from: action._tag,
+          defect: summarizeDefect(error),
+          handled: false,
+        });
+      }
+      defect(error);
+    }
+  };
+
+  /**
+   * One action, folded. Returns whether the state reference moved, so the
+   * caller can notify exactly once for a run of them.
+   */
+  const foldOne = (action: { readonly _tag: string }, cause: DevtoolsCause): boolean => {
+    if (outputs.has(action._tag)) {
+      emitOutput(action, cause);
+      return false;
+    }
+
+    const previous = state;
+    const next = blueprint.reduce(action as never, snapshot());
+    const command = Next.command(next);
+    const nextState = Next.state(next);
+
+    // `reduce` already discards `Unmounted`'s state for us — it returns
+    // `snapshot.state` — so there is no special case here, and the runtime
+    // cannot disagree with a test that folds `Unmounted` through `reduce`.
+    const moved = nextState !== state;
+    if (moved) state = nextState;
+
+    // Read once and branched on, so a store with no sink allocates nothing
+    // here: no event literal, no summary, no string, and no thunk-passing
+    // helper — a closure would allocate whether or not it were ever called.
+    const target = devtools();
+    if (target !== undefined) {
+      // After a successful reduce and before the command event, so the log
+      // reads in the order the runtime did the work.
+      report({
+        _tag: "Transition",
+        name,
+        instance,
+        cause,
+        // Trimmed for the two runtime-built actions whose payloads do not
+        // encode — see `reportableAction`. Nothing is lost for either: the
+        // `Defect` event just before an `Error` carries the same failure in
+        // encodable form, and a `HookChanged`'s effect is the state move this
+        // very event reports.
+        action: reportableAction(action),
+        previous,
+        next: nextState,
+      });
+    }
+
+    if (command) {
+      const ctx = { tag: action._tag };
+      const accepted = offer({ _tag: "Run", command, ctx });
+      if (target !== undefined) {
+        report({
+          _tag: "Command",
+          name,
+          instance,
+          cause,
+          group: ctx,
+          command: summarizeCommand(command),
+          dropped: !accepted,
+        });
+      }
+    }
+    return moved;
+  };
+
+  const fold = (action: { readonly _tag: string }, cause: DevtoolsCause): void => {
+    pending.push({ action, cause });
+    if (folding) return;
+
+    folding = true;
+    let moved = false;
+    try {
+      while (pending.length > 0) {
+        const next = pending.shift()!;
+        try {
+          if (foldOne(next.action, next.cause)) moved = true;
+        } catch (error) {
+          raiseDefect(error, next.action._tag, next.cause);
+        }
+      }
+    } finally {
+      folding = false;
+      // After the guard is released, so a subscriber that dispatches
+      // re-entrantly starts a fresh fold rather than queueing behind a dead one.
+      if (moved && !syncing) for (const subscriber of subscribers) subscriber();
+    }
+  };
+
+  /**
+   * A defect, routed the way `LifecycleHandlers.Error` documents: to the
+   * `Error` handler when one is declared, and to React's nearest error boundary
+   * when one is not.
+   *
+   * Goes through `fold` rather than pushing onto `pending` directly. Pushing
+   * was a silent drop for every defect raised *outside* an in-progress fold —
+   * a dying command, a failing layer — because nothing then started a drain:
+   * the `Error` action sat in the array until some unrelated dispatch happened
+   * to arrive, at which point it fired late and looked caused by that dispatch.
+   * Called from inside a fold, `fold` still just queues behind the current one.
+   *
+   * A defect raised *by* the `Error` handler goes straight out, or the two
+   * would feed each other forever.
+   */
+  function raiseDefect(error: unknown, from: string, cause: DevtoolsCause): void {
+    const handled = from !== "Error" && handles("Error");
+
+    // The single emission site for a dying command: `onExit` already routes
+    // here, so emitting there as well would double every one of them.
+    const target = devtools();
+    if (target !== undefined) {
+      report({
+        _tag: "Defect",
+        name,
+        instance,
+        cause,
+        from,
+        defect: summarizeDefect(error),
+        handled,
+      });
+    }
+
+    if (!handled) {
+      defect(error);
+      return;
+    }
+    // The `Transition` this produces is a *second* event and not a duplicate:
+    // one says a defect occurred, the other says the feature's recovery ran.
+    fold({ _tag: "Error", error, cause: Cause.die(error) } as never, { _tag: "Defect", from });
+  }
+
+  const run = (cells: Mount) => {
+    /**
+     * This mount's services, once built. Local to the fiber rather than a cell
+     * on the store, which is what makes it impossible for `stop` to clear it
+     * out from under the teardown command that still needs it, or for a second
+     * mount to see the first one's already-released context.
+     */
+    let context: Context.Context<never> | undefined;
+
+    /**
+     * This fiber is no longer draining anything.
+     *
+     * Guarded on identity so a mount that has already been replaced is not
+     * clobbered, and idempotent so the failure path can run it early — see the
+     * `catchCause` below for why it has to.
+     *
+     * Clears `active` as well as `mount`. Clearing only `mount` left the store
+     * in a state no call could leave: `start` is guarded by `if (active)
+     * return`, and only `stop` clears `active` — so after a mount fiber died (a
+     * failed feature layer) nothing could re-arm it at all. Clearing both means
+     * a `start` that follows *can* build fresh cells and work.
+     *
+     * "Can", not "does": through `component` nothing calls `start` again. The
+     * arming effect is `useEffect(…, [store])` and `store` never changes, so a
+     * driver holding the store directly recovers and a React subtree does not —
+     * its commands are dropped for the life of the component. Re-arming from
+     * the binding is an open design question (auto-retry loops on a permanently
+     * failing layer; demand-driven re-arm re-enters `fold`) recorded in
+     * `tea.specs.md`. This clear is a precondition for whichever answer wins,
+     * not the answer.
+     */
+    const release = (): void => {
+      if (mount !== cells) return;
+      mount = undefined;
+      active = false;
+    };
+
+    // `emit` folds straight onto the command fiber's stack rather than going
+    // through a queue: the guard already serialises it, and a queue here would
+    // put a scheduler hop between a command emitting and the state moving.
+    const { interpret } = commandInterpreter({
+      inFlight: cells.inFlight,
+      groups: cells.groups,
+      // Routed to `cells`, not to whichever mount is installed: a command
+      // forked by *this* mount emitting must have its follow-up work run on
+      // *this* mount's fiber, with this mount's services, inside this mount's
+      // scope. See `routing`.
+      emit: (message, ctx) =>
+        Effect.sync(() => withRouting(cells, () => fold(message, commandCause(ctx)))),
+      // Teardown waits for quiescence exactly as `run` does, so it needs the
+      // same wake-up. Ignored by the main loop; load-bearing during the drain.
+      //
+      // Straight onto `cells.queue`, never through `offer`: `offer` targets
+      // whichever mount is *current*, and `stop` deliberately leaves the dying
+      // mount's fibers running while a following `start` — StrictMode's dev
+      // remount is exactly `start; stop; start` — installs new cells. The
+      // marker then woke the new mount's queue while this drain sat blocked on
+      // `Queue.take` of the old one, so every remount held the scope and the
+      // feature layer open for the full 5s bound and reported a spurious
+      // "did not settle" defect into the `Error` handler.
+      settled: Effect.sync(() => Queue.offerUnsafe(cells.queue, { _tag: "Settled" })),
+      // The store's whole error contract hangs off this. Interruption is the
+      // normal way a command ends here — `Cancel` and unmount both cause it —
+      // so only a genuine failure is a defect.
+      // `ctx.tag`, never a constant: it is the tag of the action that issued
+      // the command, so a command forked *by the `Error` handler* reports with
+      // `from === "Error"` and `raiseDefect` sends it straight to the boundary.
+      // Hard-coding `"Command"` here defeated that guard entirely and made
+      // Error → command → defect → Error an unbounded loop.
+      onExit: (exit, ctx) =>
+        Effect.sync(() => {
+          if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) {
+            // Routed like `emit`, and for the same reason: the `Error`
+            // handler's compensating command belongs to the mount whose
+            // command died, not to its successor.
+            withRouting(cells, () =>
+              raiseDefect(Cause.squash(exit.cause), ctx.tag, commandCause(ctx)),
+            );
+          }
+        }),
+    });
+
+    const provided = (effect: Effect.Effect<void, never, any>) =>
+      context === undefined ? effect : Effect.provide(effect, context);
+
+    /**
+     * Teardown, drained to quiescence — `run`'s loop, not a second one.
+     *
+     * Four review rounds landed here. The bespoke versions (join the fibers a
+     * command just forked; poll the queue with a step budget; bound each hop)
+     * each fixed one case and broke another, because they were all
+     * approximations of a question `run` already answers exactly: *is anything
+     * queued, and is anything running?* `inFlight` is decremented in
+     * `runGuarded`'s `cleanup`, which runs after `onExit` — so waiting on it
+     * waits for the error-reporting watcher too, which is the thing every
+     * hand-rolled variant kept missing.
+     *
+     * Blocking on `Queue.take` rather than polling is what the `Settled`
+     * marker buys: a command that finishes without emitting still wakes this.
+     *
+     * **In-flight work is interrupted first**, and that is what makes
+     * quiescence reachable at all. `run` cannot terminate while a
+     * never-completing command is running — a known limitation recorded in
+     * this file's spec — and a feature with a `Mounted` subscription is
+     * exactly that. Unmount cancels outstanding work and *then* runs teardown,
+     * which is the reason this loop terminates where `run`'s would not.
+     *
+     * It is also a **behaviour change** and not only a fix: the sweep is
+     * unconditional, so a command dispatched in the same tick as unmount is
+     * now interrupted where the previous polling drain let it finish. A
+     * "flush on the way out" pattern has to live in the `Unmounted` handler,
+     * which runs after the sweep. What unmount owes work already in flight is
+     * an open question in this file's spec, not a settled one.
+     */
+    const teardown = (command: Command<any, any> | undefined) =>
+      Effect.gen(function* () {
+        const running = yield* Ref.get(cells.groups);
+        for (const entries of running.values()) {
+          for (const entry of entries) yield* Fiber.interrupt(entry.fiber);
+        }
+
+        if (command !== undefined) {
+          yield* provided(interpret(command, { tag: "Unmounted" }));
+        }
+
+        while (true) {
+          // `inFlight` before the queue, and the order is load-bearing. A
+          // settling fiber offers follow-up work — `onExit` → `raiseDefect` →
+          // `fold` → `offer` — *before* `cleanup` decrements `inFlight`.
+          // Reading the queue first let a preemption between the two reads
+          // return a size taken before the offer and a count taken after the
+          // decrement, so the drain closed the scope with the `Error`
+          // handler's compensating command still sitting in the queue. This
+          // order can only ever be conservative.
+          const inFlight = yield* Ref.get(cells.inFlight);
+          const queued = yield* Queue.size(cells.queue);
+          if (queued === 0 && inFlight === 0) return;
+
+          const work = yield* Queue.take(cells.queue);
+          if (work._tag === "Run") yield* provided(interpret(work.command, work.ctx));
+        }
+      });
+
+    return Effect.gen(function* () {
+      if (layer !== undefined) {
+        // `orDie` rather than a type assertion: a Layer that fails while
+        // building the services a command asked for is exactly what
+        // `LifecycleHandlers.Error` documents as arriving reified as a defect.
+        context = (yield* Effect.orDie(Layer.build(layer))) as Context.Context<never>;
+      }
+
+      while (true) {
+        const work = yield* Queue.take(cells.queue);
+
+        if (work._tag === "Teardown") {
+          // Bounded as a whole, so a teardown that will never settle cannot
+          // hold the scope — and with it the feature layer — open for the life
+          // of the page. Reported rather than silent: an abandoned teardown is
+          // a defect the feature should hear about.
+          //
+          // A command the `Error` handler returns *on this path* is queued and
+          // then dropped, because the next statement closes the scope. That is
+          // the bound doing its job, not an oversight: teardown has already had
+          // five seconds and is being abandoned, so inviting more work into a
+          // scope that is closing would make the bound unbounded. The handler
+          // is told; it does not get to keep the page alive.
+          //
+          // `withRouting`, so that stays true after a remount. Unrouted, this
+          // was the one `raiseDefect` on a mount fiber that fell through to
+          // whichever mount is installed — queueing the dying mount's
+          // compensating command into its *successor*, to run against the
+          // successor's scope and services. Dropped is the contract here;
+          // resurrected somewhere else is not.
+          yield* teardown(work.command).pipe(
+            Effect.timeoutOption("5 seconds"),
+            Effect.flatMap((finished) =>
+              Option.isNone(finished)
+                ? Effect.sync(() =>
+                    withRouting(cells, () =>
+                      raiseDefect(
+                        new Error("Unmounted did not settle within 5s; scope closed anyway"),
+                        "Unmounted",
+                        LIFECYCLE,
+                      ),
+                    ),
+                  )
+                : Effect.void,
+            ),
+          );
+          return;
+        }
+
+        if (work._tag === "Settled") continue;
+
+        yield* provided(interpret(work.command, work.ctx));
+      }
+    }).pipe(
+      Effect.scoped,
+      Effect.catchCause((cause) =>
+        Effect.sync(() => {
+          if (Cause.hasInterruptsOnly(cause)) return;
+          // Released *before* the defect is raised, and the order is the whole
+          // point. Raising first left `mount` pointing at this fiber's queue
+          // while the fiber was terminating, so the `Error` handler's own
+          // compensating command was enqueued to a reader that would never
+          // take again: not run, and not caught by `offer`'s dropped-work
+          // branch either — swallowed with no report at all. Released first,
+          // the same command takes the documented drop path.
+          release();
+          raiseDefect(Cause.squash(cause), "Mounted", LIFECYCLE);
+        }),
+      ),
+      // Whatever happened, this fiber is no longer draining anything. Leaving
+      // `mount` pointing at its queue left the store deaf: a layer that failed
+      // to build killed the fiber, and every later dispatch — including the
+      // Retry the `Error` handler rendered — queued into the void. Idempotent,
+      // since the failure path above has usually run it already.
+      Effect.ensuring(Effect.sync(release)),
+    );
+  };
+
+  return {
+    subscribe: (onStoreChange) => {
+      subscribers.add(onStoreChange);
+      return () => void subscribers.delete(onStoreChange);
+    },
+
+    getSnapshot: () => state,
+
+    dispatch: (action) => fold(action as { readonly _tag: string }, DISPATCH),
+
+    sync: (nextProps, nextHooks) => {
+      const previousProps = props;
+      const previousHooks = hooks;
+
+      if (previousHooks === undefined) {
+        props = nextProps;
+        hooks = nextHooks;
+        return state;
+      }
+
+      const propsMoved = !equivalence.props(previousProps, nextProps);
+      const hooksMoved = !equivalence.hooks(previousHooks, nextHooks);
+
+      // Only advanced when something actually moved. Assigning unconditionally
+      // meant a render React discarded still advanced the baseline, so the
+      // committed render compared new against new and never raised the change
+      // at all — losing it rather than merely repeating it. Equal-by-value
+      // objects are interchangeable, so keeping the older reference costs
+      // nothing.
+      if (propsMoved) props = nextProps;
+      if (hooksMoved) hooks = nextHooks;
+      if (!propsMoved && !hooksMoved) return state;
+
+      syncing = true;
+      try {
+        if (propsMoved) fold({ _tag: "PropsChanged", previous: previousProps } as never, LIFECYCLE);
+        if (hooksMoved) fold({ _tag: "HookChanged", previous: previousHooks } as never, LIFECYCLE);
+      } finally {
+        syncing = false;
+      }
+
+      return state;
+    },
+
+    start: () => {
+      if (active) return;
+      active = true;
+      everStarted = true;
+
+      // `Effect.runSync` on the default runtime, not `runtime.runSync`: all
+      // three are context-free, and going through the root `ManagedRuntime`
+      // forced its layer to build synchronously — which an async root layer
+      // cannot do, so the first mount of any feature would block or throw.
+      const cells: Mount = {
+        queue: Effect.runSync(Queue.unbounded<Work>()),
+        groups: Effect.runSync(Ref.make(new Map<string, ReadonlyArray<GroupEntry>>())),
+        inFlight: Effect.runSync(Ref.make(0)),
+      };
+
+      mount = cells;
+      // Anything a layout effect dispatched before this ran.
+      for (const work of buffered.splice(0)) Queue.offerUnsafe(cells.queue, work);
+      runtime.runFork(run(cells));
+      fold({ _tag: "Mounted" }, LIFECYCLE);
+    },
+
+    stop: () => {
+      const cells = mount;
+      if (!active) return;
+      active = false;
+
+      // Narrowing, and a backstop — not the dead-mount case, which the `active`
+      // guard above already took: `start` and `release` set and clear the two
+      // together, so the only window where `active` is true without cells is a
+      // throw out of `start`'s three `runSync` constructions.
+      //
+      // It sits before the fold rather than after because that ordering is what
+      // the dead-mount decision needs if the window ever widens. Folding
+      // `Unmounted` with no fiber left was tried and reverted: `reduce`
+      // discards its state and nothing can run its command, so the only
+      // observable effect was raising `Error` and notifying
+      // `useSyncExternalStore` subscribers on a component React is in the
+      // middle of unmounting.
+      if (cells === undefined) return;
+
+      // Folded before the queue is detached, because the handler's command has
+      // to reach the fiber that still owns the scope. `reduce` discards the
+      // returned state, so nothing else of this fold survives.
+      let teardown: Command<any, any> | undefined;
+      let thrown: { readonly error: unknown } | undefined;
+      try {
+        teardown = Next.command(blueprint.reduce({ _tag: "Unmounted" } as never, snapshot()));
+      } catch (error) {
+        thrown = { error };
+      }
+
+      Queue.offerUnsafe(cells.queue, { _tag: "Teardown", command: teardown });
+
+      // Teardown bypasses `fold` entirely — it calls `blueprint.reduce`
+      // directly, just above — so without these two the last thing every
+      // feature does would be missing from the log.
+      //
+      // `previous` and `next` are the same reference on purpose: `reduce`
+      // discards `Unmounted`'s returned state, which is why the default
+      // console predicate is `skipUnchangedAmbient` and not the blunter
+      // `skipUnchanged` that would hide this event on every feature.
+      //
+      // Emitted even when the handler above threw. There is no next state to
+      // be wrong about — `reduce` discards it either way — and the transition
+      // reports the fact that matters, that this instance is gone. The
+      // adjacent `Defect` reports that the handler threw. Suppressing it was
+      // worse than a missing line: the console logger evicts its elapsed entry
+      // on exactly this event, so a feature whose teardown threw left one
+      // behind.
+      const target = devtools();
+      if (target !== undefined) {
+        report({
+          _tag: "Transition",
+          name,
+          instance,
+          cause: LIFECYCLE,
+          action: { _tag: "Unmounted" },
+          previous: state,
+          next: state,
+        });
+        if (teardown !== undefined) {
+          report({
+            _tag: "Command",
+            name,
+            instance,
+            cause: LIFECYCLE,
+            group: { tag: "Unmounted" },
+            command: summarizeCommand(teardown),
+            // Queued straight onto the dying mount's own queue above, so it
+            // always has a reader.
+            dropped: false,
+          });
+        }
+      }
+
+      // Reported *after* the marker is queued, so the `Error` handler's own
+      // compensating command lands behind `Teardown` rather than in front of
+      // it. Raised first, that command was interpreted by the main loop and
+      // then killed seconds later by teardown's interrupt sweep — while the
+      // identical command reached through a *dying teardown command* survived,
+      // because that one is queued after the sweep. Same recovery path, two
+      // outcomes, decided by which way the handler was reached.
+      if (thrown !== undefined) raiseDefect(thrown.error, "Unmounted", LIFECYCLE);
+
+      // `mount` deliberately stays pointed at these cells. The teardown chain
+      // is not necessarily one hop — a teardown command may emit an action
+      // whose handler returns another command — and all of it has to reach the
+      // fiber that still owns the scope. The fiber clears `mount` itself when
+      // it returns. A `start` before then (StrictMode does exactly that)
+      // replaces it, and the old fiber's guarded clear then leaves the new one
+      // alone.
+    },
+  };
+};
+
+/**
+ * The props check, and the reason `AnyPropsSchema` is a `Struct`.
+ *
+ * `onExcessProperty: "error"` is the whole point: TypeScript's excess-property
+ * check **does not fire through a spread**, so `<Cart {...config} />` with extra
+ * keys compiles by design, and this is the only layer that can see it.
+ * `errors: "all"` reports every problem at once rather than one per debugging
+ * round.
+ *
+ * It **throws**, per `define`: a malformed prop is the parent's defect, so it
+ * belongs in the nearest React error boundary. Reporting it to the `Error`
+ * handler would let the feature swallow its own caller's bug.
+ *
+ * Validated, never decoded — `NoTransform` guarantees `Encoded` equals `Type`,
+ * so this only ever checks and the returned value is discarded.
+ *
+ * Memoised per schema: building a parser walks the AST, and this runs on every
+ * props-identity change of every mount. The key is the schema object, so a
+ * blueprint's parser is built once for the life of the module.
+ */
+const propsValidators = new WeakMap<AnyPropsSchema, (props: unknown) => unknown>();
+
+const validateProps = (schema: AnyPropsSchema, props: unknown): void => {
+  let validate = propsValidators.get(schema);
+  if (validate === undefined) {
+    validate = SchemaParser.decodeUnknownSync(
+      // `AnyPropsSchema` is `Struct<Struct.Fields>`, and a generic field record
+      // widens `DecodingServices` to `unknown`. A props schema cannot have
+      // decoding services — `NoTransform` forces `Encoded` to equal `Type`, so
+      // there is nothing to decode and nothing to require — but the constraint
+      // has no way to see that from the erased field type.
+      schema as AnyPropsSchema & { readonly DecodingServices: never },
+      { onExcessProperty: "error", errors: "all" },
+    );
+    propsValidators.set(schema, validate);
+  }
+  validate(props);
+};
+
+/**
+ * Split the incoming object into the props the schema will see and the output
+ * handlers the runtime installed.
+ *
+ * By derived name, never by an `on*` prefix rule: a declared prop may legitimately
+ * be called `onScroll`, and `NoPropCollision` is what guarantees the two sets are
+ * disjoint so this can strip exactly the handler names and nothing else.
+ *
+ * `names` is that set, built once by the caller from `outputTags` rather than
+ * per render — the whole reason it arrives as a `ReadonlySet` and not a list.
+ */
+const splitOutputProps = (
+  all: Record<string, unknown>,
+  names: ReadonlySet<string>,
+): { props: Record<string, unknown>; handlers: Record<string, (payload: unknown) => void> } => {
+  if (names.size === 0) return { props: all, handlers: {} };
+  const props: Record<string, unknown> = {};
+  const handlers: Record<string, (payload: unknown) => void> = {};
+  for (const key of Object.keys(all)) {
+    if (names.has(key)) handlers[key] = all[key] as (payload: unknown) => void;
+    else props[key] = all[key];
+  }
+  return { props, handlers };
+};
+
+/**
+ * Whole-record, one level deep, own keys only — the shape `HookChanged`
+ * documents, and `Equivalence.Record` is already exactly it: it compares key
+ * counts, then `Object.hasOwn` plus the value equivalence per key.
+ *
+ * Reference equality *per hook value* rather than structural, and that is the
+ * right depth: a hook value is whatever the ecosystem hook returned — a query
+ * result, a subscription handle, a DOM node — with no schema and no guarantee
+ * it is even walkable. Deep-comparing one is unbounded work on a value the
+ * library does not own. A hook returning a fresh object every render is the
+ * caller's problem, and the same one a bad dependency array is.
+ *
+ * One instance for the whole module: it closes over nothing.
+ */
+const hooksEquivalence = Equivalence.Record(
+  Equivalence.strictEqual<unknown>(),
+) as Equivalence.Equivalence<AnyHooks>;
+
+/** Frozen, so an absent `useHooks` still has a stable `hooks` identity. */
+const noHooks: AnyHooks = Object.freeze({});
 
 /**
  * The runtime is a root provider, in the shape everyone knows from Redux and
@@ -1252,13 +2858,20 @@ export interface RuntimeOptions {
  * `component` is closed over the root's `R`, so building a feature that needs
  * a service the root does not provide is a compile error.
  *
- * Two gaps stay, both irreducible: a missing Provider is a *runtime* error,
- * because React cannot check ancestry statically; and StrictMode will build and
- * dispose the runtime twice in development.
+ * One gap stays, and it is irreducible: StrictMode will build and dispose the
+ * runtime twice in development.
+ *
+ * A missing `<Provider>` is *not* a gap, and this used to claim it was — that a
+ * feature rendered outside one failed at runtime, because React cannot check
+ * ancestry statically. It does not fail: the context is created with `runtime`
+ * itself as its default value, so a feature outside the Provider reads the same
+ * runtime and works. The Provider is what makes the boundary *visible* and what
+ * a future per-subtree runtime would hang off; it is not what supplies the
+ * services. The cost of that is the honest half of the old claim: a genuinely
+ * mis-parented subtree looks identical to a correctly parented one.
  */
-export declare const createRuntime: <RootR, RootE>(
+export const createRuntime: <RootR, RootE>(
   layer: Layer.Layer<RootR, RootE>,
-  options?: RuntimeOptions,
 ) => {
   readonly Provider: FC<{ readonly children?: ReactNode }>;
 
@@ -1312,4 +2925,177 @@ export declare const createRuntime: <RootR, RootE>(
    * services without being rewritten.
    */
   readonly useRuntime: () => ManagedRuntime.ManagedRuntime<RootR, RootE>;
+  // One parameter. Observation used to be a second one — a `RuntimeOptions`
+  // with an `onEvent` that nothing ever called — and it is now a service
+  // installed through `layer` itself: `Layer.mergeAll(AppLayer,
+  // consoleDevtoolsLayer())`. A `Context.Reference` is `Layer<never>`, so it
+  // moves neither `RootR` nor any `component(bp)` call, and being in the layer
+  // makes it swappable per environment the same way every other service is.
+  // See `devtools.specs.md`.
+} = (layer) => {
+  const runtime = ManagedRuntime.make(layer);
+  const context = createContext(runtime);
+
+  /**
+   * Written once, loosely typed, and cast at the assignment.
+   *
+   * The declared surface above is two overloads, and an arrow function assigned
+   * into an overloaded slot is checked against only the last signature — so
+   * annotating the implementation would either lose the no-layer overload or
+   * force a third signature nobody calls. The types callers see are the two
+   * above; this body is the single implementation behind them, and the cast is
+   * the standard one for that shape.
+   */
+  const component = (
+    blueprint: Blueprint<any, any, any, any, any, any>,
+    componentOptions: { readonly layer?: Layer.Layer<any, any, any>; readonly name?: string } = {},
+  ): FC<any> => {
+    // `initialState` is not read here — the store owns it, and reads it off the
+    // same slot. It stays on `BlueprintInternals` because the store needs it.
+    const { render, useHooks, props: propsSchema, outputTags } = blueprint[internals];
+    const name = componentOptions.name ?? "TeaFeature";
+
+    // Defaulted here rather than branched at the call site below: a conditional
+    // `useHooks?.(…)` is a conditionally-called hook as far as the lint is
+    // concerned, and the lint is the thing enforcing the invariant the slot
+    // depends on. Resolved once per blueprint, so the call is unconditional.
+    const useFeatureHooks: HookSpec<any, any, AnyHooks> = useHooks ?? (() => noHooks);
+
+    // Derived once per blueprint, not per render: the names are constant, and
+    // rebuilding the Set inside `splitOutputProps` cost one throwaway array
+    // plus Set on every parent-driven render of every mount — per row, for a
+    // feature used in a list.
+    const outputPropNames = new Set(outputTags.map((tag) => `on${tag}`));
+
+    // Once per blueprint. `toEquivalence` walks the AST, and `sync` runs on
+    // every render of every mount.
+    const equivalence = {
+      props: Schema.toEquivalence(propsSchema) as Equivalence.Equivalence<Record<string, unknown>>,
+      hooks: hooksEquivalence,
+    };
+
+    const Feature: FC<Record<string, unknown>> = (incoming) => {
+      const rootRuntime = useContext(context);
+
+      // Props identity is the only trigger, per `define`: a render driven by
+      // this feature's own state hands back the identical object, so neither
+      // the split nor the schema check runs on it.
+      const { props, handlers } = useMemo(
+        () => splitOutputProps(incoming, outputPropNames),
+        [incoming],
+      );
+      useMemo(() => validateProps(propsSchema, props), [props]);
+
+      // The store outlives any one render and the parent's callbacks do not, so
+      // it reads them through a ref rather than closing over the first ones.
+      //
+      // Written in an effect, not in the render body. A bare render-phase write
+      // has no commit-phase counterpart, so a render React discards still
+      // overwrites the ref — and an output emitted before the real render
+      // commits would then call a callback from a tree that never existed.
+      // Outputs arrive on command fibers, i.e. after commit, so the effect is
+      // early enough.
+      const handlersRef = useRef(handlers);
+      useEffect(() => {
+        handlersRef.current = handlers;
+      }, [handlers]);
+
+      // A defect with no `Error` handler is rethrown *during render*, which is
+      // the only place React's nearest error boundary can catch it — throwing
+      // from inside a fiber would reach nothing.
+      const [defect, setDefect] = useState<{ readonly error: unknown } | undefined>(undefined);
+      if (defect) throw defect.error;
+
+      // One store per mount. The initialiser runs once — StrictMode runs it
+      // twice in development, which is the second of the two documented gaps.
+      const [store] = useState(() =>
+        createFeatureStore({
+          blueprint,
+          props,
+          equivalence,
+          runtime: rootRuntime,
+          layer: componentOptions.layer,
+          emit: (output) => {
+            const handler = handlerFor(handlersRef.current, `on${output._tag}`);
+            if (!handler) {
+              throw new TypeError(`No "on${output._tag}" prop for output "${output._tag}"`);
+            }
+            const { _tag, ...payload } = output as Record<string, unknown> & { _tag: string };
+            handler(payload);
+          },
+          defect: (error) => setDefect({ error }),
+          // The same `name` that becomes `displayName`. One name for the
+          // component in React's tree and for the feature in the event stream,
+          // so a reader looking at both is looking at the same thing.
+          name,
+        }),
+      );
+
+      // Everything a command changed since the last render. Read directly
+      // rather than through `useSyncExternalStore`, because the subscription
+      // has to come *after* `sync` — see below.
+      const committed = store.getSnapshot();
+
+      // Render position, unconditionally, in declaration order — the invariant
+      // `HookSpec` describes and the reason the slot is one `use…` function.
+      //
+      // Reads `committed`, not the post-`sync` state, and that is the documented
+      // cycle rather than a bug: a hook whose own value drives a state change
+      // sees that change on the next render. Feeding it the post-fold state
+      // would need a second hook call to be consistent, which is a second
+      // subscription — the exact thing `HookSpec` refuses.
+      const hooks = useFeatureHooks(props, committed);
+
+      // In the body, not an effect. `sync` compares props and hooks by value,
+      // raises `PropsChanged` / `HookChanged`, and folds them — so a
+      // props-driven change paints on the render that carried the props
+      // instead of on the one after it. It mutates a store during render,
+      // which a discarded render would repeat; the value comparison is what
+      // makes the repeat a no-op. See `FeatureStore.sync`.
+      store.sync(props, hooks);
+
+      // **After `sync`, and that ordering is the whole point.**
+      //
+      // `useSyncExternalStore` re-reads `getSnapshot` when the render finishes
+      // and schedules another render if the value moved. Subscribing first and
+      // folding second is exactly the shape that trips it, and the render-body
+      // `sync` exists to avoid a second render, so the two were working against
+      // each other on paper. Folding first means both reads see the same state.
+      //
+      // **On paper**, and stated that way deliberately: the extra render was
+      // never reproduced. `getSnapshot` is a stable method and the pre-fold
+      // read equalled the previous render's snapshot, so React had nothing to
+      // compare unfavourably, and the browser test counts one render either
+      // way. This ordering is defensive, not a measured fix, and it ships
+      // without a test that would catch a revert — see `tea.specs.md`.
+      //
+      // Hook order is still stable: this is called unconditionally on every
+      // render, just later in the body.
+      const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
+
+      // `Mounted` stays in an effect: it is the one lifecycle action that must
+      // not fire for a render React throws away, since its command has side
+      // effects. `start`/`stop` rather than a single `dispose` is what lets the
+      // StrictMode remount re-arm the store instead of inheriting a closed
+      // scope — see `FeatureStore` for the full argument.
+      useEffect(() => {
+        store.start();
+        return () => store.stop();
+      }, [store]);
+
+      return render({ state, props, hooks, dispatch: store.dispatch });
+    };
+
+    Feature.displayName = name;
+    return Feature;
+  };
+
+  return {
+    // oxlint-disable-next-line react/no-children-prop
+    Provider: ({ children }) => createElement(context.Provider, { value: runtime, children }),
+
+    useRuntime: () => runtime,
+
+    component: component as never,
+  };
 };

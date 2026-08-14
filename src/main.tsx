@@ -1,5 +1,7 @@
-import { Effect, Layer, Schema } from "effect";
-import { Action, define } from "./lib";
+import { Layer, Schema } from "effect";
+import { createRoot } from "react-dom/client";
+import { StrictMode } from "react";
+import { Action, createRuntime, define } from "./lib";
 
 const Props = Schema.Struct({
   start: Schema.Number,
@@ -27,38 +29,28 @@ const reducer = CounterBlueprint.reducer({
   Decremented: (_action, { state, props }) => ({ count: state.count - props.step }),
 });
 
-const render = CounterBlueprint.render(() => <></>);
+const render = CounterBlueprint.render(({ state, dispatch }) => (
+  <main>
+    <h1>{state.count}</h1>
+    <button onClick={() => dispatch({ _tag: "Decremented" })}>−</button>
+    <button onClick={() => dispatch({ _tag: "Incremented" })}>+</button>
+  </main>
+));
 
-const counter = CounterBlueprint.create({
-  initialState,
-  reducer,
-  render,
-});
+const counter = CounterBlueprint.create({ initialState, reducer, render });
 
-console.log({ Counter: CounterBlueprint, created: counter });
+/**
+ * The root runtime. `Layer.empty` because this feature needs no services — the
+ * point of the entry point is to show what a leaf costs, which is one line.
+ */
+const { Provider, component } = createRuntime(Layer.empty);
 
-const props = { start: 0, step: 5 };
-const at = (count: number) => ({
-  state: { count },
-  props,
-  hooks: {},
-  initialState: { count: 0 },
-});
+const Counter = component(counter, { name: "Counter" });
 
-export const one = [counter.reduce({ _tag: "Incremented" }, at(10))];
-
-void Effect.runPromise(
-  counter.run(
-    [
-      { _tag: "Incremented" },
-      { _tag: "Incremented" },
-      { _tag: "Incremented" },
-      { _tag: "Incremented" },
-    ],
-    {
-      props: { start: 0, step: 5 },
-      hooks: {},
-      layer: Layer.empty,
-    },
-  ),
-).then(console.log);
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <Provider>
+      <Counter start={0} step={1} />
+    </Provider>
+  </StrictMode>,
+);

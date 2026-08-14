@@ -28,7 +28,8 @@
 
 import { useState, type ReactNode } from "react";
 import { Context, Effect, Layer, Schema, Stream, Struct } from "effect";
-import { Action, Command, createRuntime, define, Output } from "../lib/tea";
+import { consoleDevtoolsLayer } from "../lib/devtools";
+import { Action, Command, createRuntime, define } from "../lib/tea";
 
 // --- domain (unchanged) -------------------------------------------------------
 
@@ -149,14 +150,18 @@ const CartActions = Action.of([
  * key set, so writing one is a compile error rather than a handler that silently
  * never fires.
  *
- * `Output` is `Action` with the other phantom on it, and that phantom is
- * the whole difference. Listing `OrderPlaced` in `Action.of([…])` is a type error,
- * and so is passing `CartOutputs` to `actions` — which is what the earlier
- * `action` / `output` pair only *looked* like it was doing.
+ * `Action.output` is `Action` with the other phantom on it, and that phantom is
+ * the whole difference. Mixing `OrderPlaced` into the `Action.of([…])` that
+ * builds `CartActions` is a type error, and so is passing `CartOutputs` to
+ * `action` — which is what the earlier `action` / `output` pair only *looked*
+ * like it was doing.
+ *
+ * `.of` is shared rather than per-channel: the members carry the brand, so it
+ * reads the channel back off them instead of being told twice.
  */
-const OrderPlaced = Output("OrderPlaced", { orderId: Schema.String });
+const OrderPlaced = Action.output("OrderPlaced", { orderId: Schema.String });
 
-const CartOutputs = Output.of([OrderPlaced]);
+const CartOutputs = Action.of([OrderPlaced]);
 
 // --- the interface, in one place ----------------------------------------------
 
@@ -197,12 +202,9 @@ export const initialState = Cart.initialState(() => ({
 export const reducer = Cart.reducer({
   Mounted: (_action, { props, state }) => [
     state,
-    Command.stream(
-      Stream.fromEffect(
-        Effect.map(
-          Effect.flatMap(CartApi, (api) => api.restore(props.customerId)),
-          (lines) => ({ _tag: "LinesRestored" as const, lines }),
-        ),
+    Command.effect((dispatch) =>
+      Effect.flatMap(CartApi, (api) => api.restore(props.customerId)).pipe(
+        Effect.flatMap((lines) => dispatch({ _tag: "LinesRestored" as const, lines })),
       ),
     ),
   ],
@@ -221,21 +223,19 @@ export const reducer = Cart.reducer({
     hooks.online
       ? [
           state,
-          Command.stream(
-            Stream.fromEffect(
-              Effect.match(
-                Effect.flatMap(CartApi, (api) => api.redeem(action.code)),
-                {
-                  onFailure: (error) => ({
-                    _tag: "Failed",
-                    reason: `Coupon ${error.code} was rejected.`,
-                  }),
-                  onSuccess: (discount) => ({
-                    _tag: "CouponAccepted",
-                    discount,
-                  }),
-                },
-              ),
+          Command.effect((dispatch) =>
+            Effect.flatMap(CartApi, (api) => api.redeem(action.code)).pipe(
+              Effect.match({
+                onFailure: (error) => ({
+                  _tag: "Failed" as const,
+                  reason: `Coupon ${error.code} was rejected.`,
+                }),
+                onSuccess: (discount) => ({
+                  _tag: "CouponAccepted" as const,
+                  discount,
+                }),
+              }),
+              Effect.flatMap(dispatch),
             ),
           ),
         ]
@@ -245,14 +245,19 @@ export const reducer = Cart.reducer({
 
   CheckoutRequested: (_action, { state, props }) => [
     { ...state, checkout: "reserving" as const, error: null },
-    Command.stream(
-      Stream.flatMap(Stream.fromEffect(CartApi), (api) =>
-        api.checkout(props.customerId, state.lines),
-      ).pipe(
-        Stream.map(progressToAction),
-        Stream.catchTag("CheckoutFailed", (error) =>
-          Stream.succeed({ _tag: "Failed" as const, reason: error.reason }),
+    // A multi-step source, so the whole `Stream` vocabulary is still what
+    // expresses it — one call further in, with `dispatch` as the sink.
+    Command.effect((dispatch) =>
+      Stream.runForEach(
+        Stream.flatMap(Stream.fromEffect(CartApi), (api) =>
+          api.checkout(props.customerId, state.lines),
+        ).pipe(
+          Stream.map(progressToAction),
+          Stream.catchTag("CheckoutFailed", (error) =>
+            Stream.succeed({ _tag: "Failed" as const, reason: error.reason }),
+          ),
         ),
+        dispatch,
       ),
     ),
   ],
@@ -271,7 +276,9 @@ export const reducer = Cart.reducer({
    */
   CheckoutCompleted: (action, { state }) => [
     { ...state, checkout: "idle" as const },
-    Command.stream(Stream.succeed({ _tag: "OrderPlaced" as const, orderId: action.orderId })),
+    Command.effect((dispatch) =>
+      dispatch({ _tag: "OrderPlaced" as const, orderId: action.orderId }),
+    ),
   ],
 
   Failed: (action, { state }) => ({
@@ -297,7 +304,7 @@ export const reducer = Cart.reducer({
 
   Unmounted: (_action, { state, props }) => [
     state,
-    Command.effect(Effect.flatMap(CartApi, (api) => api.release(props.customerId))),
+    Command.effect(() => Effect.flatMap(CartApi, (api) => api.release(props.customerId))),
   ],
 });
 
@@ -363,13 +370,9 @@ export type CartOutput = typeof CartOutputs.Type;
 
 declare const AppLayer: Layer.Layer<CartApi>;
 
-const { Provider, component } = createRuntime(AppLayer, {
-  onEvent: (event) => {
-    if (import.meta.env.DEV) {
-      console.debug(`[${event.name}#${event.instance}]`, event.cause, event.action);
-    }
-  },
-});
+const { Provider, component } = createRuntime(
+  Layer.mergeAll(AppLayer, import.meta.env.DEV ? consoleDevtoolsLayer() : Layer.empty),
+);
 
 export const Cart_ = component(cart, { name: "cart" });
 

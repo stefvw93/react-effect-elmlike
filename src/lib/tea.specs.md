@@ -1,0 +1,441 @@
+# tea.ts — TEA-style feature runtime core
+
+## Overview & Purpose
+
+A feature is declared as a **blueprint**: schema-typed props and state, a tagged
+action vocabulary, an optional outbound output vocabulary, optional ambient
+hooks, and a reducer. The reducer is pure — it returns the next state and,
+optionally, a `Command` describing work to do. The runtime interprets commands
+as Effects.
+
+Three consumers, one core:
+
+- `blueprint.reduce(action, snapshot)` — the reducer as one pure function. No
+  React, no Effect runtime.
+- `blueprint.run(actions, options)` — folds a sequence to quiescence and reports
+  what was emitted. No React.
+- `component(blueprint)` — the React binding, over `createFeatureStore`.
+
+`reduce`, `run` and the store share one command interpreter. Two
+implementations of grouping and cancellation would have to agree forever.
+
+## The command model
+
+A `Command` is a small ADT. The leaf is an `Effect`; everything Effect can
+already express is left to Effect.
+
+```ts
+type Command<A, R> =
+  | { _tag: "None" }
+  | { _tag: "Effect"; effect: (dispatch: Dispatcher<A>) => Effect<unknown, never, R> }
+  | { _tag: "Keyed"; key: string; command: Command<A, R> }
+  | { _tag: "Batch"; commands: ReadonlyArray<Command<A, R>> }
+  | { _tag: "Cancel"; target: Group };
+
+// `Dispatcher`, not `Dispatch`: the latter is the React-facing dispatch handed
+// to `render`, which returns void because it is called from an event handler.
+type Dispatcher<A> = (action: A) => Effect<void>;
+type Group = { tag: string; key?: string };
+```
+
+**Concurrency is userland.** Debounce, throttle, switch-to-latest, run-at-most-N
+— all of them are Effect combinators the handler writes inside its own effect.
+The runtime has no policy vocabulary, because Effect already has one and a
+second one written as data can only be a worse copy.
+
+**What the runtime does own** is the one thing a handler cannot do for itself:
+naming a running fiber so that a _different_ action's handler can interrupt it.
+That is `Keyed` + `Cancel`, and it is the whole supervisor.
+
+`Batch` sequences commands. After the leaf change its one irreplaceable job is
+putting a `Cancel` before the command that replaces it — the cancel has to run
+before the new fiber is registered, and nothing inside that fiber can do it.
+Composing two _effects_ is `Effect.all`, not `Batch`.
+
+```ts
+// restart-on-keystroke, written where the reader can see the interrupt
+TextEdited: (action, { state }) => [
+  { ...state, text: action.text, pending: true },
+  Command.batch(
+    Command.cancel({ tag: "TextEdited", key: "query" }),
+    Command.keyed(
+      "query",
+      Command.effect((dispatch) =>
+        Effect.sleep("300 millis").pipe(
+          Effect.andThen(search(action.text)),
+          Effect.flatMap((hits) => dispatch({ _tag: "HitsArrived", hits })),
+        ),
+      ),
+    ),
+  ),
+];
+
+// two effects, one fiber
+Added: (action, { state }) => [
+  next,
+  Command.effect(() => Effect.all([persist(next), track(action)])),
+];
+
+// a long-lived subscription
+Mounted: (_action, { props, state }) => [
+  { ...state, connected: true },
+  Command.effect((dispatch) =>
+    Stream.runForEach(presenceEvents(props.roomId), (event) => dispatch(toAction(event))),
+  ),
+];
+```
+
+## Acceptance Criteria
+
+`[x]` holds today. The command-leaf pass landed, and what it did not do is in
+Open work and Deferred decisions rather than left as an unchecked criterion
+here. Every box is checked again: the devtools pass closed the last two, and
+its own criteria live in `devtools.specs.md`.
+
+### Vocabularies (`Action`, `Action.output`, `Action.of`)
+
+- [x] `Action("Tag", fields)` / `Action.output("Tag", fields)` constructs a `Schema.TaggedStruct` branded with its channel (`"internal"` vs `"outbound"`).
+- [x] `Action.of([...])` builds a branded tagged union exposing `cases`, `guards`, `match`, `mapMembers`, and a `make` per case.
+- [x] `Action.of` infers the channel from its members' brand; there is no per-channel `of`.
+- [x] `Action.of` rejects a member list mixing channels, at the call rather than at `define`.
+- [x] A vocabulary built with `.of` nests inside another `.of`, and the outer `cases` include the flattened inner tags.
+- [x] The channels are not mutually assignable in either direction.
+- [x] A reserved `LifecycleTag` (`Mounted`/`PropsChanged`/`Error`/`Unmounted`/`HookChanged`) as a message tag is a compile error.
+
+### `Command`
+
+- [x] `Command.none` is the `{ _tag: "None" }` no-op.
+- [x] `Command.effect((dispatch) => Effect<unknown, never, R>)` is the only leaf. A command that emits nothing ignores the parameter.
+- [x] `Command.stream` and the `Stream` variant are removed. A long-lived source is `Stream.runForEach(source, dispatch)` inside the effect, so the whole `Stream` vocabulary stays available one call earlier.
+- [x] `Command.keyed(key, command)` names the fiber a command forks, so `Cancel` can address it. Also curried (`Command.keyed(key)`) and so pipeable. An unkeyed command is addressable by tag alone.
+- [x] `Command.restart`, `Command.ignore`, `Command.queue`, the `Policy` type and the `Guarded` node are removed.
+- [x] `Command.batch(...commands)` interprets its members in order under one context. With no policy there is no supersession question and nothing to decide.
+- [x] `Command.cancel(target)` interrupts by tag alone (prefix match, every key under it) or by `{ tag, key }` (exact).
+- [x] `Command.output(message, payload)` emits an outbound message; passing an internal message is a compile error. _Re-expressed on the new leaf internally; signature unchanged. Removing it is deferred — see Deferred decisions._
+- [x] Commands are `Pipeable`, and piping preserves `A` and `R`.
+
+### `Next` accessors
+
+- [x] `Next.state(next)` returns the state whether `next` is a bare state or a `[state, command]` tuple.
+- [x] `Next.command(next)` returns the command for a tuple, `undefined` for a bare state.
+
+### `Blueprint.reduce`
+
+- [x] Dispatches by `_tag` to the matching handler (declared or lifecycle) and returns its `Next`.
+- [x] An unhandled _lifecycle_ action leaves state unchanged and does not throw.
+- [x] A missing handler for anything that is not a lifecycle tag throws — reachable only by bypassing the typed surface.
+- [x] Every tag-keyed lookup uses `Object.hasOwn`, so `constructor`/`toString` and the rest of `Object.prototype` cannot pose as handlers, lifecycle tags, or declared outputs.
+- [x] `Unmounted`'s handler runs but its returned state is discarded — only its command matters. `reduce` and `run` agree on this.
+
+### `Blueprint.run`
+
+- [x] Seeded actions are processed but are not recorded in `emitted`.
+- [x] Actions a command emits feed back into the reducer loop; `emitted` collects them.
+- [x] `outputs` collects messages whose tag is a declared output; an output never re-enters the reducer.
+- [x] `Command.cancel({ tag })` interrupts every group under that tag; `Command.cancel({ tag, key })` interrupts only that group.
+- [x] `Command.batch` members run in order, sharing the issuing action's group.
+- [x] Services a command requests (`R`) are satisfied from `options.layer`.
+- [x] `run` resolves only at quiescence: nothing queued, nothing in flight — including fibers that settle without emitting.
+- [x] **`run` does not terminate on a never-completing command**, and its test asserts that deliberately. See Known limitations.
+
+### React binding (`createRuntime` → `component`)
+
+- [x] `Blueprint` carries its internals behind a module-private `unique symbol`; `reduce` and `run` remain the entire public surface.
+- [x] `component(blueprint)` renders `render({ state, props, hooks, dispatch })` and re-renders when a command changes state.
+- [x] Incoming props are split by derived name (`outputTags.map(t => "on" + t)`), so a declared prop merely starting with `on` is left alone.
+- [x] `validateProps` runs the schema with `onExcessProperty: "error"` and **throws** — a malformed prop is the parent's defect and belongs at the error boundary. It runs on mount and on props-identity change, not on a state-driven re-render.
+- [x] An output leaves through its `on<Tag>` prop with `_tag` stripped and never re-enters the reducer; a missing handler throws to the boundary rather than into this feature's `Error` handler.
+- [x] `dispatch` accepts only declared actions and is reference-stable for the life of the mount.
+- [x] Lifecycle order: `Mounted` once per mount, then `PropsChanged`/`HookChanged` as ambient inputs change, then `Unmounted` at teardown. _With one uncovered window: a props change landing between the first render and the mount effect buffers its command ahead of `Mounted`'s. See open work #5._
+- [x] `PropsChanged`/`HookChanged` are detected **by value** — props via `Schema.toEquivalence`, hooks via `Equivalence.Record(Equivalence.strictEqual())`.
+- [x] `store.sync` folds during render, so a props-driven change paints on the render that carried the props. Moving the fold into an effect is **deferred** — see Deferred decisions.
+- [x] `store.sync` is idempotent: called twice with equivalent props and hooks it raises nothing the second time, so a discarded render costs nothing.
+- [x] A defect from a command, or a feature `layer` that fails to build, reaches the `Error` handler; with none declared it is rethrown during render, the only place a boundary can catch it.
+- [x] Services come from the root `ManagedRuntime`; `component(bp, { layer })` satisfies the residue `Exclude<R, RootR>`.
+- [x] `createRuntime` takes **one** parameter. `RuntimeOptions` and its unwired `onEvent` are removed; observation is a service installed through the root layer instead. Spec'd in `devtools.specs.md`.
+- [x] The store reports transitions, commands issued, outputs emitted and defects to a synchronously-resolved `Devtools` sink, and allocates nothing at those sites when no sink is installed. Emission points are listed in `devtools.specs.md`.
+
+### Type-level (TSTyche)
+
+- [x] `Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/`Excess`, `ServiceOf`/`ServicesOf` reject what they document and accept what they document.
+- [x] `Command<Narrow>` stays assignable to `Command<Wide>` under the callback leaf, and `Command.none: Command<never>` stays the bottom. `Dispatcher<A>` is contravariant in `A` and sits in a parameter position — contravariant again — so the two compose to covariant. **The existing covariance test passes unchanged.**
+- [x] `Command.effect` carries `R` out of the effect it is handed. `A` has no inference site of its own, so it defaults to `never`: a command that emits nothing is `Command<never, R>` and fits every slot. Passing a bare `Effect` — the pre-redesign shape — no longer compiles, and neither does an effect with an open error channel.
+- [x] Inside a handler, `dispatch` is typed by the feature's own vocabulary: `A` arrives from the contextual type of the handler's return. An undeclared tag and a declared tag with the wrong payload are both compile errors.
+- [x] `Command.keyed` preserves `A` and `R`, through `.pipe`, applied directly, and nested. The key is a required string.
+- [x] `Command.batch` preserves `A` and `R`, and a `Command<never>` member — the `Cancel` the variant exists to sequence — does not collapse the batch to `never`.
+- [x] `Command.cancel` is `Command<never>` and addresses `"Tag"` or `{ tag, key }`; a keyed-only target is a compile error.
+- [x] `restart`/`ignore`/`queue`/`stream` are absent from the constructor set, and the `Stream` and `Guarded` variants are absent from the ADT.
+
+**How `A` reaches the leaf.** `A` appears only inside `Dispatcher<A>`, in a
+parameter position, so nothing in the argument can infer it — it is resolved from
+the contextual type of the call, which the reducer's return type supplies through
+`create`'s `U extends Reducer<…>` constraint. Written standalone, with no
+contextual type, `A` falls back to `never` and `dispatch` accepts nothing; the
+call site names it (`Command.effect<Action>(…)`). The spec's examples rely on the
+contextual path, and a type test compiles each of them to say so.
+
+Two consequences the surface had to absorb, both found by compiling the example
+above rather than by reasoning about it:
+
+- **`Command.cancel` is generic in `A`, defaulting to `never`.** A concrete
+  `Command<never>` argument is an inference source at higher priority than the
+  contextual return type, so a cancel written _first_ in a batch — which is the
+  only position it is ever written in, because sequencing it first is the node's
+  whole purpose — fixed the batch's `A` to `never` before the sibling leaf was
+  checked, and `dispatch` accepted nothing. Generic-with-a-default, the cancel
+  adopts the batch's `A` instead of pinning it, and standalone it is still
+  `Command<never>`.
+- **`Command.keyed` takes `(key, command)` as well as `(key)`.** A `.pipe`
+  receiver is checked before `.pipe`'s own contextual type exists, so
+  `Command.effect((dispatch) => …).pipe(Command.keyed("q"))` severs the
+  contextual path no matter what — a TypeScript rule about receivers, not
+  something this surface can fix. The two-argument form puts the leaf in an
+  argument position, where the contextual type reaches it. Piping still
+  type-preserves and is still the right form for a command whose `A` is already
+  fixed; it just cannot _carry_ inference.
+
+Consequence for the tests: `expect(fn).type.toBeCallableWith(arg)` types `arg` on
+its own, without the contextual type of the signature under test, so every
+context-sensitive callback inside one collapses to `never`. Assertions about
+contextual inference are therefore written as direct calls plus
+`@ts-expect-error`, not as that matcher — otherwise they measure the matcher.
+
+### Browser coverage (`/e2e`)
+
+`src/lib/tea.browser.test.tsx` covers the React binding: that a blueprint paints,
+that a real click repaints, that an output crosses into a parent's `on<Tag>`
+prop. Nothing in the leaf change alters any of that, and it still passes
+unchanged — which is the point of running it.
+
+`src/examples/search.browser.test.tsx` is the leaf change's own browser test, and
+search is the right demo for it: the debounce is only meaningful against real
+typing, where each keystroke is a separate event and the interrupt lands between
+them. It asserts through a counting fake service that four keystrokes inside one
+window send exactly one query — the behaviour the `"restart"` policy used to
+provide and a `Cancel` ahead of a `keyed` leaf now does.
+
+- e2e: not applicable for `src/examples/cart.tsx` and `src/examples/presence.tsx`
+  — **neither can be mounted in any environment.** Both declare their ambient
+  hooks (`useCatalog`, `useOnlineStatus`, `usePageVisible`) with `declare
+function` and no implementation, deliberately: they are illustrations of the
+  boundary, not runnable demos, and `main.tsx` never mounts them. The `declare`s
+  are module-private, so a test cannot inject past them either. Their commands
+  are covered headlessly instead — `cart.tsx` ships
+  `checkoutAnnouncesTheOrder`, a `blueprint.run` assertion, as its own
+  documented test story. Making them mountable means writing demo behaviour that
+  does not exist today, which is a change to what the examples _say_, not a
+  migration of how they say it.
+
+## Technical Requirements
+
+- Effect 4 beta, one pinned version.
+- The fold is synchronous; only commands are Effects. A re-entrancy guard
+  serialises folds — a command emitting on the forking stack would otherwise
+  re-enter mid-write and have the outer fold write stale state on the way out.
+- The store **object** (state cell, subscribers, pending queue) lives as long as
+  the component instance; its **Effect scope** is opened by the mount effect and
+  closed by that effect's cleanup. StrictMode forces the split: a store created
+  in `useState` survives a simulated unmount, so a single `dispose()` would leave
+  the remounted component holding a closed scope.
+- The command queue, group map and in-flight counter are **per mount**, not per
+  store, so a stale fiber can only take from a queue nobody offers to again.
+- A command's emissions route back to the mount whose command emitted them, not
+  to whichever mount is currently installed.
+- Feature layers are built per mount and released with it. Anything that must
+  survive a mount belongs in the root layer.
+- Teardown runs in-band, on the fiber that owns the scope, with the feature's own
+  services still alive — then the scope closes. Bounded as a whole; an abandoned
+  teardown is reported as a defect rather than silently closing.
+
+## Expected Behavior & Edge Cases
+
+- `Mounted` fires once **per effect cycle** — twice in StrictMode dev. Latching
+  it to once per store object was rejected: it hides non-idempotent `Mounted`
+  handlers that will misbehave under Suspense and offscreen remounts.
+- Interruption is how commands normally end (`Cancel`, unmount), so it is never
+  reported as a defect. Only a genuine failure is.
+- A command that dies is reported via the interpreter's exit hook. It forks and
+  returns, so a dying child propagates to nobody — without the hook every runtime
+  defect from a command vanishes silently.
+- A command dropped after the component is gone is dropped **silently**. Reporting
+  it was tried and reverted: `component`'s defect sink throws to the error
+  boundary, so it replaced a feature's recovery UI with a crash on exactly the
+  failure its `Error` handler existed to handle.
+- Unmount interrupts in-flight work **before** running the `Unmounted` command.
+  Flush-on-exit therefore belongs in the `Unmounted` handler. See open work #2.
+
+## Known limitations
+
+- **`run` cannot terminate while a never-completing command is in flight.**
+  `Command.effect((d) => Effect.never)` pins the in-flight count exactly as
+  `Command.stream(Stream.never)` did, so the leaf change does not fix this. The
+  fix is the `Cmd`/`Sub` split — see Deferred decisions. Its test asserts today's
+  behaviour on purpose; whoever fixes it inverts that test rather than deleting
+  it.
+- **An action a parent takes in response to a child's output is not attributable
+  to that output.** An output leaves through a plain React callback into
+  arbitrary user code, so the runtime cannot know what the parent did next. The
+  devtools event stream therefore carries an `Output` event and a `Dispatch`
+  cause on whatever the parent dispatched, and never claims an edge between
+  them — a devtools UI can draw that edge, the runtime cannot assert it. This is
+  the residue of the old `cause: { _tag: "Output" }` variant, which was deleted
+  rather than left as an unfillable optional field. See `devtools.specs.md`.
+
+## Open work
+
+Five items. Item 3 now has its decision and its own spec; the other four each
+still need a decision before they need code. Items 4 and 5 were
+found by the review of the command-leaf pass and **rejected for that pass**: both
+are byte-identical at the commit before it, so neither is a regression the leaf
+change introduced, and both need a decision about intended behaviour rather than
+a patch.
+
+### 1. Re-arming a mount that died, from `component`
+
+A feature layer that fails to build kills the mount fiber. The store clears its
+mount and arm flag, so a following `start()` _can_ build fresh cells — but
+`component` arms with `useEffect(() => { store.start(); return () => store.stop(); }, [store])`
+and `store` never changes, so nothing calls one. Every command after that is
+dropped for the life of the component, including the Retry the `Error` handler
+just rendered. A driver holding the store recovers; a React subtree does not.
+
+Candidates: a store-bumped `version` as a dep of the arming effect (simple, but
+a permanently failing layer retries forever), or a demand-driven re-arm inside
+the queue-offer path (fires only when work arrives, but re-enters `fold` from
+inside a fold, so the guard has to be shown to hold).
+
+Must not break: the silent drop after a _normal_ unmount. Done when a browser
+test drives a failing layer, clicks Retry, and the retried command runs — plus a
+test that a permanently failing layer does not spin.
+
+### 2. What unmount owes work already in flight
+
+Teardown interrupts every in-flight fiber before interpreting the `Unmounted`
+command, unconditionally, so `start(); dispatch(Go); stop()` loses a 50ms effect
+roughly 0ms in. The sweep is what makes teardown terminate at all — a
+subscription never completes — so the question is not whether to sweep but which
+work the sweep may kill.
+
+Candidates: sweep only long-lived work once the `Cmd`/`Sub` split lands; or give
+in-flight work a grace window inside the existing teardown budget; or keep the
+sweep and document that flush-on-exit belongs in `Unmounted`, which is the
+current de-facto answer.
+
+Must not break: teardown termination, and the teardown bound staying a
+whole-teardown bound rather than a per-hop one.
+
+### 3. `RuntimeOptions.onEvent` is accepted and ignored — **closed**
+
+`createRuntime` never emitted a `DevtoolsEvent`, but `src/examples/app.tsx` and
+`cart.tsx` presented it as working, so a reader copying the example installed an
+observer that never fired and got no signal.
+
+Closed by the third option — wire it, as a feature. `RuntimeOptions` and the
+second parameter are **removed outright**; observation is a `Context.Reference`
+sink installed through the root layer, resolved synchronously because the fold
+is synchronous. `src/lib/devtools.ts`, spec'd in `src/lib/devtools.specs.md`.
+The number is kept rather than the item deleted, so the cross-references to
+items #2, #4 and #5 elsewhere in this file keep meaning what they say.
+
+Two things it did **not** close, both recorded under Known limitations in
+`devtools.specs.md` rather than here: nothing is reported before `start()`
+(the root context does not exist until the first `runFork`), and a mount whose
+fiber _died_ emits no `Unmounted` — which is item #1's to fix, since the same
+`release()` is why the store cannot re-arm from `component` either.
+
+### 4. `Blueprint.run` discards a dying command
+
+`commandInterpreter`'s `onExit` is optional, and `run` is the caller that omits
+it. `forkLeaf` forks and returns, so nothing awaits the fiber: a feature whose
+command dies comes back from `run` with the state it already had, an empty
+`emitted`, and no failure. Confirmed by running it —
+`Bump: () => [state, Command.effect(() => Effect.die(new Error("kaboom")))]`
+resolves clean. `createFeatureStore` passes the hook and routes a non-interrupt
+exit to the `Error` handler, so the two callers of the one interpreter disagree
+about the one thing the hook exists for, and the interpreter's own JSDoc says
+that without it "every defect from a command is discarded silently".
+
+The consequence is worse than a missing report: `run` is the spec's headless way
+to test a feature, so _"given a failing command, this feature recovers"_ is
+currently untestable through it — a test written that way passes vacuously.
+
+The decision it needs first: what `run` should _do_ with a defect. Route it to
+the `Error` handler, matching the store, and a feature that handles it looks
+identical either way from the outside. Fail the returned Effect, and a test can
+assert on it, but `run` stops being total and every existing caller's type
+changes. Collect into a `defects` array beside `emitted` and `outputs`, and it
+stays total and stays assertable, at the cost of a third output nobody asked for
+yet. The third is the current favourite; none is a patch.
+
+### 5. Buffered work can precede `Mounted`
+
+`start()` flushes `buffered` into the queue before folding `Mounted`. `sync`
+runs in the render body while `start` runs in a passive effect, so a props
+change between the first render and the mount effect folds `PropsChanged`
+first — its command is buffered, and the flush puts it ahead of `Mounted`'s.
+Confirmed: `sync({p:1}); sync({p:2}); start()` logs `["props-cmd", "mounted-cmd"]`.
+
+This contradicts the lifecycle-order criterion above, which is marked `[x]` and
+says `Mounted` comes first. The criterion is what is wrong — it describes the
+intent, and the intent is right; the code has a window it does not cover. A
+`Mounted` handler seeding state that a `PropsChanged` command depends on sees
+them inverted.
+
+Not independent of the deferred `store.sync` work: the window exists _because_
+`sync` folds during render while `start` runs in an effect. Moving the fold into
+an effect closes it as a side effect, which is an argument for doing that piece
+properly rather than special-casing the ordering here.
+
+## Deferred decisions
+
+### One `dispatch`, routed by tag — no `Command.output`
+
+`Command.output` and its compile-error-on-an-internal-message criterion are
+removed, and outbound messages go through the same `dispatch`, routed by `_tag`
+against the declared output cases — which is already how routing works and
+already own-keys checked. The channel brand keeps its declaration-time jobs
+(`ChannelOf`, `SameChannel`, `Disjoint`, `OutputProps`); it stops being checked
+at the command call site, where it never affected routing anyway.
+
+**Deferred** to keep the leaf pass to one blast radius. It touches every example's
+props and the brand's call-site role; the leaf change does not.
+
+### `store.sync` folding during render
+
+`sync` compares props and hooks by value and, when either moved, folds
+`PropsChanged` / `HookChanged` **in the render body**. That is a store mutation
+during render, which a discarded render repeats — the value comparison is what
+makes the repeat a no-op, and the reason the idempotence criterion above exists.
+The alternative is `sync` reporting only _whether_ ambient inputs moved and
+`component` folding in an effect, which costs a render: the change would paint on
+the render after the one that carried the props.
+
+**Deferred**, and not merely unscheduled. Two reasons. The blast radius is not
+this pass's: it moves state into `component`, both browser tests and every
+example's render timing, on top of a leaf migration whose own scope was already
+trimmed for the same reason (see `Command.output`, below). And the one-line
+statement of it is not implementable as written — it says the fold moves to an
+effect but not whether the _comparison baseline_ moves with it, and the baseline
+advance is itself a render-phase mutation, so leaving it behind fixes nothing.
+It needs its own `/spec` pass rather than a box on this one.
+
+This supersedes old open item #5 ("the `useSyncExternalStore`-after-`sync`
+ordering has no discriminating test"), which the previous spec rewrite promoted
+into an acceptance criterion. The untested-ordering observation stands and is
+recorded there; the redesign it proposed is what is deferred here.
+
+### Subscriptions split from commands (`Cmd` / `Sub`)
+
+Elm's runtime asks the feature for its subscriptions on every update and
+diffs them: a subscription is a _declaration_, and stopping one means no longer
+declaring it. Commands are one-shot; subscriptions are a set the runtime
+maintains.
+
+Collapsing both into `Command` is what makes `run`'s non-termination
+unfixable — the runtime cannot tell "work that will finish" from "work that is
+supposed to run forever", so quiescence cannot be defined. It also makes unmount
+guess (open work #2).
+
+**Deferred** because it is a second ADT, a diffing step, and a second lifecycle
+hook, and it should land against the `Effect` leaf rather than at the same time
+as it.

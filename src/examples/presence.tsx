@@ -114,13 +114,16 @@ export const presence = Presence.create({
     // One command, one scope, many actions, for as long as the component lives.
     Mounted: (_action, { props, state }) => [
       { ...state, connected: true },
-      Command.stream(
-        Stream.callback<PresenceAction, never, PresenceSocket | Scope.Scope>((queue) =>
-          Effect.flatMap(PresenceSocket, (socket) =>
-            socket.join(props.roomId, (event) => {
-              Queue.offerUnsafe(queue, eventToAction(event));
-            }),
+      Command.effect((dispatch) =>
+        Stream.runForEach(
+          Stream.callback<PresenceAction, never, PresenceSocket | Scope.Scope>((queue) =>
+            Effect.flatMap(PresenceSocket, (socket) =>
+              socket.join(props.roomId, (event) => {
+                Queue.offerUnsafe(queue, eventToAction(event));
+              }),
+            ),
           ),
+          dispatch,
         ),
       ),
     ],
@@ -158,8 +161,8 @@ export const presence = Presence.create({
         ? state
         : [
             state,
-            Command.stream(
-              Stream.succeed({ _tag: "VisibilityChanged" as const, visible: hooks.visible }),
+            Command.effect((dispatch) =>
+              dispatch({ _tag: "VisibilityChanged" as const, visible: hooks.visible }),
             ),
           ],
 
@@ -168,7 +171,7 @@ export const presence = Presence.create({
     // nowhere; the command is the whole point.
     Unmounted: (_action, { state, props }) => [
       state,
-      Command.effect(
+      Command.effect(() =>
         Effect.flatMap(PresenceSocket, (socket) => socket.announceLeave(props.roomId)),
       ),
     ],

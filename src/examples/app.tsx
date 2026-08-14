@@ -11,6 +11,7 @@
 
 import { useState, type ReactNode } from "react";
 import { Context, Effect, Layer } from "effect";
+import { consoleDevtoolsLayer } from "../lib/devtools";
 import { createRuntime } from "../lib/tea";
 import { cart, CartApi } from "./cart";
 import { counter } from "./counter";
@@ -36,20 +37,19 @@ declare const PresenceLayer: Layer.Layer<PresenceSocket, never, Sockets>;
 
 // --- the root ---------------------------------------------------------------
 
-const events: Array<unknown> = [];
-
-export const { Provider, component, useRuntime } = createRuntime(AppLayer, {
-  // Every state change in every feature, in order. Everything on the event is a
-  // schema, so this is the hook a devtools transport or a replay log would
-  // attach to — and `instance` plus `cause` are what make it a graph rather than
-  // a flat list once several features are mounted at once.
-  onEvent: (event) => {
-    events.push(event);
-    if (import.meta.env.DEV) {
-      console.debug(`[${event.name}#${event.instance}]`, event.cause, event.action);
-    }
-  },
-});
+/**
+ * Every transition, command, output and defect in every mounted feature, in
+ * order, as an RTK-style console log. It is a service in the root layer rather
+ * than an option on the runtime, so swapping the console for a `postMessage`
+ * transport or a test recorder is a one-line change here and nothing else.
+ *
+ * Both branches are `Layer<never>`, so merging it moves neither the root's `R`
+ * nor any `component(bp)` call below — and in a production build the ternary is
+ * the only thing left of it.
+ */
+export const { Provider, component, useRuntime } = createRuntime(
+  Layer.mergeAll(AppLayer, import.meta.env.DEV ? consoleDevtoolsLayer() : Layer.empty),
+);
 
 // --- components -------------------------------------------------------------
 
