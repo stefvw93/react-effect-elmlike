@@ -26,21 +26,24 @@ pure function, and `cart.run(actions, options)` folds a sequence and reports wha
 was emitted — both without React.
 
 Props are schema values, validated and never decoded. `children` is the one that
-cannot be: `Children` declares it as an opaque `ReactNode`.
+cannot be, so it is declared instead — at whatever type the feature accepts:
 
 ```tsx
-props: Schema.Struct({ title: Schema.String, children: Children });
+children: Children; // ReactNode
+children: Children.as<(row: Row) => ReactNode>(); // a render prop
+children: Schema.optionalKey(Children); // optional
 ```
 
-Declared plainly it is **required**, and that is a useful thing to say: a feature
-that has nothing to render without children gets a compile error at the call
-site. Wrap it in `Schema.optionalKey` when children are optional — JSX that
-passes none (a comment counts as none) omits the key, and props are validated
-with `onExcessProperty: "error"`.
+The type argument is the whole contract; the schema carries no structure and
+validates anything. `render` receives the real value, so `{props.children}` — or
+`props.children(row)` — works as it does in any component. The state machine
+does not: children never raise `PropsChanged`, and devtools print `"<children>"`
+in their place rather than an element tree.
 
-`render` receives the real node, so `{props.children}` works as it does in any
-component. The state machine does not: children never raise `PropsChanged`, and
-devtools print `"<children>"` in their place rather than an element tree.
+Declared plainly the key is **required**, which is worth saying for a feature
+that cannot render without children. JSX that passes none (a comment counts as
+none) omits the key rather than passing `undefined`, and props are validated with
+`onExcessProperty: "error"` — hence `optionalKey` for the optional case.
 
 ## Commands
 

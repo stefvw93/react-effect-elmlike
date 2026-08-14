@@ -1,15 +1,24 @@
 import { Effect, Schema } from "effect";
 import { createRoot } from "react-dom/client";
-import { StrictMode } from "react";
+import { StrictMode, type ReactNode } from "react";
 import { Action, Children, Command, consoleDevtoolsLayer, createRuntime, define } from "./lib";
 
+const { Provider, component } = createRuntime(consoleDevtoolsLayer());
+
+const TodoItem = Schema.Struct({
+  id: Schema.Number,
+  todo: Schema.String,
+  completed: Schema.Boolean,
+  userId: Schema.Number,
+});
+
 const Props = Schema.Struct({
-  children: Schema.optionalKey(Children),
+  children: Schema.optionalKey(Children.as<(item: typeof TodoItem.Type) => ReactNode>()),
 });
 
 const State = Schema.Struct({
   query: Schema.UndefinedOr(Schema.NumberFromString),
-  data: Schema.Any,
+  data: Schema.NullishOr(TodoItem),
 });
 
 const Input = Action("Input", { value: Schema.Number });
@@ -51,7 +60,7 @@ const reducer = TodoFetcherBlueprint.reducer({
 
 const render = TodoFetcherBlueprint.render(({ props, state, dispatch }) => (
   <main>
-    <h1>{state.query}</h1>
+    <h2>Find a task by id</h2>
     <form
       onSubmit={(e) => {
         e.preventDefault();
@@ -62,20 +71,20 @@ const render = TodoFetcherBlueprint.render(({ props, state, dispatch }) => (
       <button type="submit">Fetch</button>
     </form>
     <pre>{JSON.stringify(state.data, null, 2)}</pre>
-    {props.children}
+    {state.data && props.children?.(state.data)}
   </main>
 ));
 
 const todoFetcher = TodoFetcherBlueprint.create({ initialState, reducer, render });
-
-const { Provider, component } = createRuntime(consoleDevtoolsLayer());
 
 const TodoFetcher = component(todoFetcher, { name: "TodoFetcher" });
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <Provider>
-      <TodoFetcher onTodoChanged={(data) => console.log("on data changed", data)}>test</TodoFetcher>
+      <TodoFetcher onTodoChanged={(data) => console.log("on data changed", data)}>
+        {(data) => `To do: ${data.todo}`}
+      </TodoFetcher>
     </Provider>
   </StrictMode>,
 );

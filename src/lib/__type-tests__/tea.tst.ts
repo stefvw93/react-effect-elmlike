@@ -285,6 +285,20 @@ test("`Children` is a props field `NoTransform` accepts, and it surfaces as `Rea
   expect<Parameters<Parameters<typeof OptionalDefined.initialState>[0]>[0]>().type.toBe<{
     readonly children?: ReactNode;
   }>();
+
+  // `Children.as<T>()` is the same declaration at another children type, and
+  // the type argument is the whole contract — a render prop reaches `render`
+  // as the function the parent passed.
+  type Row = { readonly id: string };
+  const RenderProp = Schema.Struct({ children: Children.as<(row: Row) => ReactNode>() });
+
+  expect<NoTransform<typeof RenderProp>>().type.toBe<unknown>();
+
+  const RenderPropDefined = define({ props: RenderProp, state, action: Actions });
+
+  expect<Parameters<Parameters<typeof RenderPropDefined.initialState>[0]>[0]>().type.toBe<{
+    readonly children: (row: Row) => ReactNode;
+  }>();
 });
 
 // ---------------------------------------------------------------------------

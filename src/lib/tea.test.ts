@@ -28,7 +28,7 @@ import {
   type DevtoolsRecorder,
   type DevtoolsSink,
 } from "./devtools";
-import { createElement } from "react";
+import { createElement, type ReactNode } from "react";
 import { Action, Children, Command, createFeatureStore, define, Next } from "./tea";
 
 // ---------------------------------------------------------------------------
@@ -3707,7 +3707,7 @@ describe("createFeatureStore — devtools", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Children as an opaque prop
+// Children, at whatever type a feature declares
 // ---------------------------------------------------------------------------
 
 describe("Children", () => {
@@ -3787,6 +3787,28 @@ describe("Children", () => {
     expect(() => required({ children: node() })).not.toThrow();
     expect(() => required({ children: undefined })).not.toThrow();
     expect(() => required({})).toThrow(/Missing key/);
+  });
+
+  it("takes whatever type a feature calls its children, render props included", () => {
+    // `Children` is `ReactNode` because that is the common case, not because
+    // the runtime cares — nothing here reads the value. `Children.as<T>()` is
+    // the same declaration at another type, so a render prop, one element, or
+    // a tuple of slots are all declarable, and each is checked by the type
+    // argument rather than by the schema.
+    const RenderProp = Children.as<(row: { readonly id: string }) => ReactNode>();
+    const validate = SchemaParser.decodeUnknownSync(Schema.Struct({ children: RenderProp }), {
+      onExcessProperty: "error",
+      errors: "all",
+    });
+
+    expect(() => validate({ children: (row: { id: string }) => row.id })).not.toThrow();
+
+    // And it is opaque on exactly the same terms as the bare form.
+    expect(internalsOf(feature(Schema.Struct({ children: RenderProp }))).opaqueProps).toEqual([
+      ["children", "<children>"],
+    ]);
+    const equivalent = Schema.toEquivalence(Schema.Struct({ children: RenderProp }));
+    expect(equivalent({ children: () => null }, { children: () => null })).toBe(true);
   });
 
   it("is found on the props schema however the key is declared optional", () => {

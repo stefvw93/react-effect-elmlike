@@ -217,36 +217,53 @@ export type NoTransform<P extends AnyPropsSchema> = [P["Encoded"]] extends [P["T
  * Marks a prop the devtools must not print. The annotation's value is the
  * placeholder printed in its stead.
  */
-const opaque = "@tea/opaque";
+const OPAQUE = "@tea/opaque";
 
-/**
- * `ReactNode`, declared rather than described.
- *
- * A React element is not a schema value: it does not encode, it is a fresh
- * object on every parent render, and printing one into a devtools event would
- * dump a whole element tree. So the field is *declared* — three properties,
- * none of them structural:
- *
- * - **It validates anything.** React already rejects what it cannot render, and
- *   a second opinion here would only disagree with it.
- * - **It is invisible to change detection.** Its equivalence is constantly
- *   `true`, so new children alone never raise `PropsChanged`. The corollary is
- *   that a reducer's `snapshot.props.children` can be the node from an earlier
- *   render — children are for rendering, not for reducing. `render` always
- *   receives the current node, since it reads the component's own props.
- * - **It is redacted in devtools**, to `"<children>"` — see `reportableAction`.
- */
-export const Children: Schema.declare<ReactNode> = Schema.declare<ReactNode>(
-  (_u): _u is ReactNode => true,
-  {
+/** One declaration, at whatever type the feature calls its children. */
+const children = <T>(): Schema.declare<T> =>
+  Schema.declare<T>((_u): _u is T => true, {
     identifier: "Children",
-    [opaque]: "<children>",
+    [OPAQUE]: "<children>",
     toEquivalence: () => () => true,
-  },
-);
+  });
 
 /**
- * The props carrying an `opaque` annotation, paired with their placeholder.
+ * Whatever a feature accepts as `children` — a node, a render prop, one
+ * element, a tuple of slots. **The type argument is the contract**; the schema
+ * carries no structure at all.
+ *
+ *     children: Children                                    // ReactNode
+ *     children: Children.as<(row: Row) => ReactNode>()      // a render prop
+ *     children: Schema.optionalKey(Children)                // optional
+ *
+ * Three properties, none of them structural:
+ *
+ * - **It validates anything.** A function's shape is unobservable, `ReactNode`
+ *   is wide and recursive, and React already rejects what it cannot render. The
+ *   type argument is what holds callers to the contract.
+ * - **It is invisible to change detection.** Its equivalence is constantly
+ *   `true`, so new children alone never raise `PropsChanged`. That is the point
+ *   — children are a fresh object on every parent render, and a declaration's
+ *   default equivalence is by reference, which would re-run the reducer on each
+ *   one. The corollary is that a reducer's `snapshot.props.children` can be the
+ *   value from an earlier render; children are for rendering, not for reducing,
+ *   and `render` always sees the current one because it reads the component's
+ *   own props.
+ * - **It is redacted in devtools**, to `"<children>"` — see `reportableAction`.
+ *   An element tree, or a function, in an event would break the round-trip
+ *   every sink relies on.
+ *
+ * Declared plainly the key is **required**, which is worth saying for a feature
+ * that cannot render without children. JSX passing none omits the key rather
+ * than passing `undefined`, so the optional form is `Schema.optionalKey`.
+ */
+export const Children: Schema.declare<ReactNode> & {
+  /** The same declaration at another children type — a render prop, say. */
+  readonly as: <T>() => Schema.declare<T>;
+} = Object.assign(children<ReactNode>(), { as: children });
+
+/**
+ * The props carrying an `OPAQUE` annotation, paired with their placeholder.
  *
  * Read off the field's own AST, and — because `Schema.optional(x)` is
  * `optionalKey(UndefinedOr(x))` — off a union's members. `Schema.optionalKey`
@@ -258,11 +275,11 @@ const opaqueProps = (schema: AnyPropsSchema): ReadonlyArray<readonly [string, un
   for (const [key, field] of Object.entries(schema.fields)) {
     const ast = field.ast;
     const placeholder =
-      ast.annotations?.[opaque] ??
+      ast.annotations?.[OPAQUE] ??
       ("types" in ast && Array.isArray(ast.types)
         ? ast.types.find((member: { annotations?: Record<string, unknown> }) =>
-            Object.hasOwn(member.annotations ?? {}, opaque),
-          )?.annotations?.[opaque]
+            Object.hasOwn(member.annotations ?? {}, OPAQUE),
+          )?.annotations?.[OPAQUE]
         : undefined);
 
     if (placeholder !== undefined) found.push([key, placeholder]);

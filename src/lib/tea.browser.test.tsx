@@ -434,3 +434,35 @@ test("declared `children` render, and changing them alone does not raise `PropsC
   expect(propsChanges).toBe(0);
   expect(text("changes")).toBe("0");
 });
+
+test("`children` can be a render prop, called with the feature's own state", async () => {
+  // The type argument is the contract, and this is the shape that makes the
+  // point: children the feature *calls*, with data only it has. `Children.as`
+  // changes nothing else — still opaque, still redacted, still unwatched.
+  const List = define({
+    props: Schema.Struct({
+      children: Children.as<(row: { readonly id: string }) => React.ReactNode>(),
+    }),
+    state: Schema.Struct({ picked: Schema.String }),
+    action: Action.of([Action("Picked", { id: Schema.String })]),
+  }).create({
+    initialState: () => ({ picked: "a" }),
+    reducer: { Picked: (action, { state }) => ({ ...state, picked: action.id }) },
+    render: ({ state, props, dispatch }) => (
+      <div>
+        <div data-testid="row">{props.children({ id: state.picked })}</div>
+        <button data-testid="pick" onClick={() => dispatch({ _tag: "Picked", id: "b" })}>
+          pick
+        </button>
+      </div>
+    ),
+  });
+
+  const ListView = component(List, { name: "List" });
+
+  await mount(<ListView>{(row) => <em>row {row.id}</em>}</ListView>);
+  await vi.waitFor(() => expect(text("row")).toBe("row a"));
+
+  await click("pick");
+  await vi.waitFor(() => expect(text("row")).toBe("row b"));
+});

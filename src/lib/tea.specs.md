@@ -30,17 +30,30 @@ tree. So `children` is _declared_ rather than described:
 const Props = Schema.Struct({ children: Children });
 ```
 
+`ReactNode` is the default, not a restriction. React lets a component call its
+children as easily as render them, so `Children.as<T>()` is the same declaration
+at whatever type the feature accepts:
+
+```ts
+children: Children.as<(row: Row) => ReactNode>(); // a render prop
+```
+
+The type argument is the whole contract — nothing in the runtime reads the
+value, so there is no shape for the schema to check and none for it to lie
+about.
+
 Required, as written: a feature that cannot render without children says so, and
 a call site that passes none is a compile error. `Schema.optionalKey(Children)`
 is the optional form. There is no third state — JSX that passes no children (a
 comment counts as none) omits the key entirely, so a required `Children` throws
 `Missing key` if the type error is ever bypassed.
 
-`Children` is `Schema.declare<ReactNode>` with three deliberate properties:
+`Children` is `Schema.declare` with three deliberate properties:
 
-- **It validates anything.** `ReactNode` is wide and recursive — elements,
-  iterables, thenables — and React already owns the question of what it can
-  render. A schema-side re-derivation could only disagree with the renderer.
+- **It validates anything.** A function's shape is unobservable, `ReactNode` is
+  wide and recursive — elements, iterables, thenables — and React already owns
+  the question of what it can render. A schema-side re-derivation could only
+  disagree with the renderer.
 - **It is invisible to change detection.** Its `toEquivalence` annotation is
   constantly `true`, so new children alone never raise `PropsChanged`. Without
   it, a declaration's default equivalence is `Equal.equals` — by reference — and
@@ -61,9 +74,11 @@ declares none pays nothing at the report site. `Schema.optional(x)` is
 `optionalKey(UndefinedOr(x))`, so the collection also looks one level into a
 union.
 
-`Children` is the only opaque prop the library ships. A general `opaque(schema,
-placeholder)` combinator was considered and rejected as surface without a second
-caller.
+`children` is the only opaque prop the library ships. A general
+`opaque<T>(placeholder)` combinator — the same mechanism exposed for callbacks,
+refs, DOM nodes — was built and withdrawn: the annotation and the collection are
+already general, so promoting them is a one-line change if a second caller ever
+turns up. Until then the surface says what it means.
 
 ## The command model
 
@@ -192,6 +207,7 @@ its own criteria live in `devtools.specs.md`.
 - [x] `validateProps` runs the schema with `onExcessProperty: "error"` and **throws** — a malformed prop is the parent's defect and belongs at the error boundary. It runs on mount and on props-identity change, not on a state-driven re-render.
 - [x] An output leaves through its `on<Tag>` prop with `_tag` stripped and never re-enters the reducer; a missing handler throws to the boundary rather than into this feature's `Error` handler.
 - [x] `Children` is a props field that validates any value, so a feature can declare `children` and still be validated with `onExcessProperty: "error"`. Declared plainly it is required — the key is absent, not `undefined`, when JSX passes no children — and `Schema.optionalKey(Children)` is the optional form.
+- [x] `Children.as<T>()` is the same declaration at any children type — a render prop, one element, a tuple of slots. It is opaque on identical terms, and the type argument is the only thing holding the caller to the contract.
 - [x] `Children` carries a constantly-`true` equivalence, so a new node alone never raises `PropsChanged` and never re-runs the reducer. The corollary — a reducer's `snapshot.props.children` may be stale — is accepted, and `render` is unaffected.
 - [x] The props carrying the `"@tea/opaque"` annotation are collected off the props schema at `create`, whether the key is declared directly, through `Schema.optionalKey`, or through `Schema.optional` (a union). A feature declaring none collects `[]`.
 - [x] `PropsChanged`'s reported `previous` has each opaque prop replaced by its placeholder (`"<children>"`), which is what keeps every devtools event JSON round-trippable. The reducer's snapshot keeps the real node; a feature with no opaque props reports the action unchanged.
@@ -208,7 +224,7 @@ its own criteria live in `devtools.specs.md`.
 ### Type-level (TSTyche)
 
 - [x] `Disjoint`, `NoTransform`, `NoPropCollision`, `Exhaustive`/`Excess`, `ServiceOf`/`ServicesOf` reject what they document and accept what they document.
-- [x] `NoTransform` accepts a props schema declaring `children: Children` — `Schema.declare` is an identity codec — and the field surfaces to `initialState`, the reducer and `render` as `ReactNode`, optional under `Schema.optionalKey`.
+- [x] `NoTransform` accepts a props schema declaring `children: Children` — `Schema.declare` is an identity codec — and the field surfaces to `initialState`, the reducer and `render` as `ReactNode`, optional under `Schema.optionalKey` and as the given function type under `Children.as<T>()`.
 - [x] `Command<Narrow>` stays assignable to `Command<Wide>` under the callback leaf, and `Command.none: Command<never>` stays the bottom. `Dispatcher<A>` is contravariant in `A` and sits in a parameter position — contravariant again — so the two compose to covariant. **The existing covariance test passes unchanged.**
 - [x] `Command.effect` carries `R` out of the effect it is handed. `A` has no inference site of its own, so it defaults to `never`: a command that emits nothing is `Command<never, R>` and fits every slot. Passing a bare `Effect` — the pre-redesign shape — no longer compiles, and neither does an effect with an open error channel.
 - [x] Inside a handler, `dispatch` is typed by the feature's own vocabulary: `A` arrives from the contextual type of the handler's return. An undeclared tag and a declared tag with the wrong payload are both compile errors.
@@ -260,7 +276,9 @@ unchanged — which is the point of running it.
 
 It also covers both halves of `Children` together, which only a browser can
 show: a parent passes a node that changes on every tick, the node reaches the
-DOM and stays current, and the reducer's `PropsChanged` never fires.
+DOM and stays current, and the reducer's `PropsChanged` never fires. A second
+test mounts a render prop — children the feature _calls_, with state only it
+has — and repaints it from a dispatch.
 
 `src/examples/search.browser.test.tsx` is the leaf change's own browser test, and
 search is the right demo for it: the debounce is only meaningful against real
