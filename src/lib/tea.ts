@@ -820,8 +820,15 @@ type CommandContext = {
  * terminates. Everything below — the fiber bookkeeping — is identical.
  */
 const commandInterpreter = (deps: {
-  /** Where a command's emissions go: back to the reducer, or out as an output. */
-  readonly emit: (message: { readonly _tag: string }) => Effect.Effect<void>;
+  /**
+   * Where a command's emissions go: back to the reducer, or out as an output.
+   *
+   * The `ctx` is the emitting command's group — the address a `Cancel` would
+   * name. It is passed so the store can attribute what it folds to the command
+   * that caused it; `run` ignores it, and a one-parameter function is still
+   * assignable here, which is why `run`'s sink needed no change.
+   */
+  readonly emit: (message: { readonly _tag: string }, ctx: CommandContext) => Effect.Effect<void>;
   /**
    * Run after a command's fiber settles, however it settled. `run` needs it to
    * wake a `Queue.take` that quiescence would otherwise never unblock; the
@@ -932,8 +939,18 @@ const commandInterpreter = (deps: {
    * what lets a long-lived source be `Stream.runForEach(source, dispatch)` and
    * a one-shot be `Effect.flatMap(load, dispatch)`, with no separate variant
    * for either.
+   *
+   * Built per leaf rather than once for the interpreter, because the ctx it
+   * closes over is what tells the store which command emitted. A single shared
+   * closure cannot carry it: `Keyed` refines the ctx on the way down, so by the
+   * time a leaf runs, its ctx is not the one the interpreter was constructed
+   * with. One extra closure per forked leaf, which is nothing beside forking
+   * the fiber it belongs to.
    */
-  const dispatch: Dispatcher<any> = (action) => deps.emit(action);
+  const dispatchFor =
+    (ctx: CommandContext): Dispatcher<any> =>
+    (action) =>
+      deps.emit(action, ctx);
 
   const interpret = (
     command: Command<any, any>,
@@ -950,7 +967,7 @@ const commandInterpreter = (deps: {
           // has no business catching it.
           return yield* forkLeaf(
             ctx,
-            Effect.asVoid(Effect.suspend(() => command.effect(dispatch))),
+            Effect.asVoid(Effect.suspend(() => command.effect(dispatchFor(ctx)))),
           );
         case "Keyed":
           // Outermost wins: an inner `Keyed` under an outer one keeps `ctx`
@@ -1687,51 +1704,6 @@ export const define: <
 // Root
 // ---------------------------------------------------------------------------
 
-/**
- * Emitted for every state change in every mounted feature. Loosely typed on
- * purpose — a root observer sees features it knows nothing about. Because
- * actions, outputs, state *and* props are all schemas with no escape hatch left
- * in them, every field here encodes: this is a devtools transport, a replay log
- * or a `postMessage` away from being useful, with no schema-aware serialiser in
- * between.
- *
- * `instance` and `cause` are what turn a flat log into something usable once
- * there are N independent machines instead of one.
- *
- * Without `instance`, two `<Presence roomId="…">` are indistinguishable in the
- * stream, because `name` is a *blueprint* name. Without `cause`, order is all
- * you have — and in a decentralised architecture order tells you almost nothing
- * while causality tells you everything. `cause` is what renders
- * `cart#3/OrderPlaced → presence#1/RosterSynced` as an edge rather than as two
- * unrelated lines that happened to be adjacent.
- *
- * This is also the argument for outputs over a shared bus, restated as a data
- * structure: an output has a declared tag, a schema, and a known recipient, so
- * the edge is derivable. Bus traffic is opaque and the edge is not.
- *
- * Note what is *not* here: a `Query` variant. It was in the sketch, and cutting
- * queries removed it — which is the second-order reason they went. An externally
- * sent message has no origin the runtime can name, so the one variant that could
- * not be filled in was also the only one crossing a boundary inbound.
- */
-export interface DevtoolsEvent {
-  readonly name: string;
-  /** Which mount. */
-  readonly instance: string;
-  readonly action: unknown;
-  readonly previous: unknown;
-  readonly next: unknown;
-  /** What caused this action, when the runtime knows. */
-  readonly cause?:
-    | { readonly _tag: "Dispatch" }
-    | { readonly _tag: "Command"; readonly action: string }
-    | { readonly _tag: "Output"; readonly from: string; readonly output: string };
-}
-
-export interface RuntimeOptions {
-  readonly onEvent?: (event: DevtoolsEvent) => void;
-}
-
 // ---------------------------------------------------------------------------
 // Mounting a blueprint
 // ---------------------------------------------------------------------------
@@ -1903,6 +1875,22 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
   readonly emit: (output: { readonly _tag: string }) => void;
   /** A defect no `Error` handler took. `component` rethrows it during render. */
   readonly defect: (error: unknown) => void;
+  /**
+   * What the devtools stream calls this feature. `component` passes the `name`
+   * it already has, which today only sets `displayName`.
+   *
+   * Optional, and it stays optional: a store constructed directly — which is
+   * how most of this library's own tests reach it — has no name to give, and
+   * requiring one would be a signature change to every one of them for a field
+   * only a debugger reads. Defaults to `"TeaFeature"`, matching `displayName`.
+   */
+  readonly name?: string;
+  /**
+   * Which mount, within the name. Optional for the same reason, and defaulted
+   * from a module-global counter so two mounts of one blueprint are
+   * distinguishable in the stream.
+   */
+  readonly instance?: string;
 }): FeatureStore<Props, State, Action, H> => {
   const { blueprint, equivalence, runtime, layer, emit, defect } = args;
   const { initialState, outputTags, handles } = blueprint[internals];
@@ -2612,7 +2600,6 @@ const noHooks: AnyHooks = Object.freeze({});
  */
 export const createRuntime: <RootR, RootE>(
   layer: Layer.Layer<RootR, RootE>,
-  options?: RuntimeOptions,
 ) => {
   readonly Provider: FC<{ readonly children?: ReactNode }>;
 
@@ -2666,13 +2653,14 @@ export const createRuntime: <RootR, RootE>(
    * services without being rewritten.
    */
   readonly useRuntime: () => ManagedRuntime.ManagedRuntime<RootR, RootE>;
-  // `_options` is deliberate: `RuntimeOptions.onEvent` is declared and
-  // deliberately unwired for now, so no `DevtoolsEvent` is emitted. Deferred
-  // rather than half-built — the `cause: "Output"` variant needs a parent↔child
-  // channel that does not exist, and the obvious substitute (blaming whatever
-  // the parent dispatches next) invents causality it cannot verify. Recorded in
-  // specs.md so the gap is visible rather than looking like an oversight.
-} = (layer, _options) => {
+  // One parameter. Observation used to be a second one — a `RuntimeOptions`
+  // with an `onEvent` that nothing ever called — and it is now a service
+  // installed through `layer` itself: `Layer.mergeAll(AppLayer,
+  // consoleDevtoolsLayer())`. A `Context.Reference` is `Layer<never>`, so it
+  // moves neither `RootR` nor any `component(bp)` call, and being in the layer
+  // makes it swappable per environment the same way every other service is.
+  // See `devtools.specs.md`.
+} = (layer) => {
   const runtime = ManagedRuntime.make(layer);
   const context = createContext(runtime);
 
