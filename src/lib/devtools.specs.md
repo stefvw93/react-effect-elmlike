@@ -178,7 +178,7 @@ untouched — no existing `component(bp)` call changes.
 - [x] Every event is **JSON round-trippable**: `JSON.parse(JSON.stringify(event))` deep-equals the event, given encodable state and actions.
 - [x] The `Transition` for the runtime's own `Error` action carries `action: { _tag: "Error" }` and not the action object the runtime built, which holds a live `Error` and a `Cause`. See Expected Behavior.
 - [x] The `Transition` for `HookChanged` carries `action: { _tag: "HookChanged" }`. Hooks are `Record<string, unknown>`, so the previous record the runtime attaches routinely holds functions — `structuredClone` throws on one, which would disable the sink rather than merely losing a field.
-- [x] `PropsChanged` **keeps** its `previous` props, which are a schema value and encode.
+- [x] `PropsChanged` **keeps** its `previous` props, which are a schema value and encode — except for props declared opaque (`Children`), which are replaced by their placeholder (`"<children>"`). A React element tree is the one props value that does not encode, and redacting it is what keeps the round-trip criterion above true. See `tea.specs.md`.
 
 ### The sink service
 

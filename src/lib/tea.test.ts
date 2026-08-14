@@ -28,7 +28,8 @@ import {
   type DevtoolsRecorder,
   type DevtoolsSink,
 } from "./devtools";
-import { Action, Command, createFeatureStore, define, Next } from "./tea";
+import { createElement } from "react";
+import { Action, Children, Command, createFeatureStore, define, Next } from "./tea";
 
 // ---------------------------------------------------------------------------
 // Vocabularies (Action, Action.output, Action.of)
@@ -3702,5 +3703,208 @@ describe("createFeatureStore — devtools", () => {
 
     expect(recorder.events.length).toBeGreaterThan(1);
     expect(reads).toBe(recorder.events.length);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Children as an opaque prop
+// ---------------------------------------------------------------------------
+
+describe("Children", () => {
+  const internalsOf = (blueprint: object): Record<string, unknown> => {
+    const slot = Object.getOwnPropertySymbols(blueprint).find(
+      (symbol) => symbol.description === "@tea/internals",
+    );
+    return (blueprint as unknown as Record<symbol, Record<string, unknown>>)[slot!];
+  };
+
+  const feature = (props: Schema.Struct<any>) =>
+    define({
+      props: props as never,
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Bump", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Bump: (_action: unknown, snapshot: any) => snapshot.state,
+        PropsChanged: (_action: unknown, snapshot: any) => ({ count: snapshot.state.count + 1 }),
+      } as never,
+      render: () => null,
+    });
+
+  const store = (options: {
+    readonly props: Schema.Struct<any>;
+    readonly initial: Record<string, unknown>;
+    readonly sink: DevtoolsSink;
+  }) => {
+    const blueprint = feature(options.props);
+
+    return createFeatureStore({
+      blueprint: blueprint as any,
+      props: options.initial,
+      equivalence: {
+        props: Schema.toEquivalence(options.props),
+        hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+      } as any,
+      runtime: ManagedRuntime.make(
+        devtoolsLayer(options.sink),
+      ) as unknown as ManagedRuntime.ManagedRuntime<any, any>,
+      layer: undefined,
+      emit: () => {},
+      defect: () => {},
+    });
+  };
+
+  const node = () => createElement("span", null, "child");
+
+  it("validates anything, so React keeps the last word on what it can render", () => {
+    // The predicate is deliberately total. `ReactNode` is a wide, recursive
+    // type — elements, iterables, thenables — and a schema-side re-derivation
+    // could only ever disagree with the renderer that owns the answer.
+    const validate = SchemaParser.decodeUnknownSync(
+      Schema.Struct({ children: Schema.optionalKey(Children) }),
+      { onExcessProperty: "error", errors: "all" },
+    );
+
+    expect(() => validate({ children: node() })).not.toThrow();
+    expect(() => validate({ children: "text" })).not.toThrow();
+    expect(() => validate({ children: [node(), node()] })).not.toThrow();
+    expect(() => validate({ children: undefined })).not.toThrow();
+    expect(() => validate({})).not.toThrow();
+  });
+
+  it("is required unless the key is, which is the only difference between the two forms", () => {
+    // JSX passing no children — a comment counts as none — omits the key
+    // entirely rather than passing `undefined`, so the required form throws
+    // `Missing key`. That is the intended reading: a feature that cannot render
+    // without children declares `children: Children` and gets a compile error
+    // at the call site; one that can wraps it in `optionalKey`.
+    const required = SchemaParser.decodeUnknownSync(Schema.Struct({ children: Children }), {
+      onExcessProperty: "error",
+      errors: "all",
+    });
+
+    expect(() => required({ children: node() })).not.toThrow();
+    expect(() => required({ children: undefined })).not.toThrow();
+    expect(() => required({})).toThrow(/Missing key/);
+  });
+
+  it("is found on the props schema however the key is declared optional", () => {
+    // `Schema.optional(x)` is `optionalKey(UndefinedOr(x))`, so the annotation
+    // sits one level down inside a union; `optionalKey` leaves the declaration
+    // whole. Both have to resolve, or redaction silently stops happening.
+    const expected = [["children", "<children>"]];
+
+    expect(internalsOf(feature(Schema.Struct({ children: Children }))).opaqueProps).toEqual(
+      expected,
+    );
+    expect(
+      internalsOf(feature(Schema.Struct({ children: Schema.optionalKey(Children) }))).opaqueProps,
+    ).toEqual(expected);
+    expect(
+      internalsOf(feature(Schema.Struct({ children: Schema.optional(Children) }))).opaqueProps,
+    ).toEqual(expected);
+    expect(internalsOf(feature(Schema.Struct({ id: Schema.String }))).opaqueProps).toEqual([]);
+  });
+
+  it("never raises `PropsChanged` on its own", () => {
+    // JSX builds a fresh node every parent render. With a declaration's default
+    // equivalence — `Equal.equals`, i.e. by reference — every parent render
+    // would fold `PropsChanged` and re-run the reducer. The `toEquivalence`
+    // annotation is what makes children invisible to change detection.
+    const recorder = createRecorder();
+    const Props = Schema.Struct({ id: Schema.String, children: Schema.optionalKey(Children) });
+    const feature = store({
+      props: Props,
+      initial: { id: "a", children: node() },
+      sink: recorder.sink,
+    });
+
+    feature.start();
+    feature.sync({ id: "a", children: node() } as never, {} as never);
+    recorder.clear();
+    feature.sync({ id: "a", children: node() } as never, {} as never);
+
+    expect(feature.getSnapshot()).toEqual({ count: 0 });
+    expect(recorder.events).toEqual([]);
+  });
+
+  it("is redacted in the devtools event, and only there", () => {
+    // Devtools-only: the reducer's snapshot keeps the real node, so a feature
+    // that wants to inspect its children still can. What must not happen is a
+    // React element tree in an event — `devtools.specs.md` requires every event
+    // to survive `JSON.parse(JSON.stringify(event))`.
+    const recorder = createRecorder();
+    const Props = Schema.Struct({ id: Schema.String, children: Schema.optionalKey(Children) });
+    const seen: Array<unknown> = [];
+
+    const blueprint = define({
+      props: Props as never,
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Bump", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Bump: (_action: unknown, snapshot: any) => snapshot.state,
+        PropsChanged: (_action: unknown, snapshot: any) => {
+          seen.push(snapshot.props.children);
+          return { count: snapshot.state.count + 1 };
+        },
+      } as never,
+      render: () => null,
+    });
+
+    const mounted = createFeatureStore({
+      blueprint: blueprint as any,
+      props: { id: "a", children: node() },
+      equivalence: {
+        props: Schema.toEquivalence(Props),
+        hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+      } as any,
+      runtime: ManagedRuntime.make(
+        devtoolsLayer(recorder.sink),
+      ) as unknown as ManagedRuntime.ManagedRuntime<any, any>,
+      layer: undefined,
+      emit: () => {},
+      defect: () => {},
+    });
+
+    mounted.start();
+    mounted.sync({ id: "a", children: node() } as never, {} as never);
+    recorder.clear();
+    mounted.sync({ id: "b", children: node() } as never, {} as never);
+
+    const changed = recorder.events.find(
+      (event): event is Extract<DevtoolsEvent, { readonly _tag: "Transition" }> =>
+        event._tag === "Transition" && event.action._tag === "PropsChanged",
+    );
+
+    expect(changed!.action).toEqual({
+      _tag: "PropsChanged",
+      previous: { id: "a", children: "<children>" },
+    });
+    expect(JSON.parse(JSON.stringify(changed))).toEqual(changed);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toEqual(node());
+  });
+
+  it("leaves the action untouched when a feature declares no opaque prop", () => {
+    // The redaction allocates nothing — and changes nothing — for the features
+    // that were here before it.
+    const recorder = createRecorder();
+    const Props = Schema.Struct({ id: Schema.String });
+    const feature = store({ props: Props, initial: { id: "a" }, sink: recorder.sink });
+
+    feature.start();
+    feature.sync({ id: "a" } as never, {} as never);
+    recorder.clear();
+    feature.sync({ id: "b" } as never, {} as never);
+
+    const changed = recorder.events.find(
+      (event): event is Extract<DevtoolsEvent, { readonly _tag: "Transition" }> =>
+        event._tag === "Transition" && event.action._tag === "PropsChanged",
+    );
+
+    expect(changed!.action).toEqual({ _tag: "PropsChanged", previous: { id: "a" } });
   });
 });

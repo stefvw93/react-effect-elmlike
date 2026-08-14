@@ -213,6 +213,64 @@ export type NoTransform<P extends AnyPropsSchema> = [P["Encoded"]] extends [P["T
     : never
   : never;
 
+/**
+ * Marks a prop the devtools must not print. The annotation's value is the
+ * placeholder printed in its stead.
+ */
+const opaque = "@tea/opaque";
+
+/**
+ * `ReactNode`, declared rather than described.
+ *
+ * A React element is not a schema value: it does not encode, it is a fresh
+ * object on every parent render, and printing one into a devtools event would
+ * dump a whole element tree. So the field is *declared* — three properties,
+ * none of them structural:
+ *
+ * - **It validates anything.** React already rejects what it cannot render, and
+ *   a second opinion here would only disagree with it.
+ * - **It is invisible to change detection.** Its equivalence is constantly
+ *   `true`, so new children alone never raise `PropsChanged`. The corollary is
+ *   that a reducer's `snapshot.props.children` can be the node from an earlier
+ *   render — children are for rendering, not for reducing. `render` always
+ *   receives the current node, since it reads the component's own props.
+ * - **It is redacted in devtools**, to `"<children>"` — see `reportableAction`.
+ */
+export const Children: Schema.declare<ReactNode> = Schema.declare<ReactNode>(
+  (_u): _u is ReactNode => true,
+  {
+    identifier: "Children",
+    [opaque]: "<children>",
+    toEquivalence: () => () => true,
+  },
+);
+
+/**
+ * The props carrying an `opaque` annotation, paired with their placeholder.
+ *
+ * Read off the field's own AST, and — because `Schema.optional(x)` is
+ * `optionalKey(UndefinedOr(x))` — off a union's members. `Schema.optionalKey`
+ * needs no unwrapping: it marks the key, leaving the declaration's AST intact.
+ */
+const opaqueProps = (schema: AnyPropsSchema): ReadonlyArray<readonly [string, unknown]> => {
+  const found: Array<readonly [string, unknown]> = [];
+
+  for (const [key, field] of Object.entries(schema.fields)) {
+    const ast = field.ast;
+    const placeholder =
+      ast.annotations?.[opaque] ??
+      ("types" in ast && Array.isArray(ast.types)
+        ? ast.types.find((member: { annotations?: Record<string, unknown> }) =>
+            Object.hasOwn(member.annotations ?? {}, opaque),
+          )?.annotations?.[opaque]
+        : undefined);
+
+    if (placeholder !== undefined) found.push([key, placeholder]);
+  }
+
+  return found;
+};
+
 // ---------------------------------------------------------------------------
 // Outputs, as props
 // ---------------------------------------------------------------------------
@@ -752,6 +810,12 @@ export interface BlueprintInternals<Props, State, Action, H extends AnyHooks> {
   readonly outputTags: ReadonlyArray<string>;
 
   /**
+   * The props that must not reach a devtools sink, with what stands in for
+   * them. Empty for a feature whose props are all schema values.
+   */
+  readonly opaqueProps: ReadonlyArray<readonly [string, unknown]>;
+
+  /**
    * Whether the feature declared a handler for this tag.
    */
   readonly handles: (tag: string) => boolean;
@@ -873,6 +937,7 @@ export const define: <
     create: (parts) => {
       const outputTags = spec.output ? Object.keys(spec.output.cases) : [];
       const outputTagSet = new Set(outputTags);
+      const opaqueFields = opaqueProps(spec.props);
 
       return {
         [internals]: {
@@ -881,6 +946,7 @@ export const define: <
           useHooks: spec.useHooks,
           props: spec.props,
           outputTags,
+          opaqueProps: opaqueFields,
           handles: (tag) => handlerFor(parts.reducer, tag) !== undefined,
         },
 
@@ -1040,10 +1106,36 @@ const LIFECYCLE: DevtoolsCause = Object.freeze({ _tag: "Lifecycle" as const });
 const ERROR_ACTION = Object.freeze({ _tag: "Error" as const });
 const HOOK_CHANGED_ACTION = Object.freeze({ _tag: "HookChanged" as const });
 
-const reportableAction = (action: { readonly _tag: string }): { readonly _tag: string } => {
+/**
+ * What a devtools sink is allowed to see of an action.
+ *
+ * `Error` and `HookChanged` are scrubbed to their tag: one holds a live `Error`
+ * and a `Cause`, the other a record that routinely holds functions.
+ * `PropsChanged` keeps its `previous` props — they are schema values and they
+ * encode — except for the ones declared opaque, which are replaced by their
+ * placeholder. That is what keeps every event JSON round-trippable once a
+ * feature declares `children`.
+ */
+const reportableAction = (
+  action: { readonly _tag: string },
+  opaqueFields: ReadonlyArray<readonly [string, unknown]>,
+): { readonly _tag: string } => {
   if (action._tag === "Error") return ERROR_ACTION;
   if (action._tag === "HookChanged") return HOOK_CHANGED_ACTION;
-  return action;
+  if (action._tag !== "PropsChanged" || opaqueFields.length === 0) return action;
+
+  const { previous } = action as { readonly previous?: Record<string, unknown> };
+  if (previous === null || typeof previous !== "object") return action;
+
+  let redacted: Record<string, unknown> | undefined;
+  for (const [key, placeholder] of opaqueFields) {
+    if (!Object.hasOwn(previous, key)) continue;
+    redacted ??= { ...previous };
+    redacted[key] = placeholder;
+  }
+
+  if (redacted === undefined) return action;
+  return { ...action, previous: redacted } as { readonly _tag: string };
 };
 
 const commandCause = (ctx: CommandContext): DevtoolsCause =>
@@ -1066,7 +1158,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
   readonly instance?: string;
 }): FeatureStore<Props, State, Action, H> => {
   const { blueprint, equivalence, runtime, layer, emit, defect } = args;
-  const { initialState, outputTags, handles } = blueprint[internals];
+  const { initialState, outputTags, opaqueProps: opaqueFields, handles } = blueprint[internals];
 
   const name = args.name ?? "TeaFeature";
   const instance = args.instance ?? nextInstance(name);
@@ -1213,7 +1305,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
         name,
         instance,
         cause,
-        action: reportableAction(action),
+        action: reportableAction(action, opaqueFields),
         previous,
         next: nextState,
       });

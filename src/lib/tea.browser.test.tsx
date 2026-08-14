@@ -14,7 +14,7 @@ import { Component, StrictMode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { act } from "react";
 import { afterEach, expect, test, vi } from "vite-plus/test";
-import { Action, Command, createRuntime, define } from "./tea";
+import { Action, Children, Command, createRuntime, define } from "./tea";
 
 // `act` needs this flag to actually batch; without it React warns and the
 // "one render, not two" assertion below would pass for the wrong reason.
@@ -378,4 +378,59 @@ test("a props change costs exactly one render, counted", async () => {
   // One render for the new props. Two would mean the fold tripped
   // `useSyncExternalStore`'s post-render consistency check.
   expect(renders - baseline).toBe(1);
+});
+
+test("declared `children` render, and changing them alone does not raise `PropsChanged`", async () => {
+  // Both halves of the opaque prop, in the only place that can show them
+  // together: the node the parent passes reaches the DOM and stays current,
+  // while the state machine never sees it move.
+  let propsChanges = 0;
+
+  const Panel = define({
+    props: Schema.Struct({ title: Schema.String, children: Schema.optionalKey(Children) }),
+    state: Schema.Struct({ changes: Schema.Number }),
+    action: Action.of([Action("Noop", {})]),
+  }).create({
+    initialState: () => ({ changes: 0 }),
+    reducer: {
+      Noop: (_action, { state }) => state,
+      PropsChanged: (_action, { state }) => {
+        propsChanges += 1;
+        return { changes: state.changes + 1 };
+      },
+    },
+    render: ({ state, props }) => (
+      <section>
+        <span data-testid="changes">{state.changes}</span>
+        <div data-testid="slot">{props.children}</div>
+      </section>
+    ),
+  });
+
+  const PanelView = component(Panel, { name: "Panel" });
+
+  const Parent = () => {
+    const [tick, setTick] = useState(0);
+    return (
+      <div>
+        <button data-testid="tick" onClick={() => setTick(tick + 1)}>
+          tick
+        </button>
+        <PanelView title="stable">
+          <em>{`child ${tick}`}</em>
+        </PanelView>
+      </div>
+    );
+  };
+
+  await mount(<Parent />);
+  await vi.waitFor(() => expect(text("slot")).toBe("child 0"));
+
+  await click("tick");
+
+  // The node moved — `render` reads the component's own props, not the store's.
+  await vi.waitFor(() => expect(text("slot")).toBe("child 1"));
+  // The state machine did not.
+  expect(propsChanges).toBe(0);
+  expect(text("changes")).toBe("0");
 });

@@ -1,76 +1,81 @@
 import { Effect, Schema } from "effect";
 import { createRoot } from "react-dom/client";
 import { StrictMode } from "react";
-import { Action, Command, consoleDevtoolsLayer, createRuntime, define } from "./lib";
+import { Action, Children, Command, consoleDevtoolsLayer, createRuntime, define } from "./lib";
 
 const Props = Schema.Struct({
-  start: Schema.Number,
-  step: Schema.Number,
+  children: Schema.optionalKey(Children),
 });
 
 const State = Schema.Struct({
-  count: Schema.Number,
+  query: Schema.UndefinedOr(Schema.NumberFromString),
   data: Schema.Any,
 });
 
-const Incremented = Action("Incremented", {});
-const Decremented = Action("Decremented", {});
-const Submitted = Action("Submitted", {});
-const Resolved = Action("Resolved", { data: Schema.Any });
-const DataChanged = Action.output("DataChanged", { data: Schema.Any });
-const CounterAction = Action.of([Incremented, Decremented, Submitted, Resolved]);
-const CounterOutput = Action.of([DataChanged]);
+const Input = Action("Input", { value: Schema.Number });
+const ClickedSubmit = Action("ClickedSubmit", {});
+const TodoResolved = Action("TodoResolved", { data: Schema.Any });
+const TodoChanged = Action.output("TodoChanged", { data: Schema.Any });
+const TodoFetcherAction = Action.of([Input, ClickedSubmit, TodoResolved]);
+const TodoFetcherOutput = Action.of([TodoChanged]);
 
-const CounterBlueprint = define({
+const TodoFetcherBlueprint = define({
   props: Props,
   state: State,
-  action: CounterAction,
-  output: CounterOutput,
+  action: TodoFetcherAction,
+  output: TodoFetcherOutput,
 });
 
-const initialState = CounterBlueprint.initialState((props) => ({ count: props.start, data: null }));
+const initialState = TodoFetcherBlueprint.initialState(() => ({ query: undefined, data: null }));
 
-const reducer = CounterBlueprint.reducer({
-  Incremented: (_action, { state, props }) => ({ ...state, count: state.count + props.step }),
-  Decremented: (_action, { state, props }) => ({ ...state, count: state.count - props.step }),
+const reducer = TodoFetcherBlueprint.reducer({
+  Input: (action, { state }) => ({ ...state, query: action.value }),
 
-  Submitted: (_action, { state }) => [
+  ClickedSubmit: (_action, { state }) => [
     { ...state, data: null },
     Command.effect((dispatch) =>
       Effect.promise(() =>
-        fetch(`https://dummyjson.com/todos/${state.count}`).then((res) => res.json()),
-      ).pipe(Effect.andThen((data) => dispatch({ _tag: "Resolved", data }))),
+        fetch(`https://dummyjson.com/todos/${state.query}`).then((res) => res.json()),
+      ).pipe(Effect.andThen((data) => dispatch({ _tag: "TodoResolved", data }))),
     ),
   ],
 
-  Resolved: (action, { state }) => [
-    { ...state, data: action.data },
-    Command.effect((dispatch) => dispatch(DataChanged.make({ data: action.data }))),
-  ],
+  TodoResolved: (action, { state }) => {
+    const nextState = { ...state, data: action.data };
+    return [
+      nextState,
+      Command.effect((dispatch) => dispatch(TodoChanged.make({ data: nextState.data }))),
+    ];
+  },
 });
 
-const render = CounterBlueprint.render(({ state, dispatch }) => (
+const render = TodoFetcherBlueprint.render(({ props, state, dispatch }) => (
   <main>
-    <h1>{state.count}</h1>
-    <button onClick={() => dispatch({ _tag: "Decremented" })}>−</button>
-    <button onClick={() => dispatch({ _tag: "Incremented" })}>+</button>
-    <button onClick={() => dispatch({ _tag: "Submitted" })}>Fetch</button>
+    <h1>{state.query}</h1>
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        dispatch(ClickedSubmit.make({}));
+      }}
+    >
+      <input onChange={(e) => dispatch(Input.make({ value: Number(e.target.value) }))} />
+      <button type="submit">Fetch</button>
+    </form>
     <pre>{JSON.stringify(state.data, null, 2)}</pre>
+    {props.children}
   </main>
 ));
 
-const counter = CounterBlueprint.create({ initialState, reducer, render });
+const todoFetcher = TodoFetcherBlueprint.create({ initialState, reducer, render });
 
 const { Provider, component } = createRuntime(consoleDevtoolsLayer());
 
-const Counter = component(counter, { name: "Counter" });
+const TodoFetcher = component(todoFetcher, { name: "TodoFetcher" });
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <Provider>
-      <Counter start={0} step={1} onDataChanged={(data) => console.log("on data changed", data)}>
-        {/*test*/}
-      </Counter>
+      <TodoFetcher onTodoChanged={(data) => console.log("on data changed", data)}>test</TodoFetcher>
     </Provider>
   </StrictMode>,
 );

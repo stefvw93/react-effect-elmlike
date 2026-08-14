@@ -1,9 +1,11 @@
 import { Effect, Layer, Schema } from "effect";
 import { expect, test } from "tstyche";
+import type { ReactNode } from "react";
 import {
   Action,
   type AnyVocabulary,
   type ChannelOf,
+  Children,
   Command,
   createRuntime,
   define,
@@ -249,6 +251,39 @@ test("`NoTransform` rejects a props schema whose `Encoded` differs from its `Typ
 
   expect<Parameters<Parameters<typeof Defined.initialState>[0]>[0]>().type.toBe<{
     readonly id: string;
+  }>();
+});
+
+// ---------------------------------------------------------------------------
+// Children
+// ---------------------------------------------------------------------------
+
+test("`Children` is a props field `NoTransform` accepts, and it surfaces as `ReactNode`", () => {
+  const ChildrenProps = Schema.Struct({ children: Children });
+  const OptionalChildrenProps = Schema.Struct({ children: Schema.optionalKey(Children) });
+
+  // `Schema.declare` is an identity codec, so the guard that rejects a
+  // transforming props schema has nothing to object to here.
+  expect<NoTransform<typeof ChildrenProps>>().type.toBe<unknown>();
+  expect<NoTransform<typeof OptionalChildrenProps>>().type.toBe<unknown>();
+
+  const state = Schema.Struct({});
+  const Actions = Action.of([Action("Bar", {})]);
+
+  expect(define).type.toBeCallableWith({ props: ChildrenProps, state, action: Actions });
+
+  const Defined = define({ props: ChildrenProps, state, action: Actions });
+
+  // What a reducer, `initialState` and `render` see: the node itself, not a
+  // wrapper anything has to unwrap before rendering it.
+  expect<Parameters<Parameters<typeof Defined.initialState>[0]>[0]>().type.toBe<{
+    readonly children: ReactNode;
+  }>();
+
+  const OptionalDefined = define({ props: OptionalChildrenProps, state, action: Actions });
+
+  expect<Parameters<Parameters<typeof OptionalDefined.initialState>[0]>[0]>().type.toBe<{
+    readonly children?: ReactNode;
   }>();
 });
 

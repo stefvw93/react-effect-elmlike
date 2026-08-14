@@ -25,6 +25,23 @@ A blueprint is inert: `cart.reduce(action, snapshot)` is the whole reducer as on
 pure function, and `cart.run(actions, options)` folds a sequence and reports what
 was emitted — both without React.
 
+Props are schema values, validated and never decoded. `children` is the one that
+cannot be: `Children` declares it as an opaque `ReactNode`.
+
+```tsx
+props: Schema.Struct({ title: Schema.String, children: Children });
+```
+
+Declared plainly it is **required**, and that is a useful thing to say: a feature
+that has nothing to render without children gets a compile error at the call
+site. Wrap it in `Schema.optionalKey` when children are optional — JSX that
+passes none (a comment counts as none) omits the key, and props are validated
+with `onExcessProperty: "error"`.
+
+`render` receives the real node, so `{props.children}` works as it does in any
+component. The state machine does not: children never raise `PropsChanged`, and
+devtools print `"<children>"` in their place rather than an element tree.
+
 ## Commands
 
 A reducer returns the next state and, optionally, a `Command`. The leaf is an
