@@ -327,3 +327,55 @@ test("an output with no matching prop throws rather than vanishing", async () =>
   await vi.waitFor(() => expect(errors.length).toBeGreaterThan(0));
   expect(String(errors[0])).toMatch(/onReached/);
 });
+
+test("a props change costs exactly one render, counted", async () => {
+  // The one-render claim was asserted indirectly (the painted value after a
+  // single flush) and never counted, so this counts it.
+  //
+  // It is not the regression guard for the `useSyncExternalStore`-after-`sync`
+  // ordering, and should not be read as one: the count still measures one when
+  // that ordering is reverted. What it pins is the claim itself — a props
+  // change costs one render — against any future change that breaks it.
+  let renders = 0;
+
+  const Counted = define({
+    props: Schema.Struct({ step: Schema.Number }),
+    state: Schema.Struct({ mirrored: Schema.Number }),
+    action: Action.of([Action("Noop", {})]),
+  }).create({
+    initialState: (props) => ({ mirrored: props.step }),
+    reducer: {
+      Noop: (_action, { state }) => state,
+      PropsChanged: (_action, { props }) => ({ mirrored: props.step }),
+    },
+    render: ({ state }) => {
+      renders += 1;
+      return <span data-testid="mirrored">{state.mirrored}</span>;
+    },
+  });
+
+  const CountedView = component(Counted, { name: "Counted" });
+
+  const Parent = () => {
+    const [step, setStep] = useState(1);
+    return (
+      <div>
+        <button data-testid="bump-step" onClick={() => setStep((n) => n + 1)}>
+          bump
+        </button>
+        <CountedView step={step} />
+      </div>
+    );
+  };
+
+  await mount(<Parent />);
+  await vi.waitFor(() => expect(text("mirrored")).toBe("1"));
+
+  const baseline = renders;
+  await click("bump-step");
+
+  expect(text("mirrored")).toBe("2");
+  // One render for the new props. Two would mean the fold tripped
+  // `useSyncExternalStore`'s post-render consistency check.
+  expect(renders - baseline).toBe(1);
+});

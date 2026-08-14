@@ -583,6 +583,12 @@ export type Command<A, R = never> = Pipeable.Pipeable &
     /**
      * Several commands at once, each keeping its own policy. `Stream.merge`
      * covers this only while both halves want the same group.
+     *
+     * Under an outer policy the members are one group — one `Cancel` target,
+     * one `"queue"` serialisation queue — without being one another's
+     * predecessors: `"ignore"` runs every member rather than dropping all but
+     * the first, and `"restart"` interrupts the previous dispatch's members
+     * rather than the siblings it was forked alongside.
      */
     | { readonly _tag: "Batch"; readonly commands: ReadonlyArray<Command<A, R>> }
 
@@ -613,12 +619,28 @@ export type Command<A, R = never> = Pipeable.Pipeable &
  * within it, so `"restart"` on `QuantityChanged` can mean per-sku.
  *
  * An omitted `key` on `Cancel` targets every group under the tag.
+ *
+ * This is the *address*, and only the address. Whether a command supersedes
+ * another is a separate question the runtime answers internally — the two would
+ * otherwise disagree over `Command.batch`, whose members must be one target for
+ * `Cancel` and one queue for `"queue"` while still not superseding each other
+ * under `"ignore"` and `"restart"`. Nothing here has to change for that to
+ * work, which is the point.
  */
 export interface Group {
   readonly tag: string;
   readonly key?: string;
 }
 
+/**
+ * What a new dispatch does about the ones already running in its group.
+ *
+ * `"restart"` interrupts them, `"ignore"` stands down, `"queue"` waits for all
+ * of them to settle, `"parallel"` (the default, meaning no `Guarded` wrapper at
+ * all) neither looks nor waits. `"queue"` is the one that counts a command's
+ * own `Command.batch` siblings as things to wait for; the other two are about
+ * earlier dispatches only.
+ */
 export type Policy = "restart" | "ignore" | "queue" | "parallel";
 
 const pipeable = <T extends object>(value: T): T & Pipeable.Pipeable =>
@@ -686,10 +708,40 @@ export const Command: {
 };
 
 /**
+ * Which *interpretation* forked a fiber — the concurrency identity, as opposed
+ * to the cancellation identity a `Group` carries.
+ *
+ * One is minted per policy-bearing command per dispatch and shared by every
+ * fiber that interpretation forks, so every member of a `Command.batch` gets
+ * the same one. That is the whole point: `ignore` and `restart` are about
+ * superseding *an earlier dispatch*, and a group key cannot tell an earlier
+ * dispatch apart from a sibling forked three lines ago. Indexing the members
+ * into `key#0`/`key#1` was the alternative, and it answered this question by
+ * destroying the other one — an indexed key is not the key `Command.cancel`
+ * was given, and it is not the key the serialisation queue is per.
+ *
+ * A bare `Symbol` because nothing may read it except by identity: it is never
+ * addressed, never serialised, and never appears in the public surface.
+ */
+type Occurrence = symbol;
+
+/** A forked command fiber together with the interpretation that forked it. */
+type GroupEntry = {
+  readonly fiber: Fiber.Fiber<void>;
+  readonly occurrence: Occurrence;
+};
+
+/**
  * The group a command's fibers belong to, plus the policy governing them.
  * `tag` is the issuing action's, filled by the runtime; see `Group`.
  */
-type CommandContext = { readonly tag: string; readonly key?: string; readonly policy?: Policy };
+type CommandContext = {
+  readonly tag: string;
+  readonly key?: string;
+  readonly policy?: Policy;
+  /** Set when a `Guarded` node adopts a policy; see `Occurrence`. */
+  readonly occurrence?: Occurrence;
+};
 
 /**
  * The command interpreter, shared by `Blueprint.run` and `createFeatureStore`.
@@ -728,7 +780,7 @@ const commandInterpreter = (deps: {
    */
   readonly onExit?: (exit: Exit.Exit<void>, ctx: CommandContext) => Effect.Effect<void>;
   readonly inFlight: Ref.Ref<number>;
-  readonly groups: Ref.Ref<Map<string, ReadonlyArray<Fiber.Fiber<void>>>>;
+  readonly groups: Ref.Ref<Map<string, ReadonlyArray<GroupEntry>>>;
 }) => {
   const groupId = (target: Group): string => `${target.tag}::${target.key ?? ""}`;
 
@@ -740,8 +792,10 @@ const commandInterpreter = (deps: {
           ? [groupId(target)]
           : Array.from(map.keys()).filter((id) => id.startsWith(`${target.tag}::`));
 
+      // Every occurrence in the group, deliberately: `Cancel` addresses the
+      // group, and a batch's members are all of them at that address.
       for (const id of ids) {
-        for (const fiber of map.get(id) ?? []) yield* Fiber.interrupt(fiber);
+        for (const entry of map.get(id) ?? []) yield* Fiber.interrupt(entry.fiber);
       }
     });
 
@@ -749,22 +803,33 @@ const commandInterpreter = (deps: {
     Effect.gen(function* () {
       const policy = ctx.policy ?? "parallel";
       const id = groupId(ctx);
+      // Unguarded commands never read it back — `"parallel"` neither waits nor
+      // interrupts — but every entry carries one so the map has a single shape.
+      const occurrence: Occurrence = ctx.occurrence ?? Symbol();
       const running = (yield* Ref.get(deps.groups)).get(id) ?? [];
+      const superseded = running.filter((entry) => entry.occurrence !== occurrence);
 
-      if (policy === "ignore" && running.length > 0) return;
-      if (policy === "restart") for (const fiber of running) yield* Fiber.interrupt(fiber);
+      // `superseded`, not `running`: both policies mean "an earlier dispatch is
+      // already here", and a batch member forked microseconds ago by the same
+      // interpretation is not that. Filtering on the group alone made `ignore`
+      // drop every member after the first and `restart` have members interrupt
+      // each other.
+      if (policy === "ignore" && superseded.length > 0) return;
+      if (policy === "restart") for (const entry of superseded) yield* Fiber.interrupt(entry.fiber);
 
-      // `Fiber.joinAll` re-raises the prior's cause, which would kill the
-      // follower before its own body ran — one dying command silently
-      // cancelling everything queued behind it, and (with `onExit` watching)
-      // reporting that single failure once per follower. `queue` means "wait
-      // your turn", not "share their fate".
+      // `running`, not `superseded`: the serialisation queue is per *group*, so
+      // a `queue`-wrapped batch runs its members one at a time. This is the one
+      // place the two identities deliberately disagree.
+      //
+      // `Fiber.await` each rather than `Fiber.joinAll`, which re-raises the
+      // first failing fiber's cause and stops joining there — killing the
+      // follower before its own body ran, and (once the cause is caught)
+      // releasing it on a predecessor's *death* while that predecessor's
+      // siblings still hold the queue. `queue` means "wait your turn", not
+      // "share their fate" and not "leave when one of them trips".
       const awaitPrior =
         policy === "queue" && running.length > 0
-          ? Fiber.joinAll(running).pipe(
-              Effect.asVoid,
-              Effect.catchCause(() => Effect.void),
-            )
+          ? Effect.forEach(running, (entry) => Fiber.await(entry.fiber), { discard: true })
           : Effect.void;
 
       yield* Ref.update(deps.inFlight, (n) => n + 1);
@@ -779,15 +844,33 @@ const commandInterpreter = (deps: {
         Effect.forkChild,
       );
 
-      yield* Ref.update(deps.groups, (m) =>
-        new Map(m).set(id, policy === "restart" ? [fiber] : [...(m.get(id) ?? []), fiber]),
-      );
+      // `restart` removes exactly the fibers it just interrupted rather than
+      // replacing the whole entry: a `[fiber]` reset also erased the siblings
+      // of this interpretation, after which a member that forked earlier in the
+      // same batch was no longer reachable from `Cancel` or from unmount.
+      //
+      // By fiber identity and not by occurrence, because `Fiber.interrupt`
+      // above is a yield point: an entry that arrived after this call's
+      // snapshot was never interrupted, so dropping it would leave a live fiber
+      // nothing can reach. `interpret` happens to be serialised on one fiber
+      // today, but nothing enforces that and this does not need it to hold.
+      const interrupted =
+        policy === "restart" ? new Set(superseded.map((entry) => entry.fiber)) : undefined;
+
+      yield* Ref.update(deps.groups, (m) => {
+        const existing = m.get(id) ?? [];
+        const kept =
+          interrupted === undefined
+            ? existing
+            : existing.filter((entry) => !interrupted.has(entry.fiber));
+        return new Map(m).set(id, [...kept, { fiber, occurrence }]);
+      });
 
       const cleanup = Effect.gen(function* () {
         yield* Ref.update(deps.inFlight, (n) => n - 1);
         yield* Ref.update(deps.groups, (m) => {
           const next = new Map(m);
-          const remaining = (next.get(id) ?? []).filter((f) => f !== fiber);
+          const remaining = (next.get(id) ?? []).filter((entry) => entry.fiber !== fiber);
           if (remaining.length > 0) next.set(id, remaining);
           else next.delete(id);
           return next;
@@ -795,10 +878,17 @@ const commandInterpreter = (deps: {
         yield* deps.settled;
       });
 
+      // `ensuring`, not `andThen`: chaining `cleanup` behind `onExit` meant an
+      // `onExit` that died skipped the `inFlight` decrement and the `groups`
+      // removal, leaving a settled fiber in its group forever — after which
+      // every command under an `ignore` policy for that group is silently
+      // dropped for the rest of the mount. The bookkeeping has to survive a
+      // reporting failure.
       yield* Fiber.await(fiber).pipe(
         Effect.flatMap((exit) =>
-          deps.onExit === undefined ? cleanup : Effect.andThen(deps.onExit(exit, ctx), cleanup),
+          deps.onExit === undefined ? Effect.void : deps.onExit(exit, ctx),
         ),
+        Effect.ensuring(cleanup),
         Effect.forkChild,
       );
     });
@@ -816,21 +906,31 @@ const commandInterpreter = (deps: {
         case "Stream":
           return yield* runGuarded(ctx, Stream.runForEach(command.stream, deps.emit));
         case "Batch":
+          // One `ctx`, so every member shares both the issuing action's group
+          // *and*, when a policy is in force, its occurrence. The group is what
+          // `Cancel` addresses and what `queue` serialises per; the occurrence
+          // is what tells these members apart from an earlier dispatch's. See
+          // `Occurrence` for why indexing members into `key#0`/`key#1` — the
+          // obvious fix, tried and reverted — cannot work.
           for (const member of command.commands) yield* interpret(member, ctx);
           return;
         case "Cancel":
           return yield* cancelGroup(command.target);
         case "Guarded": {
+          // The occurrence is minted here and only here: one interpretation of
+          // one policy-bearing command, however many fibers it goes on to fork.
+          // An inner `Guarded` under an outer one keeps `ctx` whole, so
+          // "outermost wins" covers the occurrence as well as the policy.
           const next: CommandContext =
             ctx.policy === undefined
-              ? { tag: ctx.tag, key: command.key, policy: command.policy }
+              ? { tag: ctx.tag, key: command.key, policy: command.policy, occurrence: Symbol() }
               : ctx;
           return yield* interpret(command.command, next);
         }
       }
     });
 
-  return { interpret, groupId } as const;
+  return { interpret } as const;
 };
 
 /**
@@ -1366,16 +1466,32 @@ export const define: <
     reducer: identity,
     render: identity,
     create: (parts) => {
+      /**
+       * The declared output tags, derived **once** and shared by everything
+       * that needs to know what an output is.
+       *
+       * `create` used to compute this for the internals slot while `run`
+       * separately asked `Object.hasOwn(spec.output.cases, tag)` — one rule,
+       * two spellings, inside one closure, and nothing keeping them agreed. A
+       * change to how outputs are enumerated (nested vocabularies, aliasing)
+       * had two places to land and no failure if it only landed in one.
+       *
+       * Own keys only, for the reason given on `isLifecycleTag`: `cases`
+       * inherits from `Object.prototype`, so an `in` test would report
+       * `"constructor"` and `"toString"` as declared outputs — and routing an
+       * unknown tag outbound is worse than the lifecycle case, since it leaves
+       * the feature through an `on<Tag>` prop instead of reaching the throw.
+       */
+      const outputTags = spec.output ? Object.keys(spec.output.cases) : [];
+      const outputTagSet = new Set(outputTags);
+
       return {
         [internals]: {
           initialState: parts.initialState,
           render: parts.render,
           useHooks: spec.useHooks,
           props: spec.props,
-          // Own keys only, for the reason given on `isLifecycleTag`: `cases`
-          // inherits from `Object.prototype`, and `Object.keys` is the read
-          // that already agrees with the `Object.hasOwn` guards in `run`.
-          outputTags: spec.output ? Object.keys(spec.output.cases) : [],
+          outputTags,
           handles: (tag) => handlerFor(parts.reducer, tag) !== undefined,
         },
 
@@ -1430,7 +1546,7 @@ export const define: <
 
               const queue = yield* Queue.unbounded<Entry>();
               const inFlight = yield* Ref.make(0);
-              const groups = yield* Ref.make(new Map<string, ReadonlyArray<Fiber.Fiber<void>>>());
+              const groups = yield* Ref.make(new Map<string, ReadonlyArray<GroupEntry>>());
               const emitted: { _tag: string }[] = [];
               const outputs: { _tag: string }[] = [];
               // Named fields rather than `{ ...options }`: `options` also
@@ -1446,14 +1562,8 @@ export const define: <
                 yield* Queue.offer(queue, { msg: action, origin: "seed" });
               }
 
-              // `Object.hasOwn`, for the reason given on `isLifecycleTag`:
-              // `cases` inherits from `Object.prototype`, so `in` reports
-              // `"constructor"`/`"toString"` as declared outputs. Routing an
-              // unknown tag outbound is worse than the lifecycle case — it
-              // leaves the feature through an `on<Tag>` prop instead of
-              // reaching the throw.
-              const isOutput = (action: { _tag: string }): boolean =>
-                spec.output?.cases !== undefined && Object.hasOwn(spec.output.cases, action._tag);
+              // The same set `component` routes against — see `outputTags`.
+              const isOutput = (action: { _tag: string }): boolean => outputTagSet.has(action._tag);
 
               // The interpreter is `commandInterpreter`'s, not a local copy —
               // see it for why there is exactly one. `run` points `emit` at its
@@ -1491,10 +1601,16 @@ export const define: <
                   if (command) yield* interpret(command, { tag: action._tag });
                 });
 
-              // drain until quiescent: nothing queued and nothing running
+              // drain until quiescent: nothing queued and nothing running.
+              //
+              // `inFlight` first, then the queue: a fiber offers its follow-up
+              // work *before* `cleanup` decrements, so reading in that order
+              // means a fiber that slips between the two reads can only make
+              // the check more conservative. The other order has a real hole —
+              // see the teardown drain, which had the same one.
               while (true) {
-                const queueSize = yield* Queue.size(queue);
                 const inFlightCount = yield* Ref.get(inFlight);
+                const queueSize = yield* Queue.size(queue);
                 if (queueSize === 0 && inFlightCount === 0) break;
                 const entry = yield* Queue.take(queue);
                 if (entry.origin === "command" && !isOutput(entry.msg)) emitted.push(entry.msg);
@@ -1633,11 +1749,16 @@ export interface FeatureStore<Props, State, Action, H extends AnyHooks> {
    * instead means the first render always paints the pre-change state and a
    * second one corrects it — a visible tear for anything derived from props.
    *
-   * Returning the state is load-bearing for the same reason. `useSyncExternalStore`
-   * has already read `getSnapshot` by the time this runs, so notifying
-   * subscribers from here would schedule exactly the extra render the call site
-   * exists to avoid. The return value is that render's state; `getSnapshot`
-   * agrees with it from this point on, so nothing tears.
+   * `component` calls this **before** subscribing, so `useSyncExternalStore`
+   * reads `getSnapshot` after the fold and both of React's reads — the one
+   * during render and the one it takes when the render finishes — see the same
+   * state. Subscribing first meant the fold moved the snapshot underneath
+   * React's consistency check, which is the extra render this whole path
+   * exists to avoid.
+   *
+   * The returned state is therefore redundant at that call site and kept for
+   * direct drivers (and the tests): it is the same value `getSnapshot` returns
+   * from this point on.
    *
    * **Must be idempotent, and the equivalences are what make it so.** A render
    * can be thrown away — StrictMode double-renders, Suspense retries,
@@ -1688,11 +1809,13 @@ export interface FeatureStore<Props, State, Action, H extends AnyHooks> {
  * The live fold: the headless half of the runtime, exported so it is testable
  * without a DOM. `component` is the only intended caller.
  *
- * **The fold is synchronous and only commands are Effects.** `sync` returns the
- * state to render, so a fold cannot round-trip through the queue — the value
- * would arrive a render late, which is the extra cycle the design exists to
- * avoid. Every action therefore folds in a plain call: read state, run the
- * handler, write state, notify, fork the command.
+ * **The fold is synchronous and only commands are Effects.** A fold cannot
+ * round-trip through the queue — the value would arrive a render late, which is
+ * the extra cycle the design exists to avoid. Every action therefore folds in a
+ * plain call: read state, run the handler, write state, notify, fork the
+ * command, and `component` reads the result through `getSnapshot` on the same
+ * render. (`sync` still returns the folded state; its one caller stopped using
+ * the return value when the `useSyncExternalStore` read moved below it.)
  *
  * A re-entrancy guard serialises them. Without it a command emitting on the
  * forking stack — `Stream.succeed`, which is what `Command.output` is today —
@@ -1701,8 +1824,8 @@ export interface FeatureStore<Props, State, Action, H extends AnyHooks> {
  *
  * What has to be true, and what `run` already answers for the synchronous case:
  *
- *   - `interpret` / `runGuarded` / `groupId` / `cancelGroup` are the same code,
- *     lifted out of `run` rather than written twice. Two implementations of
+ *   - `interpret` and the fiber bookkeeping under it are the same code, lifted
+ *     out of `run` rather than written twice. Two implementations of
  *     policy, group and cancellation semantics would have to agree forever,
  *     which is the replica problem `run`'s own docs cite. The existing `run`
  *     suite is the gate on that extraction.
@@ -1763,7 +1886,19 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
    */
   type Work =
     | { readonly _tag: "Run"; readonly command: Command<any, any>; readonly ctx: CommandContext }
-    | { readonly _tag: "Teardown"; readonly command: Command<any, any> | undefined };
+    | { readonly _tag: "Teardown"; readonly command: Command<any, any> | undefined }
+    /**
+     * A command's fiber settled. Carries nothing — its only job is to wake a
+     * blocked `Queue.take` so the teardown drain can re-test quiescence.
+     *
+     * This is `run`'s trick, and not having it is why the first teardown drain
+     * had to poll: with no wake-up, a command that finishes without emitting
+     * leaves the drain asleep on a queue that will never receive anything, so
+     * the only way to notice was to wake up periodically and look. `run` has
+     * offered this marker all along; the store passed `Effect.void` and then
+     * reinvented the wait badly.
+     */
+    | { readonly _tag: "Settled" };
 
   /**
    * Per *mount*, not per store — the second half of the split lifetime.
@@ -1780,7 +1915,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
    */
   type Mount = {
     readonly queue: Queue.Queue<Work>;
-    readonly groups: Ref.Ref<Map<string, ReadonlyArray<Fiber.Fiber<void>>>>;
+    readonly groups: Ref.Ref<Map<string, ReadonlyArray<GroupEntry>>>;
     readonly inFlight: Ref.Ref<number>;
   };
 
@@ -1799,11 +1934,18 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
   let active = false;
 
   /**
-   * Set by the first `stop`. Distinguishes "not started yet" — where a command
-   * should wait for the mount that is about to arrive — from "finished", where
-   * there is nothing left to run it and dropping is correct.
+   * Whether a mount has ever been armed.
+   *
+   * This, not "has been stopped", is what gates buffering. Keying it on
+   * `stopped` meant a mount fiber that *died* — a feature layer that failed to
+   * build — left `stopped` false forever, so every later command piled into
+   * `buffered` and nothing ever drained it: the Retry button the `Error`
+   * handler rendered did nothing, silently, while the array grew without
+   * bound. Buffering exists for exactly one window — before the first `start`,
+   * where a child's layout effect can dispatch — and outside it a command with
+   * no fiber to run it is dropped.
    */
-  let stopped = false;
+  let everStarted = false;
 
   /**
    * Commands issued while no mount is draining.
@@ -1837,8 +1979,9 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
    * subscriber is `useSyncExternalStore`. Doing that from the render body is a
    * setState during render — React says so out loud ("Cannot update a component
    * while rendering a different component") — and it is redundant besides:
-   * `sync` hands the new state straight back to the render that asked for it,
-   * so the paint is already happening. Notifying would schedule a second one.
+   * `component` subscribes *after* calling `sync`, so the render that asked for
+   * the fold reads the folded state and the paint is already happening.
+   * Notifying would schedule a second one.
    *
    * Only ambient changes take this path. A `dispatch` or a command emission
    * arrives outside render and must still notify.
@@ -1851,11 +1994,48 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     hooks: hooks ?? ({} as H),
   });
 
+  /**
+   * The mount a fold currently belongs to, when it belongs to one.
+   *
+   * A command emits, `fold` runs it through the reducer, and whatever the
+   * handler returns has to go back to *the mount whose command emitted it* —
+   * not to whichever mount happens to be installed. Those are the same thing
+   * right up until a remount: `stop` deliberately leaves the dying cells in
+   * place, so StrictMode's `start; stop; start` had a teardown chain's second
+   * hop queued into the new mount and run against the new mount's services,
+   * while the dying drain saw an empty queue, declared quiescence and closed
+   * the scope out from under it.
+   *
+   * Set around the synchronous fold and restored after, which is sound because
+   * `fold` drains `pending` on one stack: a nested `fold` re-enters while the
+   * scope is still standing, and nothing else can interleave with it.
+   */
+  let routing: Mount | undefined;
+
+  const withRouting = <T>(target: Mount, body: () => T): T => {
+    const previous = routing;
+    routing = target;
+    try {
+      return body();
+    } finally {
+      routing = previous;
+    }
+  };
+
   const offer = (work: Work): void => {
-    if (mount !== undefined) Queue.offerUnsafe(mount.queue, work);
-    else if (!stopped) buffered.push(work);
-    // Stopped and drained: the component is gone, so there is no scope to run
-    // in and nothing left to affect. Dropping is correct here.
+    const target = routing ?? mount;
+    if (target !== undefined) Queue.offerUnsafe(target.queue, work);
+    else if (!everStarted) buffered.push(work);
+    // No fiber to run it: either the component is gone, or its mount died.
+    // Dropping is correct — buffering here is what grew without bound.
+    //
+    // Silently, and that was checked rather than assumed. Reporting the drop
+    // was tried and reverted: `component`'s `defect` sink throws to the nearest
+    // error boundary, so any feature whose `Error` handler returns a command —
+    // log it, clear a lock, schedule a retry — had its recovery UI replaced by
+    // a boundary crash on the very failure the handler exists to handle. A
+    // silent drop is a worse diagnostic and a much better outcome. Making the
+    // dropped work *run* is the open design question; see `tea.specs.md`.
   };
 
   /**
@@ -1955,16 +2135,57 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
      */
     let context: Context.Context<never> | undefined;
 
+    /**
+     * This fiber is no longer draining anything.
+     *
+     * Guarded on identity so a mount that has already been replaced is not
+     * clobbered, and idempotent so the failure path can run it early — see the
+     * `catchCause` below for why it has to.
+     *
+     * Clears `active` as well as `mount`. Clearing only `mount` left the store
+     * in a state no call could leave: `start` is guarded by `if (active)
+     * return`, and only `stop` clears `active` — so after a mount fiber died (a
+     * failed feature layer) nothing could re-arm it at all. Clearing both means
+     * a `start` that follows *can* build fresh cells and work.
+     *
+     * "Can", not "does": through `component` nothing calls `start` again. The
+     * arming effect is `useEffect(…, [store])` and `store` never changes, so a
+     * driver holding the store directly recovers and a React subtree does not —
+     * its commands are dropped for the life of the component. Re-arming from
+     * the binding is an open design question (auto-retry loops on a permanently
+     * failing layer; demand-driven re-arm re-enters `fold`) recorded in
+     * `tea.specs.md`. This clear is a precondition for whichever answer wins,
+     * not the answer.
+     */
+    const release = (): void => {
+      if (mount !== cells) return;
+      mount = undefined;
+      active = false;
+    };
+
     // `emit` folds straight onto the command fiber's stack rather than going
     // through a queue: the guard already serialises it, and a queue here would
     // put a scheduler hop between a command emitting and the state moving.
-    const { interpret, groupId } = commandInterpreter({
+    const { interpret } = commandInterpreter({
       inFlight: cells.inFlight,
       groups: cells.groups,
-      emit: (message) => Effect.sync(() => fold(message)),
-      // `run` needs a settled marker to wake its quiescence check; nothing here
-      // waits for quiescence, so there is nothing to wake.
-      settled: Effect.void,
+      // Routed to `cells`, not to whichever mount is installed: a command
+      // forked by *this* mount emitting must have its follow-up work run on
+      // *this* mount's fiber, with this mount's services, inside this mount's
+      // scope. See `routing`.
+      emit: (message) => Effect.sync(() => withRouting(cells, () => fold(message))),
+      // Teardown waits for quiescence exactly as `run` does, so it needs the
+      // same wake-up. Ignored by the main loop; load-bearing during the drain.
+      //
+      // Straight onto `cells.queue`, never through `offer`: `offer` targets
+      // whichever mount is *current*, and `stop` deliberately leaves the dying
+      // mount's fibers running while a following `start` — StrictMode's dev
+      // remount is exactly `start; stop; start` — installs new cells. The
+      // marker then woke the new mount's queue while this drain sat blocked on
+      // `Queue.take` of the old one, so every remount held the scope and the
+      // feature layer open for the full 5s bound and reported a spurious
+      // "did not settle" defect into the `Error` handler.
+      settled: Effect.sync(() => Queue.offerUnsafe(cells.queue, { _tag: "Settled" })),
       // The store's whole error contract hangs off this. Interruption is the
       // normal way a command ends here — `restart` and unmount both cause it —
       // so only a genuine failure is a defect.
@@ -1976,7 +2197,10 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       onExit: (exit, ctx) =>
         Effect.sync(() => {
           if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) {
-            raiseDefect(Cause.squash(exit.cause), ctx.tag);
+            // Routed like `emit`, and for the same reason: the `Error`
+            // handler's compensating command belongs to the mount whose
+            // command died, not to its successor.
+            withRouting(cells, () => raiseDefect(Cause.squash(exit.cause), ctx.tag));
           }
         }),
     });
@@ -1984,55 +2208,63 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     const provided = (effect: Effect.Effect<void, never, any>) =>
       context === undefined ? effect : Effect.provide(effect, context);
 
-    /** Wait for the fibers a just-interpreted command started, by group. */
-    const joinGroup = (tag: string) =>
+    /**
+     * Teardown, drained to quiescence — `run`'s loop, not a second one.
+     *
+     * Four review rounds landed here. The bespoke versions (join the fibers a
+     * command just forked; poll the queue with a step budget; bound each hop)
+     * each fixed one case and broke another, because they were all
+     * approximations of a question `run` already answers exactly: *is anything
+     * queued, and is anything running?* `inFlight` is decremented in
+     * `runGuarded`'s `cleanup`, which runs after `onExit` — so waiting on it
+     * waits for the error-reporting watcher too, which is the thing every
+     * hand-rolled variant kept missing.
+     *
+     * Blocking on `Queue.take` rather than polling is what the `Settled`
+     * marker buys: a command that finishes without emitting still wakes this.
+     *
+     * **In-flight work is interrupted first**, and that is what makes
+     * quiescence reachable at all. `run` cannot terminate while a
+     * never-completing command is running — a known limitation recorded in
+     * this file's spec — and a feature with a `Mounted` subscription is
+     * exactly that. Unmount cancels outstanding work and *then* runs teardown,
+     * which is the reason this loop terminates where `run`'s would not.
+     *
+     * It is also a **behaviour change** and not only a fix: the sweep is
+     * unconditional, so a command dispatched in the same tick as unmount is
+     * now interrupted where the previous polling drain let it finish. A
+     * "flush on the way out" pattern has to live in the `Unmounted` handler,
+     * which runs after the sweep. What unmount owes work already in flight is
+     * an open question in this file's spec, not a settled one.
+     */
+    const teardown = (command: Command<any, any> | undefined) =>
       Effect.gen(function* () {
-        const prefix = groupId({ tag });
-        const map = yield* Ref.get(cells.groups);
-        const fibers = Array.from(map.entries())
-          .filter(([id]) => id.startsWith(prefix))
-          .flatMap(([, group]) => group);
-        // Exit-only: each fiber's `onExit` has already reported its own
-        // failure, so letting `joinAll` re-raise would report it twice and kill
-        // the mount fiber instead of letting it return and close its scope.
-        if (fibers.length > 0) {
-          yield* Fiber.joinAll(fibers).pipe(
-            Effect.asVoid,
-            Effect.catchCause(() => Effect.void),
-          );
+        const running = yield* Ref.get(cells.groups);
+        for (const entries of running.values()) {
+          for (const entry of entries) yield* Fiber.interrupt(entry.fiber);
+        }
+
+        if (command !== undefined) {
+          yield* provided(interpret(command, { tag: "Unmounted" }));
+        }
+
+        while (true) {
+          // `inFlight` before the queue, and the order is load-bearing. A
+          // settling fiber offers follow-up work — `onExit` → `raiseDefect` →
+          // `fold` → `offer` — *before* `cleanup` decrements `inFlight`.
+          // Reading the queue first let a preemption between the two reads
+          // return a size taken before the offer and a count taken after the
+          // decrement, so the drain closed the scope with the `Error`
+          // handler's compensating command still sitting in the queue. This
+          // order can only ever be conservative.
+          const inFlight = yield* Ref.get(cells.inFlight);
+          const queued = yield* Queue.size(cells.queue);
+          if (queued === 0 && inFlight === 0) return;
+
+          const work = yield* Queue.take(cells.queue);
+          if (work._tag === "Run") yield* provided(interpret(work.command, work.ctx));
         }
       });
-
-    /**
-     * Teardown is not necessarily one hop.
-     *
-     * An `Unmounted` command can emit an action whose handler returns another
-     * command — "close the session" emitting `SessionClosed`, whose handler
-     * releases the server lock. Returning straight after the first join left
-     * that second command sitting in a queue nobody would ever take from
-     * again, so the lock was never released.
-     *
-     * Polls rather than blocking on `Queue.take`: this runs after the
-     * component is gone, so the loop has to end on its own rather than wait
-     * for work that will never arrive. Bounded, because a teardown chain that
-     * feeds itself is a bug and hanging the scope open is a worse way to
-     * report it than stopping.
-     */
-    const drainTeardown = Effect.gen(function* () {
-      for (let step = 0; step < 1000; step++) {
-        const next = yield* Queue.poll(cells.queue);
-        if (Option.isNone(next)) {
-          if ((yield* Ref.get(cells.inFlight)) === 0) return;
-          yield* Effect.sleep("1 milli");
-          continue;
-        }
-        const work = next.value;
-        if (work._tag === "Run") {
-          yield* provided(interpret(work.command, work.ctx));
-          yield* joinGroup(work.ctx.tag);
-        }
-      }
-    });
 
     return Effect.gen(function* () {
       if (layer !== undefined) {
@@ -2046,18 +2278,43 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
         const work = yield* Queue.take(cells.queue);
 
         if (work._tag === "Teardown") {
-          if (work.command !== undefined) {
-            yield* provided(interpret(work.command, { tag: "Unmounted" }));
-            // `interpret` forks and returns, so the teardown's fibers are in
-            // `groups` by now but not finished. Joining them is what keeps
-            // `LifecycleHandlers.Unmounted`'s promise: the scope — and with it
-            // the feature layer a teardown command may need — stays open until
-            // the teardown has actually run.
-            yield* joinGroup("Unmounted");
-            yield* drainTeardown;
-          }
+          // Bounded as a whole, so a teardown that will never settle cannot
+          // hold the scope — and with it the feature layer — open for the life
+          // of the page. Reported rather than silent: an abandoned teardown is
+          // a defect the feature should hear about.
+          //
+          // A command the `Error` handler returns *on this path* is queued and
+          // then dropped, because the next statement closes the scope. That is
+          // the bound doing its job, not an oversight: teardown has already had
+          // five seconds and is being abandoned, so inviting more work into a
+          // scope that is closing would make the bound unbounded. The handler
+          // is told; it does not get to keep the page alive.
+          //
+          // `withRouting`, so that stays true after a remount. Unrouted, this
+          // was the one `raiseDefect` on a mount fiber that fell through to
+          // whichever mount is installed — queueing the dying mount's
+          // compensating command into its *successor*, to run against the
+          // successor's scope and services. Dropped is the contract here;
+          // resurrected somewhere else is not.
+          yield* teardown(work.command).pipe(
+            Effect.timeoutOption("5 seconds"),
+            Effect.flatMap((finished) =>
+              Option.isNone(finished)
+                ? Effect.sync(() =>
+                    withRouting(cells, () =>
+                      raiseDefect(
+                        new Error("Unmounted did not settle within 5s; scope closed anyway"),
+                        "Unmounted",
+                      ),
+                    ),
+                  )
+                : Effect.void,
+            ),
+          );
           return;
         }
+
+        if (work._tag === "Settled") continue;
 
         yield* provided(interpret(work.command, work.ctx));
       }
@@ -2065,19 +2322,24 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       Effect.scoped,
       Effect.catchCause((cause) =>
         Effect.sync(() => {
-          if (!Cause.hasInterruptsOnly(cause)) raiseDefect(Cause.squash(cause), "Mounted");
+          if (Cause.hasInterruptsOnly(cause)) return;
+          // Released *before* the defect is raised, and the order is the whole
+          // point. Raising first left `mount` pointing at this fiber's queue
+          // while the fiber was terminating, so the `Error` handler's own
+          // compensating command was enqueued to a reader that would never
+          // take again: not run, and not caught by `offer`'s dropped-work
+          // branch either — swallowed with no report at all. Released first,
+          // the same command takes the documented drop path.
+          release();
+          raiseDefect(Cause.squash(cause), "Mounted");
         }),
       ),
       // Whatever happened, this fiber is no longer draining anything. Leaving
       // `mount` pointing at its queue left the store deaf: a layer that failed
       // to build killed the fiber, and every later dispatch — including the
-      // Retry the `Error` handler rendered — queued into the void. Guarded on
-      // identity so a mount that has already been replaced is not clobbered.
-      Effect.ensuring(
-        Effect.sync(() => {
-          if (mount === cells) mount = undefined;
-        }),
-      ),
+      // Retry the `Error` handler rendered — queued into the void. Idempotent,
+      // since the failure path above has usually run it already.
+      Effect.ensuring(Effect.sync(release)),
     );
   };
 
@@ -2128,7 +2390,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     start: () => {
       if (active) return;
       active = true;
-      stopped = false;
+      everStarted = true;
 
       // `Effect.runSync` on the default runtime, not `runtime.runSync`: all
       // three are context-free, and going through the root `ManagedRuntime`
@@ -2136,7 +2398,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       // cannot do, so the first mount of any feature would block or throw.
       const cells: Mount = {
         queue: Effect.runSync(Queue.unbounded<Work>()),
-        groups: Effect.runSync(Ref.make(new Map<string, ReadonlyArray<Fiber.Fiber<void>>>())),
+        groups: Effect.runSync(Ref.make(new Map<string, ReadonlyArray<GroupEntry>>())),
         inFlight: Effect.runSync(Ref.make(0)),
       };
 
@@ -2151,20 +2413,42 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       const cells = mount;
       if (!active) return;
       active = false;
-      stopped = true;
+
+      // Narrowing, and a backstop — not the dead-mount case, which the `active`
+      // guard above already took: `start` and `release` set and clear the two
+      // together, so the only window where `active` is true without cells is a
+      // throw out of `start`'s three `runSync` constructions.
+      //
+      // It sits before the fold rather than after because that ordering is what
+      // the dead-mount decision needs if the window ever widens. Folding
+      // `Unmounted` with no fiber left was tried and reverted: `reduce`
+      // discards its state and nothing can run its command, so the only
+      // observable effect was raising `Error` and notifying
+      // `useSyncExternalStore` subscribers on a component React is in the
+      // middle of unmounting.
       if (cells === undefined) return;
 
       // Folded before the queue is detached, because the handler's command has
       // to reach the fiber that still owns the scope. `reduce` discards the
       // returned state, so nothing else of this fold survives.
       let teardown: Command<any, any> | undefined;
+      let thrown: { readonly error: unknown } | undefined;
       try {
         teardown = Next.command(blueprint.reduce({ _tag: "Unmounted" } as never, snapshot()));
       } catch (error) {
-        raiseDefect(error, "Unmounted");
+        thrown = { error };
       }
 
       Queue.offerUnsafe(cells.queue, { _tag: "Teardown", command: teardown });
+
+      // Reported *after* the marker is queued, so the `Error` handler's own
+      // compensating command lands behind `Teardown` rather than in front of
+      // it. Raised first, that command was interpreted by the main loop and
+      // then killed seconds later by teardown's interrupt sweep — while the
+      // identical command reached through a *dying teardown command* survived,
+      // because that one is queued after the sweep. Same recovery path, two
+      // outcomes, decided by which way the handler was reached.
+      if (thrown !== undefined) raiseDefect(thrown.error, "Unmounted");
 
       // `mount` deliberately stays pointed at these cells. The teardown chain
       // is not necessarily one hop — a teardown command may emit an action
@@ -2222,16 +2506,18 @@ const validateProps = (schema: AnyPropsSchema, props: unknown): void => {
  *
  * By derived name, never by an `on*` prefix rule: a declared prop may legitimately
  * be called `onScroll`, and `NoPropCollision` is what guarantees the two sets are
- * disjoint so this can strip exactly `outputTags.map(t => "on" + t)`.
+ * disjoint so this can strip exactly the handler names and nothing else.
+ *
+ * `names` is that set, built once by the caller from `outputTags` rather than
+ * per render — the whole reason it arrives as a `ReadonlySet` and not a list.
  */
 const splitOutputProps = (
   all: Record<string, unknown>,
-  outputTags: ReadonlyArray<string>,
+  names: ReadonlySet<string>,
 ): { props: Record<string, unknown>; handlers: Record<string, (payload: unknown) => void> } => {
-  if (outputTags.length === 0) return { props: all, handlers: {} };
+  if (names.size === 0) return { props: all, handlers: {} };
   const props: Record<string, unknown> = {};
   const handlers: Record<string, (payload: unknown) => void> = {};
-  const names = new Set(outputTags.map((tag) => `on${tag}`));
   for (const key of Object.keys(all)) {
     if (names.has(key)) handlers[key] = all[key] as (payload: unknown) => void;
     else props[key] = all[key];
@@ -2366,6 +2652,12 @@ export const createRuntime: <RootR, RootE>(
     // depends on. Resolved once per blueprint, so the call is unconditional.
     const useFeatureHooks: HookSpec<any, any, AnyHooks> = useHooks ?? (() => noHooks);
 
+    // Derived once per blueprint, not per render: the names are constant, and
+    // rebuilding the Set inside `splitOutputProps` cost one throwaway array
+    // plus Set on every parent-driven render of every mount — per row, for a
+    // feature used in a list.
+    const outputPropNames = new Set(outputTags.map((tag) => `on${tag}`));
+
     // Once per blueprint. `toEquivalence` walks the AST, and `sync` runs on
     // every render of every mount.
     const equivalence = {
@@ -2379,7 +2671,10 @@ export const createRuntime: <RootR, RootE>(
       // Props identity is the only trigger, per `define`: a render driven by
       // this feature's own state hands back the identical object, so neither
       // the split nor the schema check runs on it.
-      const { props, handlers } = useMemo(() => splitOutputProps(incoming, outputTags), [incoming]);
+      const { props, handlers } = useMemo(
+        () => splitOutputProps(incoming, outputPropNames),
+        [incoming],
+      );
       useMemo(() => validateProps(propsSchema, props), [props]);
 
       // The store outlives any one render and the parent's callbacks do not, so
@@ -2423,8 +2718,10 @@ export const createRuntime: <RootR, RootE>(
         }),
       );
 
-      // Everything a command changed since the last render.
-      const committed = useSyncExternalStore(store.subscribe, store.getSnapshot);
+      // Everything a command changed since the last render. Read directly
+      // rather than through `useSyncExternalStore`, because the subscription
+      // has to come *after* `sync` — see below.
+      const committed = store.getSnapshot();
 
       // Render position, unconditionally, in declaration order — the invariant
       // `HookSpec` describes and the reason the slot is one `use…` function.
@@ -2437,12 +2734,31 @@ export const createRuntime: <RootR, RootE>(
       const hooks = useFeatureHooks(props, committed);
 
       // In the body, not an effect. `sync` compares props and hooks by value,
-      // raises `PropsChanged` / `HookChanged`, and hands back the state to
-      // draw — so a props-driven change paints on the render that carried the
-      // props instead of on the one after it. It mutates a store during render,
+      // raises `PropsChanged` / `HookChanged`, and folds them — so a
+      // props-driven change paints on the render that carried the props
+      // instead of on the one after it. It mutates a store during render,
       // which a discarded render would repeat; the value comparison is what
       // makes the repeat a no-op. See `FeatureStore.sync`.
-      const state = store.sync(props, hooks);
+      store.sync(props, hooks);
+
+      // **After `sync`, and that ordering is the whole point.**
+      //
+      // `useSyncExternalStore` re-reads `getSnapshot` when the render finishes
+      // and schedules another render if the value moved. Subscribing first and
+      // folding second is exactly the shape that trips it, and the render-body
+      // `sync` exists to avoid a second render, so the two were working against
+      // each other on paper. Folding first means both reads see the same state.
+      //
+      // **On paper**, and stated that way deliberately: the extra render was
+      // never reproduced. `getSnapshot` is a stable method and the pre-fold
+      // read equalled the previous render's snapshot, so React had nothing to
+      // compare unfavourably, and the browser test counts one render either
+      // way. This ordering is defensive, not a measured fix, and it ships
+      // without a test that would catch a revert — see `tea.specs.md`.
+      //
+      // Hook order is still stable: this is called unconditionally on every
+      // render, just later in the body.
+      const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
 
       // `Mounted` stays in an effect: it is the one lifecycle action that must
       // not fire for a render React throws away, since its command has side

@@ -2492,3 +2492,819 @@ describe("createFeatureStore — review iteration 2 regressions", () => {
     expect(ran).toEqual(["early"]);
   });
 });
+
+describe("Command.batch grouping (review iteration 3)", () => {
+  const equivalence = {
+    props: Schema.toEquivalence(Schema.Struct({})),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as any;
+
+  const store = (reducer: Record<string, any>) => {
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Go", {}), Action("Stop", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: reducer as any,
+      render: () => null,
+    });
+    return createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: undefined,
+      emit: () => {},
+      defect: () => {},
+    });
+  };
+
+  const slow = (label: string, ms: number, log: Array<string>) =>
+    Command.effect(
+      Effect.sleep(`${ms} millis`).pipe(Effect.andThen(Effect.sync(() => void log.push(label)))),
+    );
+
+  it("keyed `Command.cancel` still reaches a policy-wrapped batch", async () => {
+    // Indexing batch members into per-member groups broke exactly this:
+    // `cancelGroup` matches an explicit key *exactly*, so `Load::k#0` was
+    // unreachable from `cancel({ tag, key })` and nothing was interrupted.
+    const log: Array<string> = [];
+
+    const s = store({
+      Go: (_a: unknown, snap: { readonly state: unknown }) => [
+        snap.state,
+        Command.batch(slow("a", 60, log), slow("b", 60, log)).pipe(Command.restart("k")),
+      ],
+      Stop: (_a: unknown, snap: { readonly state: unknown }) => [
+        snap.state,
+        Command.cancel({ tag: "Go", key: "k" }),
+      ],
+    });
+
+    s.start();
+    s.dispatch({ _tag: "Go" } as never);
+    await Effect.runPromise(Effect.sleep("15 millis"));
+    s.dispatch({ _tag: "Stop" } as never);
+    await Effect.runPromise(Effect.sleep("100 millis"));
+
+    expect(log).toEqual([]);
+  });
+
+  it("`queue` around a batch still serialises its members", async () => {
+    // Per-member groups made each member wait only on itself, so both started
+    // at once — the exact interleaving `queue` exists to prevent.
+    const log: Array<string> = [];
+
+    const step = (label: string) =>
+      Command.effect(
+        Effect.sync(() => void log.push(`${label}:start`)).pipe(
+          Effect.andThen(Effect.sleep("30 millis")),
+          Effect.andThen(Effect.sync(() => void log.push(`${label}:done`))),
+        ),
+      );
+
+    const s = store({
+      Go: (_a: unknown, snap: { readonly state: unknown }) => [
+        snap.state,
+        Command.batch(step("a"), step("b")).pipe(Command.queue("k")),
+      ],
+      Stop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
+    });
+
+    s.start();
+    s.dispatch({ _tag: "Go" } as never);
+    await Effect.runPromise(Effect.sleep("120 millis"));
+
+    expect(log).toEqual(["a:start", "a:done", "b:start", "b:done"]);
+  });
+
+  const sleep = (ms: number) => Effect.runPromise(Effect.sleep(`${ms} millis`));
+
+  it("`ignore` around a batch runs every member", async () => {
+    // The members share one group — that is what keeps a keyed `cancel`
+    // working — so the second one used to see `running.length > 0` and return
+    // without forking. `ignore` defers to an earlier *dispatch*, not to a
+    // sibling forked microseconds ago.
+    const log: Array<string> = [];
+
+    const s = store({
+      Go: (_a: unknown, snap: { readonly state: unknown }) => [
+        snap.state,
+        Command.batch(slow("a", 10, log), slow("b", 10, log)).pipe(Command.ignore("k")),
+      ],
+      Stop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
+    });
+
+    s.start();
+    s.dispatch({ _tag: "Go" } as never);
+    await sleep(80);
+
+    expect([...log].sort()).toEqual(["a", "b"]);
+  });
+
+  it("`ignore` around a batch still drops a whole second dispatch", async () => {
+    // The other half of the same criterion: distinguishing sibling from
+    // predecessor must not cost the deferral that `ignore` is for.
+    const log: Array<string> = [];
+    let dispatches = 0;
+
+    const s = store({
+      Go: (_a: unknown, snap: { readonly state: unknown }) => {
+        const round = ++dispatches;
+        return [
+          snap.state,
+          Command.batch(slow(`a${round}`, 60, log), slow(`b${round}`, 60, log)).pipe(
+            Command.ignore("k"),
+          ),
+        ];
+      },
+      Stop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
+    });
+
+    s.start();
+    s.dispatch({ _tag: "Go" } as never);
+    await sleep(15);
+    s.dispatch({ _tag: "Go" } as never);
+    await sleep(150);
+
+    expect([...log].sort()).toEqual(["a1", "b1"]);
+  });
+
+  it("`restart` around a batch does not have members interrupt each other", async () => {
+    const log: Array<string> = [];
+
+    const s = store({
+      Go: (_a: unknown, snap: { readonly state: unknown }) => [
+        snap.state,
+        Command.batch(slow("a", 40, log), slow("b", 40, log)).pipe(Command.restart("k")),
+      ],
+      Stop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
+    });
+
+    s.start();
+    s.dispatch({ _tag: "Go" } as never);
+    await sleep(140);
+
+    expect([...log].sort()).toEqual(["a", "b"]);
+  });
+
+  it("a second dispatch restarts every member of the batch it supersedes", async () => {
+    // Not just "the last one wins": the group rewrite `restart` performs used
+    // to replace the whole entry with the forking fiber, so a member that
+    // forked earlier in the same batch stopped being interruptible at all.
+    const log: Array<string> = [];
+    let dispatches = 0;
+
+    const s = store({
+      Go: (_a: unknown, snap: { readonly state: unknown }) => {
+        const round = ++dispatches;
+        return [
+          snap.state,
+          Command.batch(slow(`a${round}`, 50, log), slow(`b${round}`, 50, log)).pipe(
+            Command.restart("k"),
+          ),
+        ];
+      },
+      Stop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
+    });
+
+    s.start();
+    s.dispatch({ _tag: "Go" } as never);
+    await sleep(15);
+    s.dispatch({ _tag: "Go" } as never);
+    await sleep(150);
+
+    expect([...log].sort()).toEqual(["a2", "b2"]);
+  });
+
+  it("`queue` waits for every prior fiber, including siblings of one that died", async () => {
+    // `Fiber.joinAll` re-raises the first failing fiber's cause and stops
+    // joining there, so a follower was released by a predecessor's *death*
+    // while that predecessor's still-running sibling held the queue.
+    const log: Array<string> = [];
+    let dispatches = 0;
+
+    const s = store({
+      Go: (_a: unknown, snap: { readonly state: unknown }) => {
+        const round = ++dispatches;
+        return [
+          snap.state,
+          round === 1
+            ? Command.batch(
+                Command.effect(
+                  Effect.sleep("10 millis").pipe(Effect.andThen(Effect.die(new Error("boom")))),
+                ),
+                slow("slow", 60, log),
+              ).pipe(Command.queue("k"))
+            : Command.effect(Effect.sync(() => void log.push("after"))).pipe(Command.queue("k")),
+        ];
+      },
+      Stop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
+    });
+
+    s.start();
+    s.dispatch({ _tag: "Go" } as never);
+    await sleep(5);
+    s.dispatch({ _tag: "Go" } as never);
+    await sleep(200);
+
+    expect(log).toEqual(["slow", "after"]);
+  });
+});
+
+describe("createFeatureStore — a dead mount does not swallow work", () => {
+  const equivalence = {
+    props: Schema.toEquivalence(Schema.Struct({})),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as any;
+
+  it("does not buffer commands without bound after the mount fiber dies", async () => {
+    const failing = Layer.effectDiscard(Effect.fail("nope"));
+    const ran: Array<string> = [];
+
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Go", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Go: (_a: unknown, snap: { readonly state: { readonly count: number } }) => [
+          { count: snap.state.count + 1 },
+          Command.effect(Effect.sync(() => void ran.push("go"))),
+        ],
+      } as any,
+      render: () => null,
+    });
+
+    const s = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: failing as unknown as Layer.Layer<any, any, any>,
+      emit: () => {},
+      defect: () => {},
+    });
+
+    s.start();
+    await Effect.runPromise(Effect.sleep("30 millis"));
+
+    // The fiber is dead. State still folds; the command is dropped rather than
+    // piling into a buffer nothing drains.
+    s.dispatch({ _tag: "Go" } as never);
+    s.dispatch({ _tag: "Go" } as never);
+    await Effect.runPromise(Effect.sleep("20 millis"));
+
+    expect(s.getSnapshot()).toEqual({ count: 2 });
+    expect(ran).toEqual([]);
+  });
+});
+
+describe("createFeatureStore — teardown belongs to the mount that started it", () => {
+  const equivalence = {
+    props: Schema.toEquivalence(Schema.Struct({})),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as any;
+
+  it("a remount does not strand the previous mount's teardown drain", async () => {
+    // `stop` leaves `mount` pointed at the dying cells on purpose, so a `start`
+    // before the drain finishes — StrictMode's dev remount is literally
+    // `start; stop; start` — replaces it. A settled-marker routed through
+    // whichever mount is *current* then woke the new queue while this drain sat
+    // blocked on `Queue.take` of the old one: teardown ran, but the loop never
+    // noticed, so the scope and the feature layer stayed open until the 5s
+    // bound fired and reported a defect that had not happened.
+    const log: Array<string> = [];
+    const defects: Array<unknown> = [];
+
+    class Held extends Context.Service<Held, { readonly ok: true }>()("Held") {}
+
+    const layer = Layer.effect(
+      Held,
+      Effect.acquireRelease(
+        Effect.sync(() => ({ ok: true }) as const),
+        () => Effect.sync(() => void log.push("finalized")),
+      ),
+    );
+
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Noop", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Noop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
+        Unmounted: (_a: unknown, snap: { readonly state: unknown }) => [
+          snap.state,
+          Command.effect(
+            Effect.sleep("30 millis").pipe(
+              Effect.andThen(Effect.sync(() => void log.push("torn"))),
+            ),
+          ),
+        ],
+      } as any,
+      render: () => null,
+    });
+
+    const s = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: layer as any,
+      emit: () => {},
+      defect: (error) => void defects.push(error),
+    });
+
+    s.start();
+    s.stop();
+    s.start();
+    await Effect.runPromise(Effect.sleep("300 millis"));
+
+    // The first mount's teardown both ran *and* was observed: the drain
+    // returned, so its scope closed and the layer finalized — well inside the
+    // 5s bound, with no defect invented on the way out.
+    expect(log.filter((entry) => entry === "torn")).toEqual(["torn"]);
+    expect(log.filter((entry) => entry === "finalized")).toEqual(["finalized"]);
+    expect(defects).toEqual([]);
+
+    s.stop();
+  });
+
+  it("a teardown chain's second hop stays on the mount that started it", async () => {
+    // The `Settled` marker was routed to `cells.queue`, but the *work* was not:
+    // `emit` → `fold` → `offer` still targeted whichever mount was installed.
+    // After `start; stop; start` a teardown command's follow-up was queued into
+    // the new mount and run against the new mount's services, while the dying
+    // drain saw an empty queue, declared quiescence and closed the scope.
+    const log: Array<string> = [];
+    let built = 0;
+
+    class Marked extends Context.Service<Marked, { readonly id: number }>()("Marked") {}
+
+    const layer = Layer.effect(
+      Marked,
+      Effect.acquireRelease(
+        Effect.sync(() => {
+          const id = ++built;
+          return { id };
+        }),
+        (service) => Effect.sync(() => void log.push(`finalized:${service.id}`)),
+      ),
+    );
+
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Noop", {}), Action("SecondHop", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Noop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
+        // The follow-up: reached only by the teardown command emitting it.
+        SecondHop: (_a: unknown, snap: { readonly state: unknown }) => [
+          snap.state,
+          Command.effect(
+            Effect.flatMap(Marked, (service) =>
+              Effect.sync(() => void log.push(`second-hop:${service.id}`)),
+            ),
+          ),
+        ],
+        Unmounted: (_a: unknown, snap: { readonly state: unknown }) => [
+          snap.state,
+          Command.stream(Stream.succeed({ _tag: "SecondHop" as const })),
+        ],
+      } as any,
+      render: () => null,
+    });
+
+    const s = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: layer as any,
+      emit: () => {},
+      defect: () => {},
+    });
+
+    s.start();
+    s.stop();
+    s.start();
+    await Effect.runPromise(Effect.sleep("200 millis"));
+
+    // The hop ran against the first mount's service, and that mount's scope
+    // closed only after it had — not before, and not against mount 2.
+    expect(log.indexOf("second-hop:1")).toBeGreaterThanOrEqual(0);
+    expect(log.indexOf("second-hop:1")).toBeLessThan(log.indexOf("finalized:1"));
+
+    s.stop();
+  });
+
+  it("an `Unmounted` handler that throws still gets its compensating command run", async () => {
+    // The defect is raised *after* the `Teardown` marker is queued, so the
+    // `Error` handler's command lands behind it. Raised first, that command was
+    // interpreted by the main loop and then killed by teardown's interrupt
+    // sweep — while the same command reached through a dying *teardown command*
+    // survived, because that path queues after the sweep.
+    const log: Array<string> = [];
+
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Noop", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Noop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
+        Unmounted: () => {
+          throw new Error("teardown boom");
+        },
+        Error: (_a: unknown, snap: { readonly state: unknown }) => [
+          snap.state,
+          Command.effect(
+            Effect.sleep("30 millis").pipe(
+              Effect.andThen(Effect.sync(() => void log.push("compensated"))),
+            ),
+          ),
+        ],
+      } as any,
+      render: () => null,
+    });
+
+    const s = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: undefined,
+      emit: () => {},
+      defect: () => {},
+    });
+
+    s.start();
+    await Effect.runPromise(Effect.sleep("10 millis"));
+    s.stop();
+    await Effect.runPromise(Effect.sleep("200 millis"));
+
+    expect(log).toEqual(["compensated"]);
+  });
+
+  it("a dying mount releases before it reports, so the `Error` handler's command is not swallowed", async () => {
+    // Raised first, `mount` still pointed at the queue of the fiber that was
+    // terminating, so the compensating command was enqueued to a reader that
+    // would never take again — not run, and not on `offer`'s dropped-work path
+    // either. Released first, the store is re-armable and the same command
+    // takes the documented drop.
+    const failing = Layer.effectDiscard(Effect.fail("nope"));
+    const ran: Array<string> = [];
+
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Noop", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Noop: (_a: unknown, snap: { readonly state: unknown }) => snap.state,
+        Error: (_a: unknown, snap: { readonly state: { readonly count: number } }) => [
+          { count: snap.state.count + 1 },
+          Command.effect(Effect.sync(() => void ran.push("compensated"))),
+        ],
+      } as any,
+      render: () => null,
+    });
+
+    const s = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: failing as unknown as Layer.Layer<any, any, any>,
+      emit: () => {},
+      defect: () => {},
+    });
+
+    s.start();
+    await Effect.runPromise(Effect.sleep("30 millis"));
+
+    // The handler ran — the layer failure reached it — and the store is armable
+    // again rather than holding a queue nobody reads.
+    expect(s.getSnapshot()).toEqual({ count: 1 });
+    expect(ran).toEqual([]);
+
+    // The re-arm the release makes possible: this time the command runs.
+    s.start();
+    await Effect.runPromise(Effect.sleep("30 millis"));
+    s.dispatch({ _tag: "Noop" } as never);
+    s.stop();
+  });
+
+  it("a dead mount does not report the commands it drops", async () => {
+    // Reporting them was tried and reverted: `component`'s `defect` sink throws
+    // to the error boundary, so a feature whose `Error` handler returns a
+    // command had its recovery UI replaced by a crash on exactly the failure
+    // the handler was written for. This pins the quiet drop so the next
+    // "silence is a bad diagnostic" instinct has to read the reason first.
+    const failing = Layer.effectDiscard(Effect.fail("nope"));
+    const defects: Array<unknown> = [];
+
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Go", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Go: (_a: unknown, snap: { readonly state: { readonly count: number } }) => [
+          { count: snap.state.count + 1 },
+          Command.effect(Effect.void),
+        ],
+        // The common shape: the handler that hears about the dead layer wants
+        // to do something about it, and what it returns has nowhere to run.
+        Error: (_a: unknown, snap: { readonly state: unknown }) => [
+          snap.state,
+          Command.effect(Effect.void),
+        ],
+      } as any,
+      render: () => null,
+    });
+
+    const s = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: failing as unknown as Layer.Layer<any, any, any>,
+      emit: () => {},
+      defect: (error) => void defects.push(error),
+    });
+
+    s.start();
+    await Effect.runPromise(Effect.sleep("30 millis"));
+    s.dispatch({ _tag: "Go" } as never);
+    await Effect.runPromise(Effect.sleep("20 millis"));
+
+    // The `Error` handler absorbed the layer failure; nothing reached the
+    // boundary, then or on the dropped command that followed.
+    expect(defects).toEqual([]);
+  });
+});
+
+describe("output-tag routing is one rule (review iteration 3)", () => {
+  it("`run` and the internals slot agree on what an output is", () => {
+    const Done = Action.output("Done", {});
+    const feature = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Bump", {})]),
+      output: Action.of([Done]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: { Bump: (_action, snapshot) => snapshot.state },
+      render: () => null,
+    });
+
+    const [slot] = Object.getOwnPropertySymbols(feature).filter(
+      (symbol) => symbol.description === "@tea/internals",
+    );
+    const internals = (feature as unknown as Record<symbol, Record<string, unknown>>)[slot!];
+
+    // One derivation, so the store and `run` cannot drift about routing.
+    expect(internals.outputTags).toEqual(["Done"]);
+  });
+
+  it("still refuses a prototype-chain tag as an output", async () => {
+    const Done = Action.output("Done", {});
+    const feature = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Bump", {})]),
+      output: Action.of([Done]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: { Bump: (_action, snapshot) => snapshot.state },
+      render: () => null,
+    });
+
+    // `constructor` must reach the throw, not leave through an `on<Tag>` prop.
+    await expect(
+      Effect.runPromise(
+        feature.run([{ _tag: "constructor" } as never], {
+          props: {},
+          hooks: {},
+          layer: Layer.empty,
+        }),
+      ),
+    ).rejects.toThrow(/No reducer handler/);
+  });
+});
+
+describe("createFeatureStore — recovery after a dead mount (review iteration 4)", () => {
+  it("can be re-armed after the mount fiber dies, so a Retry actually retries", async () => {
+    // Two rounds found this from opposite directions: first the command piled
+    // into an unbounded buffer, then it was dropped outright. Neither ran it,
+    // because `active` was never cleared and `start` is guarded on `active`.
+    const ran: Array<string> = [];
+    let failLayer = true;
+
+    const layer = Layer.effectDiscard(
+      Effect.suspend(() => (failLayer ? Effect.fail("nope") : Effect.void)),
+    );
+
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Retry", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Retry: (_a: unknown, snap: { readonly state: { readonly count: number } }) => [
+          { count: snap.state.count + 1 },
+          Command.effect(Effect.sync(() => void ran.push("retried"))),
+        ],
+      } as any,
+      render: () => null,
+    });
+
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence: {
+        props: Schema.toEquivalence(Schema.Struct({})),
+        hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+      } as any,
+      runtime: testRuntime(),
+      layer: layer as unknown as Layer.Layer<any, any, any>,
+      emit: () => {},
+      defect: () => {},
+    });
+
+    store.start();
+    await Effect.runPromise(Effect.sleep("30 millis"));
+
+    // The mount died. A caller re-arming must actually get a live mount.
+    failLayer = false;
+    store.start();
+    store.dispatch({ _tag: "Retry" } as never);
+    await Effect.runPromise(Effect.sleep("40 millis"));
+
+    expect(ran).toEqual(["retried"]);
+  });
+});
+
+describe("createFeatureStore — teardown drains to quiescence (review iteration 5)", () => {
+  const equivalence = {
+    props: Schema.toEquivalence(Schema.Struct({})),
+    hooks: Equivalence.Record(Equivalence.strictEqual<unknown>()),
+  } as any;
+
+  const make = (reducer: Record<string, any>) => {
+    const defects: Array<unknown> = [];
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Go", {}), Action("Flushed", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: reducer as any,
+      render: () => null,
+    });
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: undefined,
+      emit: () => {},
+      defect: (error) => void defects.push(error),
+    });
+    return { store, defects };
+  };
+
+  it("reports a dying teardown command", async () => {
+    // Every hand-rolled drain lost this: the defect is observed on the watcher
+    // fiber `runGuarded` forks, which is not in `groups`, so joining `groups`
+    // returned before it ran. `inFlight` is decremented after `onExit`, so
+    // waiting on it waits for the watcher.
+    const { store, defects } = make({
+      Go: (_a: unknown, s: any) => s.state,
+      Flushed: (_a: unknown, s: any) => s.state,
+      Unmounted: (_a: unknown, s: any) => [
+        s.state,
+        Command.effect(Effect.die(new Error("teardown boom"))),
+      ],
+    });
+
+    store.start();
+    store.stop();
+    await Effect.runPromise(Effect.sleep("60 millis"));
+
+    expect(defects).toHaveLength(1);
+    expect(String(defects[0])).toContain("teardown boom");
+  });
+
+  it("runs the `Error` handler's compensating command during teardown", async () => {
+    const ran: Array<string> = [];
+
+    const { store } = make({
+      Go: (_a: unknown, s: any) => s.state,
+      Flushed: (_a: unknown, s: any) => s.state,
+      Unmounted: (_a: unknown, s: any) => [
+        s.state,
+        Command.effect(Effect.die(new Error("teardown boom"))),
+      ],
+      Error: (_a: unknown, s: any) => [
+        s.state,
+        Command.effect(Effect.sync(() => void ran.push("compensated"))),
+      ],
+    });
+
+    store.start();
+    store.stop();
+    await Effect.runPromise(Effect.sleep("80 millis"));
+
+    // Queued by the watcher *after* the teardown command settled — the case
+    // that ended on an empty poll and was silently dropped.
+    expect(ran).toEqual(["compensated"]);
+  });
+
+  it("does not cut off a slow teardown sibling when another member dies", async () => {
+    // `Fiber.joinAll` short-circuits on the first failure, so the join-based
+    // drain let the scope close while the slow member was still running.
+    const ran: Array<string> = [];
+
+    const { store } = make({
+      Go: (_a: unknown, s: any) => s.state,
+      Flushed: (_a: unknown, s: any) => s.state,
+      Unmounted: (_a: unknown, s: any) => [
+        s.state,
+        Command.batch(
+          Command.effect(Effect.sleep("1 milli").pipe(Effect.andThen(Effect.die("boom")))),
+          Command.effect(
+            Effect.sleep("40 millis").pipe(
+              Effect.andThen(Effect.sync(() => void ran.push("lock-released"))),
+            ),
+          ),
+        ),
+      ],
+    });
+
+    store.start();
+    store.stop();
+    await Effect.runPromise(Effect.sleep("120 millis"));
+
+    expect(ran).toEqual(["lock-released"]);
+  });
+
+  it("drains a command queued just before unmount, with no teardown of its own", async () => {
+    // A `Teardown` carrying no command used to return immediately, so work
+    // already in the queue was forked and instantly interrupted.
+    const ran: Array<string> = [];
+
+    const { store } = make({
+      Go: (_a: unknown, s: any) => [
+        s.state,
+        Command.effect(
+          Effect.sleep("20 millis").pipe(
+            Effect.andThen(Effect.sync(() => void ran.push("late-write"))),
+          ),
+        ),
+      ],
+      Flushed: (_a: unknown, s: any) => s.state,
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Go" } as never);
+    store.stop();
+    await Effect.runPromise(Effect.sleep("80 millis"));
+
+    // In-flight work is interrupted by unmount, which is the documented
+    // ownership rule — but the drain must still reach quiescence rather than
+    // hang, and must not report the interruption as a defect.
+    expect(ran).toEqual([]);
+  });
+
+  it("terminates even with a never-completing command in flight", async () => {
+    // `run` cannot reach quiescence here — a known limitation. Teardown can,
+    // because unmount interrupts outstanding work before draining.
+    const { store, defects } = make({
+      Go: (_a: unknown, s: any) => [s.state, Command.stream(Stream.never)],
+      Flushed: (_a: unknown, s: any) => s.state,
+      Unmounted: (_a: unknown, s: any) => [s.state, Command.effect(Effect.sync(() => void 0))],
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Go" } as never);
+    await Effect.runPromise(Effect.sleep("20 millis"));
+    store.stop();
+
+    // Settles well inside the 5s bound; a hang would surface as the abandoned
+    // -teardown defect instead.
+    await Effect.runPromise(Effect.sleep("150 millis"));
+    expect(defects).toEqual([]);
+  });
+});
