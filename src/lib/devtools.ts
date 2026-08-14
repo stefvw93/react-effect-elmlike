@@ -1,4 +1,4 @@
-import type { Context, Layer } from "effect";
+import { Context, Layer } from "effect";
 import type { Command, Group } from "./tea";
 
 // ---------------------------------------------------------------------------
@@ -207,7 +207,26 @@ export interface DefectSummary {
  * input can make it throw — it runs on a debugging path, and a summariser that
  * can fail is a debugger that breaks the program it was installed to watch.
  */
-export declare const summarizeCommand: (command: Command<any, any>) => CommandSummary;
+export const summarizeCommand = (command: Command<any, any>): CommandSummary => {
+  switch (command._tag) {
+    case "None":
+      return { _tag: "None" };
+    case "Effect":
+      return { _tag: "Effect" };
+    case "Keyed":
+      return { _tag: "Keyed", key: command.key, command: summarizeCommand(command.command) };
+    case "Batch":
+      return { _tag: "Batch", commands: command.commands.map(summarizeCommand) };
+    case "Cancel":
+      return { _tag: "Cancel", target: command.target };
+    default:
+      // Unreachable through the typed surface, and deliberately not a throw.
+      // The parameter is `Command<any, any>`; a caller that got there by
+      // bypassing the types is already in trouble, and a summariser that
+      // crashed would turn a debugging aid into the cause of the crash.
+      return { _tag: "None" };
+  }
+};
 
 /**
  * Erase an unknown thrown value to its {@link DefectSummary}.
@@ -216,7 +235,52 @@ export declare const summarizeCommand: (command: Command<any, any>) => CommandSu
  * symbol, `undefined`, an object with a throwing `message` getter. Every one of
  * those produces a summary rather than a second failure.
  */
-export declare const summarizeDefect: (error: unknown) => DefectSummary;
+export const summarizeDefect = (error: unknown): DefectSummary => {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      ...(typeof error.stack === "string" ? { stack: error.stack } : {}),
+    };
+  }
+
+  // Not an `Error`, but shaped like one — a rejected value from a library that
+  // rolled its own. Read through a `try`, because the property may be a getter
+  // and a getter may throw.
+  if (typeof error === "object" && error !== null && "message" in error) {
+    try {
+      const { message, name, stack } = error as {
+        readonly message?: unknown;
+        readonly name?: unknown;
+        readonly stack?: unknown;
+      };
+      if (typeof message === "string") {
+        return {
+          message,
+          ...(typeof name === "string" ? { name } : {}),
+          ...(typeof stack === "string" ? { stack } : {}),
+        };
+      }
+    } catch {
+      // Fall through to the stringification below.
+    }
+  }
+
+  return { message: stringify(error) };
+};
+
+/**
+ * `String(value)`, with the two ways it can fail handled: a `Symbol` throws on
+ * implicit conversion, and a `toString` a user wrote can throw for any reason
+ * at all.
+ */
+const stringify = (value: unknown): string => {
+  try {
+    return typeof value === "symbol" ? value.toString() : String(value);
+  } catch {
+    return "<unprintable>";
+  }
+};
 
 // ---------------------------------------------------------------------------
 // The sink service
@@ -244,11 +308,15 @@ export interface DevtoolsSink {
  * A frozen module constant rather than a fresh object per read, because the
  * runtime detects "no devtools" by comparing the resolved reference against
  * **this exact value** by identity. `Context.getReferenceUnsafe` caches the
- * default it computes, so repeated reads are identity-stable — but
- * `Devtools.defaultValue()` re-invokes the thunk and returns something new, so
- * nothing may ever compare against that.
+ * default it computes, so repeated reads are identity-stable either way — but
+ * `Devtools.defaultValue()` re-invokes the thunk, and a thunk returning a fresh
+ * literal would hand back a different object every call and make every store
+ * conclude a sink was installed. Returning this constant is what keeps that
+ * safe, so the constant is the invariant, not an optimisation.
  */
-export declare const noopDevtools: DevtoolsSink;
+export const noopDevtools: DevtoolsSink = Object.freeze({
+  onEvent: () => {},
+});
 
 /**
  * The service key, as a `Context.Reference` rather than a `Context.Service`.
@@ -260,7 +328,10 @@ export declare const noopDevtools: DevtoolsSink;
  * `component(bp)` call — the property the entire install story rests on, and
  * the reason this is not a plain `Service` that a store would have to check for.
  */
-export declare const Devtools: Context.Reference<DevtoolsSink>;
+export const Devtools: Context.Reference<DevtoolsSink> = Context.Reference<DevtoolsSink>(
+  "@tea/Devtools",
+  { defaultValue: () => noopDevtools },
+);
 
 /**
  * Install a sink at the root.
@@ -270,7 +341,8 @@ export declare const Devtools: Context.Reference<DevtoolsSink>;
  * a `import.meta.env.DEV ? devtoolsLayer(…) : Layer.empty` ternary has one type
  * on both branches.
  */
-export declare const devtoolsLayer: (sink: DevtoolsSink) => Layer.Layer<never>;
+export const devtoolsLayer = (sink: DevtoolsSink): Layer.Layer<never> =>
+  Layer.succeed(Devtools)(sink);
 
 // ---------------------------------------------------------------------------
 // Predicates
@@ -290,7 +362,12 @@ export declare const devtoolsLayer: (sink: DevtoolsSink) => Layer.Layer<never>;
  * `previous === next` always, and a dispatch that deliberately no-ops — often
  * the exact thing the log was opened to see.
  */
-export declare const skipUnchangedAmbient: (event: DevtoolsEvent) => boolean;
+export const skipUnchangedAmbient = (event: DevtoolsEvent): boolean =>
+  !(
+    event._tag === "Transition" &&
+    (event.action._tag === "PropsChanged" || event.action._tag === "HookChanged") &&
+    event.previous === event.next
+  );
 
 /**
  * Drop **any** transition where state did not move, whatever caused it.
@@ -299,7 +376,8 @@ export declare const skipUnchangedAmbient: (event: DevtoolsEvent) => boolean;
  * reasons given there. Exported because a feature whose reducer no-ops on most
  * actions has a different noise problem, and this is the one line that fixes it.
  */
-export declare const skipUnchanged: (event: DevtoolsEvent) => boolean;
+export const skipUnchanged = (event: DevtoolsEvent): boolean =>
+  !(event._tag === "Transition" && event.previous === event.next);
 
 // ---------------------------------------------------------------------------
 // Recorder
@@ -321,7 +399,20 @@ export interface DevtoolsRecorder {
 }
 
 /** Build a fresh {@link DevtoolsRecorder}. */
-export declare const createRecorder: () => DevtoolsRecorder;
+export const createRecorder = (): DevtoolsRecorder => {
+  // One array, handed out as-is rather than copied on read. A caller that took
+  // a reference before the first event still sees them arrive, which is what
+  // makes `const { events } = createRecorder()` at the top of a test work.
+  const events: Array<DevtoolsEvent> = [];
+
+  return {
+    sink: { onEvent: (event) => void events.push(event) },
+    events,
+    clear: () => {
+      events.length = 0;
+    },
+  };
+};
 
 // ---------------------------------------------------------------------------
 // Console logger
@@ -398,7 +489,191 @@ export interface ConsoleDevtoolsOptions {
  * permanently indent every subsequent console line on the page, long after the
  * feature that caused it unmounted.
  */
-export declare const createConsoleDevtools: (options?: ConsoleDevtoolsOptions) => DevtoolsSink;
+export const createConsoleDevtools = (options: ConsoleDevtoolsOptions = {}): DevtoolsSink => {
+  const {
+    collapsed = true,
+    predicate = skipUnchangedAmbient,
+    diff = false,
+    timestamps = true,
+    colors,
+    console: output = globalThis.console,
+  } = options;
+
+  const palette = { ...defaultColors, ...colors };
+
+  /**
+   * Last print time per mount, for the elapsed figure.
+   *
+   * Keyed by `name#instance` and not by `name`: two mounts of one blueprint
+   * each have their own clock, and sharing one would report the gap between
+   * two unrelated features as if it were a reducer's duration.
+   */
+  const lastSeen = new Map<string, number>();
+
+  return {
+    onEvent: (event) => {
+      const key = `${event.name}#${event.instance}`;
+      const unmounting = event._tag === "Transition" && event.action._tag === "Unmounted";
+
+      if (!predicate(event)) {
+        // Still forget the mount. A custom predicate that filtered `Unmounted`
+        // would otherwise leak one map entry per mount for the life of the
+        // page — a leak in the tool installed to find leaks.
+        if (unmounting) lastSeen.delete(key);
+        return;
+      }
+
+      const now = timestamps ? performance.now() : undefined;
+      const previous = now === undefined ? undefined : lastSeen.get(key);
+      if (now !== undefined) lastSeen.set(key, now);
+
+      const stamp =
+        now === undefined
+          ? ""
+          : `  @ ${clock()}${previous === undefined ? "" : `  (+${Math.round(now - previous)}ms)`}`;
+
+      const open = collapsed ? output.groupCollapsed : output.group;
+      open(`%c${headline(event)}${stamp}`, palette.header);
+
+      // `finally`, because one throw inside the body — a getter on user state,
+      // a proxy, a `toString` that fails — would otherwise leave the group open
+      // and indent every later console line on the page.
+      try {
+        body(event, { output, palette, diff });
+      } finally {
+        output.groupEnd();
+        if (unmounting) lastSeen.delete(key);
+      }
+    },
+  };
+};
+
+const defaultColors: Required<DevtoolsColors> & { readonly header: string } = {
+  header: "color: inherit; font-weight: bold",
+  previous: "color: #9E9E9E; font-weight: bold",
+  action: "color: #03A9F4; font-weight: bold",
+  next: "color: #4CAF50; font-weight: bold",
+  command: "color: #9C27B0; font-weight: bold",
+  output: "color: #009688; font-weight: bold",
+  defect: "color: #F20404; font-weight: bold",
+};
+
+/** `12:34:56.789`, local time. Cheap enough to build per printed event. */
+const clock = (): string => {
+  const now = new Date();
+  const pad = (value: number, width = 2) => String(value).padStart(width, "0");
+  return `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}.${pad(
+    now.getMilliseconds(),
+    3,
+  )}`;
+};
+
+/** The one line that shows when the group is collapsed, so it carries the news. */
+const headline = (event: DevtoolsEvent): string => {
+  const who = `▸ ${event.name}#${event.instance}`;
+  switch (event._tag) {
+    case "Transition":
+      return `${who}  ${event.action._tag}`;
+    case "Command":
+      return `${who}  ⟶ ${address(event.group)}  ${formatCommand(event.command)}${
+        event.dropped ? "  (dropped)" : ""
+      }`;
+    case "Output":
+      return `${who}  ⇢ ${event.output._tag}`;
+    case "Defect":
+      return `${who}  ✖ ${event.from}: ${event.defect.message}${
+        event.handled ? "" : " (unhandled)"
+      }`;
+  }
+};
+
+const body = (
+  event: DevtoolsEvent,
+  context: {
+    readonly output: DevtoolsConsole;
+    readonly palette: Required<DevtoolsColors> & { readonly header: string };
+    readonly diff: boolean;
+  },
+): void => {
+  const { output, palette } = context;
+  switch (event._tag) {
+    case "Transition": {
+      output.log("%cprev state  ", palette.previous, event.previous);
+      output.log("%caction      ", palette.action, event.action);
+      output.log("%cnext state  ", palette.next, event.next);
+      output.log("%ccause       ", palette.header, event.cause);
+      if (context.diff) printDiff(event.previous, event.next, output, palette);
+      return;
+    }
+    case "Command": {
+      output.log("%ccommand     ", palette.command, formatCommand(event.command));
+      output.log("%cgroup       ", palette.command, address(event.group));
+      output.log("%ccause       ", palette.header, event.cause);
+      return;
+    }
+    case "Output": {
+      output.log("%coutput      ", palette.output, event.output);
+      output.log("%ccause       ", palette.header, event.cause);
+      return;
+    }
+    case "Defect": {
+      // `error`, not `log`: a defect belongs in the console's error channel,
+      // where a filter set to errors-only still shows it.
+      output.error("%cdefect      ", palette.defect, event.defect);
+      output.log("%ccause       ", palette.header, event.cause);
+      return;
+    }
+  }
+};
+
+/**
+ * A shallow, own-keys diff.
+ *
+ * Values are passed to the console as *arguments* rather than interpolated, so
+ * a circular structure or a throwing getter is the console's problem to render
+ * and not this function's to survive.
+ */
+const printDiff = (
+  previous: unknown,
+  next: unknown,
+  output: DevtoolsConsole,
+  palette: Required<DevtoolsColors> & { readonly header: string },
+): void => {
+  if (!isRecord(previous) || !isRecord(next)) return;
+
+  for (const key of Object.keys(previous)) {
+    if (!Object.hasOwn(next, key)) output.log(`%c- ${key}`, palette.previous);
+    else if (!Object.is(previous[key], next[key])) {
+      output.log(`%c~ ${key}`, palette.action, previous[key], "→", next[key]);
+    }
+  }
+  for (const key of Object.keys(next)) {
+    if (!Object.hasOwn(previous, key)) output.log(`%c+ ${key}`, palette.next, next[key]);
+  }
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** `Bump` or `Bump#key` — how a `Cancel` would name this work. */
+const address = (group: Group): string =>
+  group.key === undefined ? group.tag : `${group.tag}#${group.key}`;
+
+/** `batch(cancel(Bump), keyed(q, effect))` — the reducer's own shape, in one line. */
+const formatCommand = (summary: CommandSummary): string => {
+  switch (summary._tag) {
+    case "None":
+      return "none";
+    case "Effect":
+      return "effect";
+    case "Keyed":
+      return `keyed(${summary.key}, ${formatCommand(summary.command)})`;
+    case "Batch":
+      return `batch(${summary.commands.map(formatCommand).join(", ")})`;
+    case "Cancel":
+      return `cancel(${address(summary.target)})`;
+  }
+};
 
 /**
  * {@link createConsoleDevtools} as a layer — the one-liner an app installs.
@@ -409,4 +684,5 @@ export declare const createConsoleDevtools: (options?: ConsoleDevtoolsOptions) =
  * );
  * ```
  */
-export declare const consoleDevtoolsLayer: (options?: ConsoleDevtoolsOptions) => Layer.Layer<never>;
+export const consoleDevtoolsLayer = (options?: ConsoleDevtoolsOptions): Layer.Layer<never> =>
+  devtoolsLayer(createConsoleDevtools(options));
