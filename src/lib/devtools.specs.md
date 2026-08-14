@@ -358,9 +358,31 @@ fold is a spec decision, not a patch. Recorded here rather than left ambiguous.
 
 ## Browser coverage (`/e2e`)
 
-Applicable, `src/lib/devtools.browser.test.tsx`: `sync` folding in the render
-body, `start` in a passive effect, an output crossing into a real `on<Tag>`
-prop, and a real click are none of them faithfully reproducible in node.
+Applicable, `src/lib/devtools.browser.test.tsx` — eight tests. The node suite
+drives `createFeatureStore` directly and covers every emission site; what it
+cannot cover is the thing devtools is installed _into_, because `component`
+owns when `start` runs and the effect scheduling is React's:
+
+- **`Mounted` is reported from a real mount.** The riskiest claim in the design:
+  `start` forks the root runtime in a passive effect immediately before folding
+  `Mounted`, and if `cachedContext` were not populated by then every log would
+  silently begin one action late.
+- A real click reports its transition and the command it issued.
+- **An output reaches the log before the parent's `on<Tag>` prop is called**,
+  across the actual React boundary rather than a stub `emit`.
+- A `PropsChanged` folded _during render_ is reported — the one emission site
+  that runs while React is rendering.
+- A dying command reports one `Defect` and then the recovery fold.
+- Unmounting reports `Unmounted`.
+- Two mounts of one blueprint are distinguishable by `instance`, which is the
+  reason that field exists.
+- StrictMode's double mount stays coherent.
+
+The output test pins the **two-hop causal chain** rather than a single edge: the
+click folds `Bumped`, whose keyed command emits `Landed`, whose own unkeyed
+command emits the output. So the `Output` carries `cause: { _tag: "Command",
+action: "Landed" }` and not the click two hops back. Each event states the one
+edge the runtime can see; walking them is the UI's job.
 
 - e2e: **not applicable for the examples.** `tea.specs.md` already records that
   `cart.tsx` and `presence.tsx` cannot be mounted in any environment
