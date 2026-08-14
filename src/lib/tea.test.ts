@@ -3042,6 +3042,7 @@ describe("createFeatureStore — devtools", () => {
     });
 
     store.start();
+    recorder.clear();
     const before = store.getSnapshot();
     store.dispatch({ _tag: "Bump" } as never);
 
@@ -3078,13 +3079,38 @@ describe("createFeatureStore — devtools", () => {
       },
     });
 
+    store.start();
     store.sync({ id: "a" }, {} as never);
+    recorder.clear();
     store.sync({ id: "b" }, {} as never);
 
     const [event] = only(recorder, "Transition");
     expect(event!.action._tag).toBe("PropsChanged");
     expect(event!.cause).toEqual({ _tag: "Lifecycle" });
     expect(event!.previous).toBe(event!.next);
+  });
+
+  it("reports nothing before `start`, which is the documented blind window", () => {
+    // The root context does not exist until the first `runFork`, and `start`
+    // is what does that. So a `sync` in the first render body, and a
+    // descendant's layout-effect dispatch, are both invisible. Asserted rather
+    // than left implicit, because the alternative — warming the context inside
+    // `createRuntime` — moves when the root layer builds, which is observable
+    // through any layer's acquire and is not a debugging tool's call to make.
+    const { store, recorder } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+        Land: (_a: unknown, s: any) => s.state,
+      },
+    });
+
+    store.dispatch({ _tag: "Bump" } as never);
+    expect(recorder.events).toHaveLength(0);
+
+    // And it recovers: the window closes at `start`, it does not latch.
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    expect(recorder.events.length).toBeGreaterThan(0);
   });
 
   it("emits one `Command` event per issued command, summarized and addressed", async () => {
@@ -3121,10 +3147,15 @@ describe("createFeatureStore — devtools", () => {
     });
   });
 
-  it("reports a command nobody was there to run as dropped", () => {
-    // The store is never started, so no mount is draining the queue. The
-    // command is discarded silently as far as the feature is concerned —
-    // deliberately — but a log that showed it as issued would be lying.
+  it("reports a command nobody was there to run as dropped", async () => {
+    // After the mount is gone, no fiber will ever take this work. The feature
+    // is told nothing — deliberately, because reporting the drop through the
+    // defect sink replaced a recovery UI with a boundary crash — but a log
+    // that showed the command as issued would be lying.
+    //
+    // Not the pre-`start` case: work dispatched then is *buffered* and `start`
+    // flushes it, so it is delayed rather than discarded, and `dropped` says
+    // so.
     const { store, recorder } = setup({
       reducer: {
         Bump: (_a: unknown, s: any) => [s.state, Command.effect(() => Effect.void)],
@@ -3132,6 +3163,10 @@ describe("createFeatureStore — devtools", () => {
       },
     });
 
+    store.start();
+    store.stop();
+    await settle();
+    recorder.clear();
     store.dispatch({ _tag: "Bump" } as never);
 
     const commands = only(recorder, "Command");
