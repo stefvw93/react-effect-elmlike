@@ -1,7 +1,8 @@
-import { Context, Effect, Layer, Option, pipe, Schema } from "effect";
+import { Context, Effect, Layer, pipe, Result, Schema } from "effect";
 import { createRoot } from "react-dom/client";
 import { StrictMode, type ReactNode } from "react";
 import { Action, Children, Command, consoleDevtoolsLayer, createRuntime, define } from "./lib";
+import type { UnknownError } from "effect/Cause";
 
 const TodoItem = Schema.Struct({
   id: Schema.Number,
@@ -13,18 +14,20 @@ const TodoItem = Schema.Struct({
 class TodoService extends Context.Service<
   TodoService,
   {
-    getById: (id: number) => Effect.Effect<typeof TodoItem.Type | null, never, never>;
+    getById: (
+      id: number,
+    ) => Effect.Effect<Result.Result<typeof TodoItem.Type, UnknownError>, never, never>;
   }
 >()("TodoService") {
   static readonly live = Layer.succeed(TodoService, {
     getById: (id: number) =>
       pipe(
-        Effect.promise(() =>
+        Effect.tryPromise(() =>
           fetch(`https://dummyjson.com/todos/${id}`)
             .then((res) => res.json())
-            .then((data) => Schema.decodeUnknownOption(TodoItem)(data)),
+            .then((data) => Schema.decodeUnknownSync(TodoItem)(data)),
         ),
-        Effect.map(Option.getOrNull),
+        Effect.result,
       ),
   });
 }
@@ -40,8 +43,8 @@ const State = Schema.Struct({
 
 const Input = Action("Input", { value: Schema.Number });
 const ClickedSubmit = Action("ClickedSubmit", {});
-const TodoResolved = Action("TodoResolved", { data: Schema.Any });
-const TodoChanged = Action.output("TodoChanged", { data: Schema.Any });
+const TodoResolved = Action("TodoResolved", { data: Schema.NullishOr(TodoItem) });
+const TodoChanged = Action.output("TodoChanged", { data: Schema.NullishOr(TodoItem) });
 const TodoFetcherAction = Action.of([Input, ClickedSubmit, TodoResolved]);
 const TodoFetcherOutput = Action.of([TodoChanged]);
 
@@ -61,11 +64,15 @@ const reducer = TodoFetcherBlueprint.reducer({
     { ...state, data: null },
     Command.effect((dispatch) =>
       Effect.gen(function* () {
+        if (state.query === undefined) return;
+
         const todoService = yield* TodoService;
-        if (state.query) {
-          const data = yield* todoService.getById(state.query);
-          yield* dispatch({ _tag: "TodoResolved", data });
-        }
+        const data = yield* todoService.getById(state.query);
+
+        yield* dispatch({
+          _tag: "TodoResolved",
+          data: Result.getOrNull(data),
+        });
       }),
     ),
   ],
