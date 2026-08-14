@@ -77,9 +77,9 @@ export interface DevtoolsTransition extends DevtoolsEnvelope {
 }
 export interface DevtoolsCommand extends DevtoolsEnvelope {
   readonly _tag: "Command";
-  readonly group: Group; // the address `Cancel` would name
+  readonly group: Group; // tag-level: `cancel(group.tag)` reaches every fiber this forked
   readonly command: CommandSummary;
-  readonly dropped: boolean; // no mount draining the queue
+  readonly dropped: boolean; // nothing was draining the queue when it was offered
 }
 export interface DevtoolsOutput extends DevtoolsEnvelope {
   readonly _tag: "Output";
@@ -170,75 +170,75 @@ untouched — no existing `component(bp)` call changes.
 
 ### The event and its summaries
 
-- [ ] `DevtoolsEvent` is a four-member tagged union (`Transition`, `Command`, `Output`, `Defect`) and narrows by `_tag`.
-- [ ] `cause` is **required** on every member; every emission site knows its cause.
-- [ ] `DevtoolsCause` has exactly four variants: `Dispatch`, `Command` (with `action` and optional `key`), `Lifecycle`, `Defect` (with `from`). The old `cause: { _tag: "Output" }` variant is **deleted, not made optional** — see Expected Behavior.
-- [ ] `summarizeCommand` erases the effect (`{ _tag: "Effect" }` carries no function), preserves `Keyed` nesting and `Batch` order, and passes `Cancel`'s target through.
-- [ ] `summarizeDefect` produces `{ message }` plus optional `name`/`stack` from an `Error`, from a string, from a symbol, and from `undefined`, and never throws.
-- [ ] Every event is **JSON round-trippable**: `JSON.parse(JSON.stringify(event))` deep-equals the event, given encodable state and actions.
-- [ ] The `Transition` for the runtime's own `Error` action carries `action: { _tag: "Error" }` and not the action object the runtime built, which holds a live `Error` and a `Cause`. See Expected Behavior.
-- [ ] The `Transition` for `HookChanged` carries `action: { _tag: "HookChanged" }`. Hooks are `Record<string, unknown>`, so the previous record the runtime attaches routinely holds functions — `structuredClone` throws on one, which would disable the sink rather than merely losing a field.
-- [ ] `PropsChanged` **keeps** its `previous` props, which are a schema value and encode.
+- [x] `DevtoolsEvent` is a four-member tagged union (`Transition`, `Command`, `Output`, `Defect`) and narrows by `_tag`.
+- [x] `cause` is **required** on every member; every emission site knows its cause.
+- [x] `DevtoolsCause` has exactly four variants: `Dispatch`, `Command` (with `action` and optional `key`), `Lifecycle`, `Defect` (with `from`). The old `cause: { _tag: "Output" }` variant is **deleted, not made optional** — see Expected Behavior.
+- [x] `summarizeCommand` erases the effect (`{ _tag: "Effect" }` carries no function), preserves `Keyed` nesting and `Batch` order, and passes `Cancel`'s target through.
+- [x] `summarizeDefect` produces `{ message }` plus optional `name`/`stack` from an `Error`, from a string, from a symbol, and from `undefined`, and never throws.
+- [x] Every event is **JSON round-trippable**: `JSON.parse(JSON.stringify(event))` deep-equals the event, given encodable state and actions.
+- [x] The `Transition` for the runtime's own `Error` action carries `action: { _tag: "Error" }` and not the action object the runtime built, which holds a live `Error` and a `Cause`. See Expected Behavior.
+- [x] The `Transition` for `HookChanged` carries `action: { _tag: "HookChanged" }`. Hooks are `Record<string, unknown>`, so the previous record the runtime attaches routinely holds functions — `structuredClone` throws on one, which would disable the sink rather than merely losing a field.
+- [x] `PropsChanged` **keeps** its `previous` props, which are a schema value and encode.
 
 ### The sink service
 
-- [ ] `Devtools` is a `Context.Reference<DevtoolsSink>` keyed `"@tea/Devtools"` whose default is `noopDevtools`.
-- [ ] Reading the reference from an empty context returns `noopDevtools` **by identity**, and repeated reads return the same object.
-- [ ] `noopDevtools.onEvent` is a no-op and the object is frozen.
-- [ ] `devtoolsLayer(sink)` types as `Layer.Layer<never>` and installs `sink` where `Devtools` is read.
-- [ ] `createRecorder()` returns a sink that appends every event in emission order to `events`, and `clear()` empties it.
+- [x] `Devtools` is a `Context.Reference<DevtoolsSink>` keyed `"@tea/Devtools"` whose default is `noopDevtools`.
+- [x] Reading the reference from an empty context returns `noopDevtools` **by identity**, and repeated reads return the same object.
+- [x] `noopDevtools.onEvent` is a no-op and the object is frozen.
+- [x] `devtoolsLayer(sink)` types as `Layer.Layer<never>` and installs `sink` where `Devtools` is read.
+- [x] `createRecorder()` returns a sink that appends every event in emission order to `events`, and `clear()` empties it.
 
 ### Emission from `createFeatureStore`
 
-- [ ] `start()` emits a `Transition` for `Mounted` with `cause: Lifecycle`.
-- [ ] `dispatch(action)` emits a `Transition` with `cause: { _tag: "Dispatch" }`, the store's `name` and `instance`, and `previous`/`next` as the actual state references.
-- [ ] `sync` with changed props emits a `PropsChanged` `Transition` with `cause: Lifecycle`; a handler that returns the same state gives `previous === next`.
-- [ ] A reducer returning a command emits one `Command` event whose `command` is the summary, whose `group` is the address `Cancel` would name, and whose `dropped` reflects whether any mount was there to take it.
-- [ ] An action a command dispatches carries `cause: { _tag: "Command", action, key? }`; `key` is present when the command was `Keyed`, proving the key reached the leaf.
-- [ ] `Command.output(…)` emits an `Output` event carrying the **whole message including `_tag`** (unlike the `on<Tag>` prop, which gets `_tag` stripped), and it lands **before** the `on<Tag>` handler runs.
-- [ ] A dying command emits **exactly one** `Defect` (`from` = the action tag, `handled: true` when an `Error` handler takes it), followed by a `Transition` for `Error` with `cause: { _tag: "Defect", from }`. That second event is not a duplicate — see Expected Behavior.
-- [ ] With no `Error` handler declared, the same defect emits one `Defect` with `handled: false`, and the error still reaches the store's `defect` sink.
-- [ ] A throwing `on<Tag>` handler emits one `Defect` with `handled: false` and does **not** reach the feature's `Error` handler.
-- [ ] `stop()` emits the `Unmounted` `Transition` and the teardown `Command` event, even though teardown bypasses `fold` and calls `blueprint.reduce` directly. The transition is emitted **even when the `Unmounted` handler throws** — `reduce` discards that handler's state either way, so there is no next state to be wrong about, and the console logger evicts its elapsed entry on this event.
-- [ ] `summarizeDefect` is total **including for an `Error` subclass with a throwing `message` or `stack` getter**. `instanceof Error` is not a guarantee that reading a property is safe, and both funnels call the summarizer before routing — see Expected Behavior.
-- [ ] `instance` is stable across `stop(); start()` on one store, and differs between two stores of the same `name`.
-- [ ] `name` comes from `component(bp, { name })` and falls back to `"TeaFeature"`.
+- [x] `start()` emits a `Transition` for `Mounted` with `cause: Lifecycle`.
+- [x] `dispatch(action)` emits a `Transition` with `cause: { _tag: "Dispatch" }`, the store's `name` and `instance`, and `previous`/`next` as the actual state references.
+- [x] `sync` with changed props emits a `PropsChanged` `Transition` with `cause: Lifecycle`; a handler that returns the same state gives `previous === next`.
+- [x] A reducer returning a command emits one `Command` event whose `command` is the summary, whose `group` is the address `Cancel` would name, and whose `dropped` reflects whether any mount was there to take it.
+- [x] An action a command dispatches carries `cause: { _tag: "Command", action, key? }`; `key` is present when the command was `Keyed`, proving the key reached the leaf.
+- [x] `Command.output(…)` emits an `Output` event carrying the **whole message including `_tag`** (unlike the `on<Tag>` prop, which gets `_tag` stripped), and it lands **before** the `on<Tag>` handler runs.
+- [x] A dying command emits **exactly one** `Defect` (`from` = the action tag, `handled: true` when an `Error` handler takes it), followed by a `Transition` for `Error` with `cause: { _tag: "Defect", from }`. That second event is not a duplicate — see Expected Behavior.
+- [x] With no `Error` handler declared, the same defect emits one `Defect` with `handled: false`, and the error still reaches the store's `defect` sink.
+- [x] A throwing `on<Tag>` handler emits one `Defect` with `handled: false` and does **not** reach the feature's `Error` handler.
+- [x] `stop()` emits the `Unmounted` `Transition` and the teardown `Command` event, even though teardown bypasses `fold` and calls `blueprint.reduce` directly. The transition is emitted **even when the `Unmounted` handler throws** — `reduce` discards that handler's state either way, so there is no next state to be wrong about, and the console logger evicts its elapsed entry on this event.
+- [x] `summarizeDefect` is total **including for an `Error` subclass with a throwing `message` or `stack` getter**. `instanceof Error` is not a guarantee that reading a property is safe, and both funnels call the summarizer before routing — see Expected Behavior.
+- [x] `instance` is stable across `stop(); start()` on one store, and differs between two stores of the same `name`.
+- [x] `name` comes from `component(bp, { name })` and falls back to `"TeaFeature"`.
 
 ### Robustness and cost
 
-- [ ] **A throwing sink does not break the fold**: state still moves, no defect is raised, and the sink is disabled — it is not called again.
-- [ ] With no devtools layer installed, every path above behaves exactly as it does today and nothing throws.
-- [ ] With no sink installed, an emission site **allocates nothing**: no summaries, no event literals, no strings, and no thunk-passing helper. **Verified by construction, not by a test** — every site is `const target = devtools(); if (target !== undefined) …`, and the absence of an allocation is not observable from outside the fold. A test asserting it would have to mock the module and would then be asserting the mock. What _is_ tested is the observable half: the sink is resolved at most once (`resolves the sink once and reuses it`) and a store with no layer behaves identically.
+- [x] **A throwing sink does not break the fold**: state still moves, no defect is raised, and the sink is disabled — it is not called again.
+- [x] With no devtools layer installed, every path above behaves exactly as it does today and nothing throws.
+- [x] With no sink installed, an emission site **allocates nothing**: no summaries, no event literals, no strings, and no thunk-passing helper. **Verified by construction, not by a test** — every site is `const target = devtools(); if (target !== undefined) …`, and the absence of an allocation is not observable from outside the fold. A test asserting it would have to mock the module and would then be asserting the mock. What _is_ tested is the observable half: the sink is resolved at most once (`resolves the sink once and reuses it`) and a store with no layer behaves identically.
 
 ### Console logger
 
-- [ ] `collapsed: true` (the default) uses `groupCollapsed`; `collapsed: false` uses `group`.
-- [ ] `groupEnd()` fires **exactly once per group even when the body throws** — a throw inside a group would otherwise nest every subsequent console line for the life of the page.
-- [ ] **A throw while printing does not escape the logger.** It is reported through `console.error` and the sink keeps working. Printing reads user state, so such a throw is a property of one value, not of the sink — and the store disables a sink that throws, which would take devtools dark for the rest of the page because one state object had a hostile getter. If `console.error` throws too, that is swallowed: there is nothing left to report it with.
-- [ ] The elapsed map is **bounded**, independently of the `Unmounted` transition that normally clears an entry — a mount whose fiber died never folds one.
-- [ ] A transition prints `prev state` / `action` / `next state` / `cause` lines with `%c` colour directives.
-- [ ] Defect bodies go through `console.error`, not `console.log`.
-- [ ] The default predicate (`skipUnchangedAmbient`) drops an unchanged `PropsChanged`/`HookChanged`, keeps a `PropsChanged` that moved state, and keeps `Unmounted` and an unchanged **dispatch**.
-- [ ] `skipUnchanged` drops any transition where `previous === next`, including `Unmounted`.
-- [ ] `diff: true` prints a **shallow own-keys** diff (`+ key`, `- key`, `~ key: prev → next`).
-- [ ] Elapsed time appears from the second event of a given `${name}#${instance}` onward, and the elapsed map **drops its entry on an `Unmounted` transition**.
-- [ ] `timestamps: false` omits the clock, `timestamps: true` (default) includes it.
-- [ ] Everything above is asserted against an injected `DevtoolsConsole`, never the global.
+- [x] `collapsed: true` (the default) uses `groupCollapsed`; `collapsed: false` uses `group`.
+- [x] `groupEnd()` fires **exactly once per group even when the body throws** — a throw inside a group would otherwise nest every subsequent console line for the life of the page.
+- [x] **A throw while printing does not escape the logger.** It is reported through `console.error` and the sink keeps working. Printing reads user state, so such a throw is a property of one value, not of the sink — and the store disables a sink that throws, which would take devtools dark for the rest of the page because one state object had a hostile getter. If `console.error` throws too, that is swallowed: there is nothing left to report it with.
+- [x] The elapsed map is **bounded**, independently of the `Unmounted` transition that normally clears an entry — a mount whose fiber died never folds one.
+- [x] A transition prints `prev state` / `action` / `next state` / `cause` lines with `%c` colour directives.
+- [x] Defect bodies go through `console.error`, not `console.log`.
+- [x] The default predicate (`skipUnchangedAmbient`) drops an unchanged `PropsChanged`/`HookChanged`, keeps a `PropsChanged` that moved state, and keeps `Unmounted` and an unchanged **dispatch**.
+- [x] `skipUnchanged` drops any transition where `previous === next`, including `Unmounted`.
+- [x] `diff: true` prints a **shallow own-keys** diff (`+ key`, `- key`, `~ key: prev → next`).
+- [x] Elapsed time appears from the second event of a given `${name}#${instance}` onward, and the elapsed map **drops its entry on an `Unmounted` transition**.
+- [x] `timestamps: false` omits the clock, `timestamps: true` (default) includes it.
+- [x] Everything above is asserted against an injected `DevtoolsConsole`, never the global.
 
 ### Removal of `RuntimeOptions`
 
-- [ ] `DevtoolsEvent` and `RuntimeOptions` are gone from `tea.ts`; `tea.ts` imports the event type from `./devtools`.
-- [ ] `createRuntime` takes one parameter. `__type-tests__/tea.tst.ts` already passes one argument at every call site, so this is source-compatible.
-- [ ] `src/examples/app.tsx` and `src/examples/cart.tsx` no longer pass a dead `onEvent`.
-- [ ] `tea.specs.md` Open work #3 is closed and its `onEvent` known-limitation is replaced.
+- [x] `DevtoolsEvent` and `RuntimeOptions` are gone from `tea.ts`; `tea.ts` imports the event type from `./devtools`.
+- [x] `createRuntime` takes one parameter. `__type-tests__/tea.tst.ts` already passes one argument at every call site, so this is source-compatible.
+- [x] `src/examples/app.tsx` and `src/examples/cart.tsx` no longer pass a dead `onEvent`.
+- [x] `tea.specs.md` Open work #3 is closed and its `onEvent` known-limitation is replaced.
 
 ### Type-level (TSTyche) — `src/lib/__type-tests__/devtools.tst.ts`
 
-- [ ] `DevtoolsEvent` narrows by `_tag` to each of the four members.
-- [ ] `devtoolsLayer(sink)` and `consoleDevtoolsLayer()` are both `Layer.Layer<never>`.
-- [ ] `createRuntime(Layer.mergeAll(fooLayer, consoleDevtoolsLayer())).component(needsFoo)` typechecks — **the claim the whole install story rests on**: merging devtools moves neither `RootR` nor any existing `component` call.
-- [ ] `CommandSummary` is a faithful erasure of `Command`: same tag set, no function-valued field.
-- [ ] `DevtoolsCause`, `CommandSummary` and `DefectSummary` all satisfy a locally declared recursive `Json` type — the first machine check of this file's encodability promise.
+- [x] `DevtoolsEvent` narrows by `_tag` to each of the four members.
+- [x] `devtoolsLayer(sink)` and `consoleDevtoolsLayer()` are both `Layer.Layer<never>`.
+- [x] `createRuntime(Layer.mergeAll(fooLayer, consoleDevtoolsLayer())).component(needsFoo)` typechecks — **the claim the whole install story rests on**: merging devtools moves neither `RootR` nor any existing `component` call.
+- [x] `CommandSummary` is a faithful erasure of `Command`: same tag set, no function-valued field.
+- [x] `DevtoolsCause`, `CommandSummary` and `DefectSummary` all satisfy a locally declared recursive `Json` type — the first machine check of this file's encodability promise.
 
 ## Technical Requirements
 

@@ -89,8 +89,8 @@ Mounted: (_action, { props, state }) => [
 
 `[x]` holds today. The command-leaf pass landed, and what it did not do is in
 Open work and Deferred decisions rather than left as an unchecked criterion
-here. The only `[ ]` boxes are the two devtools criteria under **React
-binding** — spec'd in `devtools.specs.md` and mid-cycle, not undecided.
+here. Every box is checked again: the devtools pass closed the last two, and
+its own criteria live in `devtools.specs.md`.
 
 ### Vocabularies (`Action`, `Action.output`, `Action.of`)
 
@@ -152,8 +152,8 @@ binding** — spec'd in `devtools.specs.md` and mid-cycle, not undecided.
 - [x] `store.sync` is idempotent: called twice with equivalent props and hooks it raises nothing the second time, so a discarded render costs nothing.
 - [x] A defect from a command, or a feature `layer` that fails to build, reaches the `Error` handler; with none declared it is rethrown during render, the only place a boundary can catch it.
 - [x] Services come from the root `ManagedRuntime`; `component(bp, { layer })` satisfies the residue `Exclude<R, RootR>`.
-- [ ] `createRuntime` takes **one** parameter. `RuntimeOptions` and its unwired `onEvent` are removed; observation is a service installed through the root layer instead. Spec'd in `devtools.specs.md`.
-- [ ] The store reports transitions, commands issued, outputs emitted and defects to a synchronously-resolved `Devtools` sink, and allocates nothing at those sites when no sink is installed. Emission points are listed in `devtools.specs.md`; this box is checked when they land.
+- [x] `createRuntime` takes **one** parameter. `RuntimeOptions` and its unwired `onEvent` are removed; observation is a service installed through the root layer instead. Spec'd in `devtools.specs.md`.
+- [x] The store reports transitions, commands issued, outputs emitted and defects to a synchronously-resolved `Devtools` sink, and allocates nothing at those sites when no sink is installed. Emission points are listed in `devtools.specs.md`.
 
 ### Type-level (TSTyche)
 
@@ -324,19 +324,24 @@ current de-facto answer.
 Must not break: teardown termination, and the teardown bound staying a
 whole-teardown bound rather than a per-hop one.
 
-### 3. `RuntimeOptions.onEvent` is accepted and ignored — **spec'd, in progress**
+### 3. `RuntimeOptions.onEvent` is accepted and ignored — **closed**
 
-`createRuntime` never emits a `DevtoolsEvent`, but `src/examples/app.tsx` and
-`cart.tsx` present it as working, so a reader copying the example installs an
-observer that never fires and gets no signal.
+`createRuntime` never emitted a `DevtoolsEvent`, but `src/examples/app.tsx` and
+`cart.tsx` presented it as working, so a reader copying the example installed an
+observer that never fired and got no signal.
 
-Resolved by the third option — wire it, as a feature. `RuntimeOptions` and the
-second parameter are **removed outright**; observation becomes a `Context.Reference`
+Closed by the third option — wire it, as a feature. `RuntimeOptions` and the
+second parameter are **removed outright**; observation is a `Context.Reference`
 sink installed through the root layer, resolved synchronously because the fold
-is synchronous. Spec: `src/lib/devtools.specs.md`. The number is kept rather
-than the item deleted, so that the cross-references to items #2, #4 and #5
-elsewhere in this file keep meaning what they say. Closed when the two unchecked
-boxes under **React binding** above are checked.
+is synchronous. `src/lib/devtools.ts`, spec'd in `src/lib/devtools.specs.md`.
+The number is kept rather than the item deleted, so the cross-references to
+items #2, #4 and #5 elsewhere in this file keep meaning what they say.
+
+Two things it did **not** close, both recorded under Known limitations in
+`devtools.specs.md` rather than here: nothing is reported before `start()`
+(the root context does not exist until the first `runFork`), and a mount whose
+fiber _died_ emits no `Unmounted` — which is item #1's to fix, since the same
+`release()` is why the store cannot re-arm from `component` either.
 
 ### 4. `Blueprint.run` discards a dying command
 
