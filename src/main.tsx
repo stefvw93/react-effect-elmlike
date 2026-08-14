@@ -1,9 +1,7 @@
-import { Effect, Schema } from "effect";
+import { Context, Effect, Layer, Option, pipe, Schema } from "effect";
 import { createRoot } from "react-dom/client";
 import { StrictMode, type ReactNode } from "react";
 import { Action, Children, Command, consoleDevtoolsLayer, createRuntime, define } from "./lib";
-
-const { Provider, component } = createRuntime(consoleDevtoolsLayer());
 
 const TodoItem = Schema.Struct({
   id: Schema.Number,
@@ -11,6 +9,25 @@ const TodoItem = Schema.Struct({
   completed: Schema.Boolean,
   userId: Schema.Number,
 });
+
+class TodoService extends Context.Service<
+  TodoService,
+  {
+    getById: (id: number) => Effect.Effect<typeof TodoItem.Type | null, never, never>;
+  }
+>()("TodoService") {
+  static readonly live = Layer.succeed(TodoService, {
+    getById: (id: number) =>
+      pipe(
+        Effect.promise(() =>
+          fetch(`https://dummyjson.com/todos/${id}`)
+            .then((res) => res.json())
+            .then((data) => Schema.decodeUnknownOption(TodoItem)(data)),
+        ),
+        Effect.map(Option.getOrNull),
+      ),
+  });
+}
 
 const Props = Schema.Struct({
   children: Schema.optionalKey(Children.as<(item: typeof TodoItem.Type) => ReactNode>()),
@@ -43,9 +60,13 @@ const reducer = TodoFetcherBlueprint.reducer({
   ClickedSubmit: (_action, { state }) => [
     { ...state, data: null },
     Command.effect((dispatch) =>
-      Effect.promise(() =>
-        fetch(`https://dummyjson.com/todos/${state.query}`).then((res) => res.json()),
-      ).pipe(Effect.andThen((data) => dispatch({ _tag: "TodoResolved", data }))),
+      Effect.gen(function* () {
+        const todoService = yield* TodoService;
+        if (state.query) {
+          const data = yield* todoService.getById(state.query);
+          yield* dispatch({ _tag: "TodoResolved", data });
+        }
+      }),
     ),
   ],
 
@@ -76,6 +97,10 @@ const render = TodoFetcherBlueprint.render(({ props, state, dispatch }) => (
 ));
 
 const todoFetcher = TodoFetcherBlueprint.create({ initialState, reducer, render });
+
+const { Provider, component } = createRuntime(
+  Layer.mergeAll(consoleDevtoolsLayer(), TodoService.live),
+);
 
 const TodoFetcher = component(todoFetcher, { name: "TodoFetcher" });
 
