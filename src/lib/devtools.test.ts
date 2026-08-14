@@ -184,6 +184,35 @@ describe("summarizeDefect", () => {
     expect(summarizeDefect(undefined).message).toBe("undefined");
   });
 
+  it("survives an `Error` subclass whose `message` getter throws", () => {
+    // The gap the plain-object case below does not cover: a subclass is
+    // `instanceof Error`, so it takes the first branch, and that branch used
+    // to read `name`/`message`/`stack` unguarded while the branch beneath it
+    // guarded the identical reads. Real code produces these — a library error
+    // that lazily formats its message from state that has since been torn
+    // down.
+    class Hostile extends Error {
+      override get message(): string {
+        throw new TypeError("getter blew up");
+      }
+    }
+
+    expect(() => summarizeDefect(new Hostile())).not.toThrow();
+    expect(typeof summarizeDefect(new Hostile()).message).toBe("string");
+  });
+
+  it("survives an `Error` whose `stack` getter throws", () => {
+    const hostile = new Error("fine");
+    Object.defineProperty(hostile, "stack", {
+      get() {
+        throw new TypeError("no stack for you");
+      },
+    });
+
+    expect(() => summarizeDefect(hostile)).not.toThrow();
+    expect(summarizeDefect(hostile).message).toBe("fine");
+  });
+
   it("survives a value whose own `message` getter throws", () => {
     // A summariser on a debugging path may not fail: it would take down the
     // program it was installed to watch, at the exact moment that program was

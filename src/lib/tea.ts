@@ -2708,7 +2708,15 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       // discards `Unmounted`'s returned state, which is why the default
       // console predicate is `skipUnchangedAmbient` and not the blunter
       // `skipUnchanged` that would hide this event on every feature.
-      const target = thrown === undefined ? devtools() : undefined;
+      //
+      // Emitted even when the handler above threw. There is no next state to
+      // be wrong about — `reduce` discards it either way — and the transition
+      // reports the fact that matters, that this instance is gone. The
+      // adjacent `Defect` reports that the handler threw. Suppressing it was
+      // worse than a missing line: the console logger evicts its elapsed entry
+      // on exactly this event, so a feature whose teardown threw left one
+      // behind.
+      const target = devtools();
       if (target !== undefined) {
         report({
           _tag: "Transition",

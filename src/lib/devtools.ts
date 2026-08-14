@@ -255,37 +255,34 @@ export const summarizeCommand = (command: Command<any, any>): CommandSummary => 
  * those produces a summary rather than a second failure.
  */
 export const summarizeDefect = (error: unknown): DefectSummary => {
-  if (error instanceof Error) {
-    return {
-      name: error.name,
-      message: error.message,
-      ...(typeof error.stack === "string" ? { stack: error.stack } : {}),
-    };
-  }
-
-  // Not an `Error`, but shaped like one — a rejected value from a library that
-  // rolled its own. Read through a `try`, because the property may be a getter
-  // and a getter may throw.
-  if (typeof error === "object" && error !== null && "message" in error) {
-    try {
-      const { message, name, stack } = error as {
-        readonly message?: unknown;
-        readonly name?: unknown;
-        readonly stack?: unknown;
+  // `instanceof Error` is not a guarantee that reading its properties is safe.
+  // A subclass may define `message` or `stack` as a getter, and a getter may
+  // throw — a library error that formats its message lazily from state that
+  // has since been torn down does exactly this. So both branches read through
+  // `field`, and neither is trusted more than the other for being an `Error`.
+  if (error instanceof Error || (typeof error === "object" && error !== null)) {
+    const message = field(error, "message");
+    if (typeof message === "string") {
+      const name = field(error, "name");
+      const stack = field(error, "stack");
+      return {
+        message,
+        ...(typeof name === "string" ? { name } : {}),
+        ...(typeof stack === "string" ? { stack } : {}),
       };
-      if (typeof message === "string") {
-        return {
-          message,
-          ...(typeof name === "string" ? { name } : {}),
-          ...(typeof stack === "string" ? { stack } : {}),
-        };
-      }
-    } catch {
-      // Fall through to the stringification below.
     }
   }
 
   return { message: stringify(error) };
+};
+
+/** One property read, defused. Absent and unreadable collapse to the same thing. */
+const field = (source: object, key: "message" | "name" | "stack"): unknown => {
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
 };
 
 /**

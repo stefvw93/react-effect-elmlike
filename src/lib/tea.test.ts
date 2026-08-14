@@ -3330,6 +3330,101 @@ describe("createFeatureStore — devtools", () => {
     expect(only(recorder, "Transition").some((event) => event.action._tag === "Error")).toBe(false);
   });
 
+  it("keeps a hostile output-handler error out of the feature's `Error` handler", async () => {
+    // The chain this guards, which is three steps and only visible end to end:
+    // `emitOutput`'s catch summarizes the error before calling `defect`. If
+    // summarizing threw, `defect` never ran, the original error escaped
+    // `emitOutput` into `fold`'s catch, and `raiseDefect` routed it into the
+    // *feature's* `Error` handler — which is precisely what `emitOutput`
+    // exists to prevent, since a missing or throwing `on<Tag>` prop is the
+    // parent's bug and belongs at the boundary.
+    class Hostile extends Error {
+      override get message(): string {
+        throw new TypeError("getter blew up");
+      }
+    }
+
+    const { store, recorder, defects } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [s.state, Command.output(Placed, { at: 1 })],
+        Land: (_a: unknown, s: any) => s.state,
+        Error: () => ({ count: -1 }),
+      },
+      outputs: true,
+      emit: () => {
+        throw new Hostile();
+      },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    // Straight to the boundary, exactly as a bad prop would go.
+    expect(defects).toHaveLength(1);
+    // And not into the feature's recovery state.
+    expect(store.getSnapshot()).toEqual({ count: 0 });
+    expect(only(recorder, "Transition").some((event) => event.action._tag === "Error")).toBe(false);
+    expect(only(recorder, "Defect")).toHaveLength(1);
+  });
+
+  it("keeps a hostile command defect on the documented error path", async () => {
+    // Same failure one funnel over: `raiseDefect` summarizes before it routes,
+    // so a throwing summarizer skipped both `defect()` and the `Error` fold
+    // and surfaced as a raw throw out of the interpreter's exit hook.
+    class Hostile extends Error {
+      override get message(): string {
+        throw new TypeError("getter blew up");
+      }
+    }
+
+    const { store, recorder, defects } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => [s.state, Command.effect(() => Effect.die(new Hostile()))],
+        Land: (_a: unknown, s: any) => s.state,
+        Error: (_a: unknown, s: any) => ({ count: s.state.count + 1 }),
+      },
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Bump" } as never);
+    await settle();
+
+    expect(store.getSnapshot()).toEqual({ count: 1 });
+    expect(defects).toEqual([]);
+    expect(only(recorder, "Defect")).toHaveLength(1);
+  });
+
+  it("emits `Unmounted` even when the teardown reducer throws", async () => {
+    // The criterion is unconditional, and the silence was worse than a missing
+    // line: the console logger's elapsed map evicts on this event, so a
+    // feature whose `Unmounted` handler throws left an entry behind. `reduce`
+    // discards `Unmounted`'s state anyway, so there is no next state to be
+    // wrong about — the transition says the feature went away, and the
+    // adjacent `Defect` says the handler threw.
+    const { store, recorder, defects } = setup({
+      reducer: {
+        Bump: (_a: unknown, s: any) => s.state,
+        Land: (_a: unknown, s: any) => s.state,
+        Unmounted: () => {
+          throw new Error("teardown blew up");
+        },
+      },
+    });
+
+    store.start();
+    recorder.clear();
+    store.stop();
+    await settle();
+
+    const unmounted = only(recorder, "Transition").filter(
+      (event) => event.action._tag === "Unmounted",
+    );
+    expect(unmounted).toHaveLength(1);
+    expect(unmounted[0]!.cause).toEqual({ _tag: "Lifecycle" });
+    expect(defects).toHaveLength(1);
+  });
+
   it("survives a throwing sink: state still moves and the sink is disabled", async () => {
     // Without the guard, a throw inside `foldOne` is caught by `fold` and
     // routed into the *feature's* `Error` handler — a devtools bug becoming a
