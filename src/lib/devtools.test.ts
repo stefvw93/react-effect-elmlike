@@ -21,6 +21,7 @@ import {
   skipUnchangedAmbient,
   summarizeCommand,
   summarizeDefect,
+  type DefectSummary,
   type DevtoolsConsole,
   type DevtoolsEvent,
 } from "./devtools";
@@ -225,6 +226,73 @@ describe("summarizeDefect", () => {
 
     expect(() => summarizeDefect(hostile)).not.toThrow();
     expect(typeof summarizeDefect(hostile).message).toBe("string");
+  });
+
+  it("survives every hostile shape a `throw` can produce", () => {
+    // Written as a table because the interesting ones were found by trying
+    // them, not by reasoning about the code. The revoked Proxy in particular
+    // defeats the *type test*: `instanceof` invokes `getPrototypeOf`, which
+    // throws on one, so even asking "is this an Error" was unsafe until the
+    // whole body was wrapped.
+    const revocable = Proxy.revocable({}, {});
+    revocable.revoke();
+
+    class BadMessage extends Error {
+      override get message(): string {
+        throw new TypeError("message getter");
+      }
+    }
+
+    const cases: ReadonlyArray<readonly [string, unknown]> = [
+      ["null-prototype object", Object.create(null)],
+      [
+        "proxy whose get trap throws",
+        new Proxy(
+          {},
+          {
+            get() {
+              throw new TypeError("get trap");
+            },
+            has() {
+              throw new TypeError("has trap");
+            },
+          },
+        ),
+      ],
+      ["revoked proxy", revocable.proxy],
+      ["Error subclass with a throwing message getter", new BadMessage()],
+      [
+        "throwing toString",
+        {
+          toString() {
+            throw new TypeError("toString");
+          },
+        },
+      ],
+      [
+        "throwing Symbol.toPrimitive",
+        {
+          [Symbol.toPrimitive]() {
+            throw new TypeError("toPrimitive");
+          },
+        },
+      ],
+      ["symbol", Symbol("s")],
+      ["bigint", 10n],
+      ["function", () => {}],
+      ["a message that is not a string", { message: 42 }],
+    ];
+
+    for (const [label, value] of cases) {
+      let summary: DefectSummary | undefined;
+      expect(() => {
+        summary = summarizeDefect(value);
+      }, label).not.toThrow();
+      expect(typeof summary!.message, label).toBe("string");
+      // Still encodable, which is the only reason this type exists.
+      expect(() => JSON.stringify(summary), label).not.toThrow();
+      expect(() => structuredClone(summary), label).not.toThrow();
+    }
   });
 
   it("survives a circular object", () => {

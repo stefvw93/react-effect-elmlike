@@ -255,25 +255,39 @@ export const summarizeCommand = (command: Command<any, any>): CommandSummary => 
  * those produces a summary rather than a second failure.
  */
 export const summarizeDefect = (error: unknown): DefectSummary => {
-  // `instanceof Error` is not a guarantee that reading its properties is safe.
-  // A subclass may define `message` or `stack` as a getter, and a getter may
-  // throw — a library error that formats its message lazily from state that
-  // has since been torn down does exactly this. So both branches read through
-  // `field`, and neither is trusted more than the other for being an `Error`.
-  if (error instanceof Error || (typeof error === "object" && error !== null)) {
-    const message = field(error, "message");
-    if (typeof message === "string") {
-      const name = field(error, "name");
-      const stack = field(error, "stack");
-      return {
-        message,
-        ...(typeof name === "string" ? { name } : {}),
-        ...(typeof stack === "string" ? { stack } : {}),
-      };
+  // Total, and the outer `try` is what finally makes that true rather than
+  // aspirational. Three separate things in here can throw on a sufficiently
+  // hostile value, and each was found by trying it rather than by reasoning:
+  //
+  //   - `instanceof` invokes `getPrototypeOf`, which throws for a **revoked
+  //     Proxy**. So even the type test is unsafe, which is why it is inside.
+  //   - A property read may be a getter. `instanceof Error` is no guarantee
+  //     otherwise: a subclass can define `message` or `stack` as one, and a
+  //     library error that formats its message lazily from state that has
+  //     since been torn down does exactly that.
+  //   - Stringifying invokes `toString` or `Symbol.toPrimitive`.
+  //
+  // The value reaching here is already a defect, usually from a fold that is
+  // going wrong. A summariser that added a second failure on top would take
+  // down the program it was installed to explain.
+  try {
+    if (typeof error === "object" && error !== null) {
+      const message = field(error, "message");
+      if (typeof message === "string") {
+        const name = field(error, "name");
+        const stack = field(error, "stack");
+        return {
+          message,
+          ...(typeof name === "string" ? { name } : {}),
+          ...(typeof stack === "string" ? { stack } : {}),
+        };
+      }
     }
-  }
 
-  return { message: stringify(error) };
+    return { message: stringify(error) };
+  } catch {
+    return { message: "<unsummarizable defect>" };
+  }
 };
 
 /** One property read, defused. Absent and unreadable collapse to the same thing. */
