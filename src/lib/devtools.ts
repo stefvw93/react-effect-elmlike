@@ -300,13 +300,13 @@ const field = (source: object, key: "message" | "name" | "stack"): unknown => {
 };
 
 /**
- * `String(value)`, with the two ways it can fail handled: a `Symbol` throws on
- * implicit conversion, and a `toString` a user wrote can throw for any reason
- * at all.
+ * `String(value)`, defused: a user-written `toString` or `Symbol.toPrimitive`
+ * can throw for any reason at all. (`String()` handles symbols itself — only
+ * implicit conversion throws on them.)
  */
 const stringify = (value: unknown): string => {
   try {
-    return typeof value === "symbol" ? value.toString() : String(value);
+    return String(value);
   } catch {
     return "<unprintable>";
   }
@@ -543,9 +543,29 @@ export const createConsoleDevtools = (options: ConsoleDevtoolsOptions = {}): Dev
   return {
     onEvent: (event) => {
       const key = `${event.name}#${event.instance}`;
-      const unmounting = event._tag === "Transition" && event.action._tag === "Unmounted";
+      // Both terminal events a `stop()` emits: the `Unmounted` transition and
+      // the teardown command that follows it. The command must evict too, or
+      // it re-inserts the entry the transition just removed.
+      const unmounting =
+        (event._tag === "Transition" && event.action._tag === "Unmounted") ||
+        (event._tag === "Command" && event.group.tag === "Unmounted");
 
-      if (!predicate(event)) {
+      // The predicate is user code reading user state, so a throw is a
+      // property of one value, not of the sink. Escaping would reach the
+      // store's disable-on-throw rule and take devtools dark for the rest of
+      // the page — keep the event and report instead.
+      let keep = true;
+      try {
+        keep = predicate(event);
+      } catch (error) {
+        try {
+          output.error("%cdevtools predicate threw", palette.defect, error);
+        } catch {
+          // The console itself is broken. Nothing left to report it with.
+        }
+      }
+
+      if (!keep) {
         // Still forget the mount. A custom predicate that filtered `Unmounted`
         // would otherwise leak one map entry per mount for the life of the
         // page — a leak in the tool installed to find leaks.
@@ -691,8 +711,9 @@ const body = (
  * A shallow, own-keys diff.
  *
  * Values are passed to the console as *arguments* rather than interpolated, so
- * a circular structure or a throwing getter is the console's problem to render
- * and not this function's to survive.
+ * a circular structure is the console's problem to render. A throwing getter,
+ * read here by the comparison itself, aborts the diff and is caught by the
+ * body's guard in `onEvent`.
  */
 const printDiff = (
   previous: unknown,

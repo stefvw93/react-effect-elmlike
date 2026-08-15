@@ -827,6 +827,56 @@ describe("createConsoleDevtools", () => {
     expect(printed(spy).slice(beforeRemount.length)).not.toMatch(/\+\d/);
   });
 
+  it("does not let the teardown command event resurrect the evicted elapsed entry", () => {
+    // `stop()` emits the `Unmounted` transition and then the teardown command
+    // event for the same mount. The transition evicts the elapsed entry; the
+    // command event that follows must not quietly re-insert it, or every
+    // feature with a teardown command leaks one entry per mount.
+    const spy = spyConsole();
+    const sink = createConsoleDevtools({ console: spy });
+    const state = { count: 0 };
+
+    sink.onEvent(transition());
+    sink.onEvent(
+      transition({
+        cause: { _tag: "Lifecycle" },
+        action: { _tag: "Unmounted" },
+        previous: state,
+        next: state,
+      }),
+    );
+    sink.onEvent({
+      _tag: "Command",
+      ...envelope,
+      cause: { _tag: "Lifecycle" },
+      group: { tag: "Unmounted" },
+      command: { _tag: "Effect" },
+      dropped: false,
+    });
+    const beforeRemount = printed(spy);
+    sink.onEvent(transition());
+
+    expect(printed(spy).slice(beforeRemount.length)).not.toMatch(/\+\d/);
+  });
+
+  it("survives a throwing predicate, keeping the event and the sink alive", () => {
+    // The predicate is user code reading user state, so a throw is a property
+    // of one value, not of the sink. Escaping would reach the store's
+    // disable-on-throw rule and take devtools dark for the rest of the page.
+    const spy = spyConsole();
+    const sink = createConsoleDevtools({
+      console: spy,
+      predicate: () => {
+        throw new Error("hostile predicate");
+      },
+    });
+
+    expect(() => sink.onEvent(transition())).not.toThrow();
+    // Reported rather than swallowed, and the event itself still prints.
+    expect(methods(spy)).toContain("error");
+    expect(printed(spy)).toContain("prev state");
+  });
+
   it("omits the clock when `timestamps` is off", () => {
     const withStamps = spyConsole();
     const stamped = createConsoleDevtools({ console: withStamps });
