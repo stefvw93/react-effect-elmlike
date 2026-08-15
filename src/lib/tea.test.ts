@@ -1311,6 +1311,55 @@ describe("createFeatureStore — feature layers", () => {
     // the mount that built it.
     expect(log).toEqual(["acquired", "used", "released"]);
   });
+
+  it("a command can register a finalizer on the mount's own scope", async () => {
+    // The mount loop runs inside `Effect.scoped`, so a command's
+    // `Effect.addFinalizer` lands on the mount scope and runs when the mount
+    // closes — including with no feature layer at all.
+    const log: Array<string> = [];
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Open", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Open: (_action: unknown, snapshot: { readonly state: { readonly count: number } }) => [
+          snapshot.state,
+          Command.effect(() =>
+            Effect.andThen(
+              Effect.addFinalizer(() => Effect.sync(() => void log.push("finalized"))),
+              Effect.sync(() => void log.push("opened")),
+            ),
+          ),
+        ],
+      } as any,
+      render: () => null,
+    });
+
+    const defects: Array<unknown> = [];
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: undefined,
+      emit: () => {},
+      defect: (error) => void defects.push(error),
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Open" } as never);
+    await Effect.runPromise(Effect.sleep("20 millis"));
+
+    expect(defects).toEqual([]);
+    expect(log).toEqual(["opened"]);
+
+    store.stop();
+    await Effect.runPromise(Effect.sleep("20 millis"));
+
+    expect(log).toEqual(["opened", "finalized"]);
+  });
 });
 
 describe("validateProps (via `component`'s check)", () => {
@@ -2731,6 +2780,65 @@ describe("Blueprint.run — the effect leaf", () => {
     expect(log).toContain("b:done");
   });
 
+  it("group addresses do not collide when a tag or key contains '::'", async () => {
+    // `{tag: "Spin", key: "a::b"}` and `{tag: "Spin::a", key: "b"}` both
+    // flattened to the string "Spin::a::b" under the old `${tag}::${key}`
+    // group id, so an exact `Cancel` of one interrupted the other. The book is
+    // nested by tag then key so the two addresses stay distinct.
+    const { ref, layer } = makeLogLayer();
+    const spin = (id: string, ms: number) =>
+      Command.effect(() =>
+        Effect.ensuring(
+          Effect.andThen(
+            push(`${id}:start`),
+            Effect.andThen(Effect.sleep(`${ms} millis`), push(`${id}:done`)),
+          ),
+          push(`${id}:ensuring`),
+        ),
+      );
+    const Feature = define({
+      props: RunProps,
+      state: RunState,
+      action: Action.of([
+        Action("Spin", {}),
+        Action("Spin::a", {}),
+        Action("Arm", {}),
+        Action("Stop", {}),
+      ]),
+    });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Spin: () => [{ count: 0 }, spin("plain", 200).pipe(Command.keyed("a::b"))],
+        "Spin::a": () => [{ count: 0 }, spin("colon", 60).pipe(Command.keyed("b"))],
+        Arm: () => [
+          { count: 0 },
+          Command.effect((dispatch) =>
+            Effect.andThen(Effect.sleep("20 millis"), dispatch({ _tag: "Stop" })),
+          ),
+        ],
+        Stop: () => [{ count: 0 }, Command.cancel({ tag: "Spin", key: "a::b" })],
+      },
+      render: () => null,
+    });
+
+    await Effect.runPromise(
+      feature.run([{ _tag: "Spin" }, { _tag: "Spin::a" }, { _tag: "Arm" }], {
+        props: {},
+        hooks: {},
+        layer,
+      }),
+    );
+
+    const log = await Effect.runPromise(Ref.get(ref));
+    // Only the exact `{Spin, a::b}` group was cancelled…
+    expect(log).toContain("plain:start");
+    expect(log).not.toContain("plain:done");
+    expect(log).toContain("plain:ensuring");
+    // …and `{Spin::a, b}` — the old encoding's collision victim — completed.
+    expect(log).toContain("colon:done");
+  });
+
   it("an unkeyed command is addressable by its tag alone", async () => {
     const { ref, layer } = makeLogLayer();
     const Feature = define({
@@ -3711,6 +3819,21 @@ describe("createFeatureStore — devtools", () => {
 // ---------------------------------------------------------------------------
 
 describe("Children", () => {
+  it("is rejected in a state schema, where devtools redaction cannot reach", () => {
+    // `reportableAction` redacts opaque fields only in `PropsChanged.previous`;
+    // a Transition's `previous`/`next` state is reported verbatim. A state
+    // schema declaring `Children` would put raw ReactNodes into every event
+    // and silently break the devtools encodability contract, so `define`
+    // refuses it outright.
+    expect(() =>
+      define({
+        props: Schema.Struct({}),
+        state: Schema.Struct({ node: Children }) as never,
+        action: Action.of([Action("Bump", {})]),
+      }),
+    ).toThrow(/node.*state.*props/s);
+  });
+
   const internalsOf = (blueprint: object): Record<string, unknown> => {
     const slot = Object.getOwnPropertySymbols(blueprint).find(
       (symbol) => symbol.description === "@tea/internals",
