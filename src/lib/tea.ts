@@ -471,6 +471,9 @@ type FiberBook = {
 
 const fiberBook = (): FiberBook => ({ groups: new Map(), inFlight: 0 });
 
+const allFibers = (book: FiberBook): Array<Fiber.Fiber<void>> =>
+  [...book.groups.values()].flatMap((byKey) => [...byKey.values()].flatMap((set) => [...set]));
+
 /**
  * The command interpreter, shared by `Blueprint.run` and `createFeatureStore`.
  *
@@ -529,12 +532,15 @@ const commandInterpreter = (deps: {
       byKey.set(ctx.key, group);
       group.add(fiber);
 
+      // No identity guards on the deletes: a Set or key-map level is deleted
+      // only when empty, by the cleanup that emptied it, and cleanups run
+      // exactly once — so a registered instance can never be a stale one.
       const cleanup = Effect.sync(() => {
         book.inFlight -= 1;
         group.delete(fiber);
-        if (group.size === 0 && byKey.get(ctx.key) === group) {
+        if (group.size === 0) {
           byKey.delete(ctx.key);
-          if (byKey.size === 0 && book.groups.get(ctx.tag) === byKey) book.groups.delete(ctx.tag);
+          if (byKey.size === 0) book.groups.delete(ctx.tag);
         }
       });
 
@@ -582,7 +588,7 @@ const commandInterpreter = (deps: {
           for (const member of command.commands) yield* interpret(member, ctx);
           return;
         case "Cancel":
-          return yield* Effect.suspend(() => Fiber.interruptAll(fibersAt(command.target)));
+          return yield* Fiber.interruptAll(fibersAt(command.target));
       }
     });
 
@@ -1341,11 +1347,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     // alive, then drain to quiescence so nothing that command started is lost.
     const teardown = (command: Command<any, any> | undefined) =>
       Effect.gen(function* () {
-        yield* Fiber.interruptAll(
-          [...cells.book.groups.values()].flatMap((byKey) =>
-            [...byKey.values()].flatMap((set) => [...set]),
-          ),
-        );
+        yield* Fiber.interruptAll(allFibers(cells.book));
 
         if (command !== undefined) {
           yield* interpret(command, { tag: "Unmounted" });

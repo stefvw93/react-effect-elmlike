@@ -439,6 +439,16 @@ export const createConsoleDevtools = (options: ConsoleDevtoolsOptions = {}): Dev
    */
   const lastSeen = new Map<string, number>();
 
+  // The defused report for the sink's own failures. If the console itself is
+  // broken too, there is nothing left to report with.
+  const reportError = (label: string, error: unknown): void => {
+    try {
+      output.error(`%c${label}`, palette.defect, error);
+    } catch {
+      // Nothing left to report it with.
+    }
+  };
+
   return {
     onEvent: (event) => {
       const key = `${event.name}#${event.instance}`;
@@ -457,11 +467,7 @@ export const createConsoleDevtools = (options: ConsoleDevtoolsOptions = {}): Dev
       try {
         keep = predicate(event);
       } catch (error) {
-        try {
-          output.error("%cdevtools predicate threw", palette.defect, error);
-        } catch {
-          // The console itself is broken. Nothing left to report it with.
-        }
+        reportError("devtools predicate threw", error);
       }
 
       if (!keep) {
@@ -494,11 +500,7 @@ export const createConsoleDevtools = (options: ConsoleDevtoolsOptions = {}): Dev
       try {
         body(event, { output, palette, diff });
       } catch (error) {
-        try {
-          output.error("%cdevtools could not print this event", palette.defect, error);
-        } catch {
-          // The console itself is broken. Nothing left to report it with.
-        }
+        reportError("devtools could not print this event", error);
       } finally {
         output.groupEnd();
         if (unmounting) lastSeen.delete(key);
