@@ -1311,6 +1311,55 @@ describe("createFeatureStore — feature layers", () => {
     // the mount that built it.
     expect(log).toEqual(["acquired", "used", "released"]);
   });
+
+  it("a command can register a finalizer on the mount's own scope", async () => {
+    // The mount loop runs inside `Effect.scoped`, so a command's
+    // `Effect.addFinalizer` lands on the mount scope and runs when the mount
+    // closes — including with no feature layer at all.
+    const log: Array<string> = [];
+    const blueprint = define({
+      props: Schema.Struct({}),
+      state: Schema.Struct({ count: Schema.Number }),
+      action: Action.of([Action("Open", {})]),
+    }).create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Open: (_action: unknown, snapshot: { readonly state: { readonly count: number } }) => [
+          snapshot.state,
+          Command.effect(() =>
+            Effect.andThen(
+              Effect.addFinalizer(() => Effect.sync(() => void log.push("finalized"))),
+              Effect.sync(() => void log.push("opened")),
+            ),
+          ),
+        ],
+      } as any,
+      render: () => null,
+    });
+
+    const defects: Array<unknown> = [];
+    const store = createFeatureStore({
+      blueprint: blueprint as any,
+      props: {},
+      equivalence,
+      runtime: testRuntime(),
+      layer: undefined,
+      emit: () => {},
+      defect: (error) => void defects.push(error),
+    });
+
+    store.start();
+    store.dispatch({ _tag: "Open" } as never);
+    await Effect.runPromise(Effect.sleep("20 millis"));
+
+    expect(defects).toEqual([]);
+    expect(log).toEqual(["opened"]);
+
+    store.stop();
+    await Effect.runPromise(Effect.sleep("20 millis"));
+
+    expect(log).toEqual(["opened", "finalized"]);
+  });
 });
 
 describe("validateProps (via `component`'s check)", () => {

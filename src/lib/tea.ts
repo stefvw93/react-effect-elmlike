@@ -3,6 +3,7 @@ import {
   createElement,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -1388,10 +1389,14 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       }
     });
 
-    // `Effect.provide` builds the feature layer once for the mount and releases
-    // it when the loop ends; commands forked inside inherit its services. A
+    // `Effect.scoped` keeps the mount's own scope ambient, so a command's
+    // `Effect.addFinalizer` lands on it and runs when the mount closes — inside
+    // `Effect.provide`, so those finalizers run before the feature layer is
+    // released. `provide` builds the layer once for the mount and releases it
+    // when the loop ends; commands forked inside inherit its services, and a
     // layer that fails to build surfaces in `catchCause` below.
-    return (layer === undefined ? loop : Effect.provide(loop, layer)).pipe(
+    const scoped = Effect.scoped(loop);
+    return (layer === undefined ? scoped : Effect.provide(scoped, layer)).pipe(
       Effect.catchCause((cause) =>
         Effect.sync(() => {
           if (Cause.hasInterruptsOnly(cause)) return;
@@ -1605,13 +1610,16 @@ export const createRuntime: <RootR, RootE>(
 
       useMemo(() => void validateProps(props), [props]);
 
-      // Latest-ref, assigned during render rather than in an effect: a
-      // command fiber can emit an output on a microtask between the commit
-      // and a passive effect's flush, and an effect-updated ref would hand
-      // that emission the previous render's handler. Handlers derive purely
-      // from props, so a discarded render's assignment is harmless.
+      // Latest-ref, assigned in a layout effect: commit and layout effects run
+      // in one synchronous task, so no command fiber's microtask can emit
+      // between them and see the previous render's handler — the hole a
+      // passive effect had. And unlike a render-phase assignment, a render
+      // pass React abandons never assigns, so an emission can never invoke a
+      // handler from a tree that was never committed.
       const handlersRef = useRef(handlers);
-      handlersRef.current = handlers;
+      useLayoutEffect(() => {
+        handlersRef.current = handlers;
+      });
 
       const [defect, setDefect] = useState<{ readonly error: unknown } | undefined>(undefined);
       if (defect) throw defect.error;

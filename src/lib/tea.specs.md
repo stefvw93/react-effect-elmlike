@@ -325,10 +325,21 @@ function` and no implementation, deliberately: they are illustrations of the
   action (set only for command-emitted actions), so a fresh `dispatch` a
   parent's `on<Tag>` handler makes re-entrantly during a teardown drain still
   targets the live mount.
-- Output handlers are read through a latest-ref assigned **during render**: a
-  command fiber can emit on a microtask between the commit and a passive
-  effect's flush, and an effect-updated ref would hand that emission the
-  previous render's handler.
+- Output handlers are read through a latest-ref assigned in a **layout
+  effect**. A passive effect left a gap — a command fiber can emit on a
+  microtask between the commit and the passive flush and see the previous
+  render's handler — while a render-phase assignment had the opposite hole: a
+  render pass React abandons would leave a never-committed handler in the ref
+  (reproduced under suspension inside a transition). Commit and layout effects
+  run in one synchronous task, which closes both.
+- `Cancel` (and the teardown sweep) interrupt via `Fiber.interruptAll`: every
+  fiber in the group is **signalled before any is awaited**, so a slow or hung
+  finalizer on one member no longer delays — or blocks forever — the interrupt
+  signal to its siblings, and no member can keep emitting during another's
+  finalizer window.
+- The mount loop runs inside `Effect.scoped`, so the mount's own scope is
+  ambient to command fibers: a command's `Effect.addFinalizer` lands on it and
+  runs when the mount closes, before the feature layer is released.
 - Feature layers are built per mount and released with it. Anything that must
   survive a mount belongs in the root layer.
 - Teardown runs in-band, on the fiber that owns the scope, with the feature's own
