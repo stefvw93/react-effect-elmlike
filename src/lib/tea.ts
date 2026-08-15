@@ -227,34 +227,25 @@ const children = <T>(): Schema.declare<T> =>
   });
 
 /**
- * Whatever a feature accepts as `children` — a node, a render prop, one
- * element, a tuple of slots. **The type argument is the contract**; the schema
- * carries no structure at all.
+ * Whatever a feature accepts as `children` — a node, a render prop, a tuple of
+ * slots. **The type argument is the contract**; the schema carries no
+ * structure at all.
  *
  *     children: Children                                    // ReactNode
  *     children: Children.as<(row: Row) => ReactNode>()      // a render prop
  *     children: Schema.optionalKey(Children)                // optional
  *
- * Three properties, none of them structural:
+ * Three deliberate properties: it **validates anything** (React owns what it
+ * can render; the type argument holds callers to the contract); it is
+ * **invisible to change detection** (equivalence constantly `true`, so a fresh
+ * node per parent render never raises `PropsChanged` — the corollary is that a
+ * reducer's `snapshot.props.children` can be stale; `render` always sees the
+ * current one); and it is **redacted in devtools** to `"<children>"`, keeping
+ * every event JSON round-trippable.
  *
- * - **It validates anything.** A function's shape is unobservable, `ReactNode`
- *   is wide and recursive, and React already rejects what it cannot render. The
- *   type argument is what holds callers to the contract.
- * - **It is invisible to change detection.** Its equivalence is constantly
- *   `true`, so new children alone never raise `PropsChanged`. That is the point
- *   — children are a fresh object on every parent render, and a declaration's
- *   default equivalence is by reference, which would re-run the reducer on each
- *   one. The corollary is that a reducer's `snapshot.props.children` can be the
- *   value from an earlier render; children are for rendering, not for reducing,
- *   and `render` always sees the current one because it reads the component's
- *   own props.
- * - **It is redacted in devtools**, to `"<children>"` — see `reportableAction`.
- *   An element tree, or a function, in an event would break the round-trip
- *   every sink relies on.
- *
- * Declared plainly the key is **required**, which is worth saying for a feature
- * that cannot render without children. JSX passing none omits the key rather
- * than passing `undefined`, so the optional form is `Schema.optionalKey`.
+ * Declared plainly the key is **required** — JSX passing no children omits the
+ * key rather than passing `undefined`, so the optional form is
+ * `Schema.optionalKey`.
  */
 export const Children: Schema.declare<ReactNode> & {
   /** The same declaration at another children type — a render prop, say. */
@@ -692,10 +683,9 @@ export interface LifecycleHandlers<Props, State, Action, H extends AnyHooks, R =
   readonly Mounted?: LifecycleHandler<"Mounted", Props, State, Action, H, R>;
 
   /**
-   * Props are a fresh object every render, so this fires constantly. That is
-   * fine: returning the *same state reference* is the no-op. It puts the "did
-   * anything I care about change" decision in `reducer`, where it can see the
-   * state.
+   * Fires when props change **by value** (`Schema.toEquivalence`), so an
+   * unchanged parent re-render folds nothing. Returning the same state
+   * reference is the no-op.
    */
   readonly PropsChanged?: LifecycleHandler<"PropsChanged", Props, State, Action, H, R>;
 
@@ -705,26 +695,18 @@ export interface LifecycleHandlers<Props, State, Action, H extends AnyHooks, R =
   readonly HookChanged?: LifecycleHandler<"HookChanged", Props, State, Action, H, R>;
 
   /**
-   * Commands cannot fail, but they can still *die* — and a Layer can fail
-   * while building the services a command asked for. Both arrive here, the
-   * latter reified as a defect, since a command's own error channel is
-   * `never`. Left unhandled, it is rethrown into the nearest React error
-   * boundary — the idiomatic default, and no configuration for the common
-   * case.
-   *
-   * `error` is the squashed cause, so the common handler never has to learn
-   * `Cause`. `cause` is there for the ones that do.
+   * Commands cannot fail, but they can still *die* — and a feature layer can
+   * fail to build. Both arrive here as defects. Left unhandled, the defect is
+   * rethrown into the nearest React error boundary. `error` is the squashed
+   * cause; `cause` is there for handlers that want the real one.
    */
   readonly Error?: LifecycleHandler<"Error", Props, State, Action, H, R>;
 
   /**
-   * Uniform in shape and narrow in meaning: the component is gone, so the
-   * runtime reads `Next.command(…)` and discards the rest. A returned state has
-   * nowhere to go and an emitted action has nowhere to land — return
-   * `snapshot.state` and put the work in the command.
-   *
-   * `blueprint.reduce` discards it identically, so a teardown test folded
-   * through `reduce` and the same feature under the runtime cannot disagree.
+   * The component is gone, so the runtime reads `Next.command(…)` and
+   * discards the rest — return `snapshot.state` and put the work in the
+   * command. `blueprint.reduce` discards identically, so a teardown test
+   * folded through `reduce` cannot disagree with the runtime.
    */
   readonly Unmounted?: LifecycleHandler<"Unmounted", Props, State, Action, H, R>;
 }
@@ -1026,18 +1008,15 @@ export interface FeatureStore<Props, State, Action, H extends AnyHooks> {
   readonly sync: (props: Props, hooks: H) => State;
 
   /**
-   * Open the mount scope, build the feature layer inside it, raise `Mounted`.
-   *
-   * Idempotent while already started, so React's effect running twice cannot
-   * open two scopes. Calling it after `stop` re-arms the store — the dev
-   * remount path — reusing the existing state rather than reprojecting
-   * `initialState`.
+   * Open the mount, build the feature layer inside it, raise `Mounted`.
+   * Idempotent while started; calling it after `stop` re-arms the store (the
+   * StrictMode remount path), reusing the existing state.
    */
   readonly start: () => void;
 
   /**
-   * Raise `Unmounted`, fork its command into the **root** scope, and close the
-   * mount scope once that command settles.
+   * Raise `Unmounted`, run its command with the feature's services still
+   * alive, and close the mount once that command settles.
    */
   readonly stop: () => void;
 }
@@ -1125,11 +1104,10 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
    * Hand one event to the sink, and disable the sink if it throws.
    */
   const report = (event: DevtoolsEvent): void => {
-    // Re-read rather than trusting the caller's handle. A single fold reports
-    // twice — a transition, then the command it issued — and a sink that threw
-    // on the first must not be called for the second. The call sites still
-    // guard on `devtools()` before building an event, which is what keeps the
-    // no-sink path free of allocation; this is only about staying disabled.
+    // Re-read `sink` rather than trusting the caller's handle: a single fold
+    // reports twice, and a sink that threw on the first event must not be
+    // called for the second. Call sites still guard on `devtools()` before
+    // building an event, which keeps the no-sink path free of allocation.
     const target = sink;
     if (target === undefined) return;
     try {
@@ -1634,38 +1612,23 @@ export const createRuntime: <RootR, RootE>(
       const committed = store.getSnapshot();
       const hooks = useFeatureHooks(props, committed);
 
-      // In the body, not an effect. `sync` compares props and hooks by value,
-      // raises `PropsChanged` / `HookChanged`, and folds them — so a
-      // props-driven change paints on the render that carried the props
-      // instead of on the one after it. It mutates a store during render,
-      // which a discarded render would repeat; the value comparison is what
-      // makes the repeat a no-op. See `FeatureStore.sync`.
+      // In the body, not an effect: `sync` compares props and hooks by value
+      // and folds `PropsChanged`/`HookChanged`, so a props-driven change
+      // paints on the render that carried the props. A discarded render
+      // repeats the call; the value comparison makes the repeat a no-op.
       store.sync(props, hooks);
 
-      // **After `sync`, and that ordering is the whole point.**
-      //
-      // `useSyncExternalStore` re-reads `getSnapshot` when the render finishes
-      // and schedules another render if the value moved. Subscribing first and
-      // folding second is exactly the shape that trips it, and the render-body
-      // `sync` exists to avoid a second render, so the two were working against
-      // each other on paper. Folding first means both reads see the same state.
-      //
-      // **On paper**, and stated that way deliberately: the extra render was
-      // never reproduced. `getSnapshot` is a stable method and the pre-fold
-      // read equalled the previous render's snapshot, so React had nothing to
-      // compare unfavourably, and the browser test counts one render either
-      // way. This ordering is defensive, not a measured fix, and it ships
-      // without a test that would catch a revert — see `tea.specs.md`.
-      //
-      // Hook order is still stable: this is called unconditionally on every
-      // render, just later in the body.
+      // After `sync`, deliberately: `useSyncExternalStore` re-reads
+      // `getSnapshot` when the render finishes and schedules another render if
+      // it moved — folding first means both reads see the same state.
+      // Defensive rather than a measured fix; see `tea.specs.md`. Hook order
+      // stays stable: called unconditionally, just later in the body.
       const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
 
-      // `Mounted` stays in an effect: it is the one lifecycle action that must
-      // not fire for a render React throws away, since its command has side
-      // effects. `start`/`stop` rather than a single `dispose` is what lets the
+      // `Mounted` stays in an effect: it must not fire for a render React
+      // throws away. `start`/`stop` rather than a single `dispose` lets the
       // StrictMode remount re-arm the store instead of inheriting a closed
-      // scope — see `FeatureStore` for the full argument.
+      // scope.
       useEffect(() => {
         store.start();
         return () => store.stop();
