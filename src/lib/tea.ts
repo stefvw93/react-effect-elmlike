@@ -459,9 +459,13 @@ type CommandContext = {
  * Mutable bookkeeping for the fibers an interpreter has in flight. Every
  * mutation is synchronous and JS is single-threaded, so plain fields suffice —
  * fibers only interleave at yield points.
+ *
+ * Nested by tag then key (`undefined` = unkeyed) rather than a `${tag}:${key}`
+ * string, so a tag or key containing the would-be delimiter cannot collide
+ * with another group's address.
  */
 type FiberBook = {
-  readonly groups: Map<string, Set<Fiber.Fiber<void>>>;
+  readonly groups: Map<string, Map<string | undefined, Set<Fiber.Fiber<void>>>>;
   inFlight: number;
 };
 
@@ -503,33 +507,35 @@ const commandInterpreter = (deps: {
   ) => Effect.Effect<void, never, any>;
 } => {
   const { book } = deps;
-  const groupId = (target: Group): string => `${target.tag}::${target.key ?? ""}`;
 
   // Every fiber at the address: a bare tag addresses every key under it.
   const fibersAt = (target: Group): Array<Fiber.Fiber<void>> => {
-    if (target.key !== undefined) return [...(book.groups.get(groupId(target)) ?? [])];
-    const found: Array<Fiber.Fiber<void>> = [];
-    for (const [id, fibers] of book.groups) {
-      if (id.startsWith(`${target.tag}::`)) found.push(...fibers);
-    }
-    return found;
+    const byKey = book.groups.get(target.tag);
+    if (byKey === undefined) return [];
+    if (target.key !== undefined) return [...(byKey.get(target.key) ?? [])];
+    return [...byKey.values()].flatMap((set) => [...set]);
   };
 
   /** Fork one leaf, register it under `ctx`'s group, unregister however it ends. */
   const forkLeaf = (ctx: CommandContext, run: Effect.Effect<void, never, any>) =>
     Effect.gen(function* () {
-      const id = groupId(ctx);
       book.inFlight += 1;
 
       const fiber: Fiber.Fiber<void> = yield* Effect.forkChild(run);
-      const group = book.groups.get(id) ?? new Set();
+      const byKey =
+        book.groups.get(ctx.tag) ?? new Map<string | undefined, Set<Fiber.Fiber<void>>>();
+      book.groups.set(ctx.tag, byKey);
+      const group = byKey.get(ctx.key) ?? new Set<Fiber.Fiber<void>>();
+      byKey.set(ctx.key, group);
       group.add(fiber);
-      book.groups.set(id, group);
 
       const cleanup = Effect.sync(() => {
         book.inFlight -= 1;
         group.delete(fiber);
-        if (group.size === 0 && book.groups.get(id) === group) book.groups.delete(id);
+        if (group.size === 0 && byKey.get(ctx.key) === group) {
+          byKey.delete(ctx.key);
+          if (byKey.size === 0 && book.groups.get(ctx.tag) === byKey) book.groups.delete(ctx.tag);
+        }
       });
 
       // A fiber interrupted before the scheduler has started it never runs its
@@ -1136,9 +1142,18 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
 
   const buffered: Array<Work> = [];
   const subscribers = new Set<() => void>();
+
+  /**
+   * Actions waiting to fold, each carrying the mount its commands must go to.
+   * `target` is set for actions a command emitted — they belong to the mount
+   * whose command emitted them, which during a teardown drain is not the
+   * currently installed one. A plain `dispatch` carries none and routes to
+   * whatever mount is live when it folds.
+   */
   const pending: Array<{
     readonly action: { readonly _tag: string };
     readonly cause: DevtoolsCause;
+    readonly target: Mount | undefined;
   }> = [];
 
   let active = false;
@@ -1148,7 +1163,6 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
   let hooks: H | undefined;
   let folding = false;
   let syncing = false;
-  let routing: Mount | undefined;
 
   const snapshot = (): Snapshot<Props, State, H> => ({
     state,
@@ -1156,20 +1170,10 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     hooks: hooks ?? ({} as H),
   });
 
-  const withRouting = <T>(target: Mount, body: () => T): T => {
-    const previous = routing;
-    routing = target;
-    try {
-      return body();
-    } finally {
-      routing = previous;
-    }
-  };
-
-  const offer = (work: Work): boolean => {
-    const target = routing ?? mount;
-    if (target !== undefined) {
-      Queue.offerUnsafe(target.queue, work);
+  const offer = (work: Work, target: Mount | undefined): boolean => {
+    const to = target ?? mount;
+    if (to !== undefined) {
+      Queue.offerUnsafe(to.queue, work);
       return true;
     }
     if (!everStarted) {
@@ -1204,7 +1208,11 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     }
   };
 
-  const foldOne = (action: { readonly _tag: string }, cause: DevtoolsCause): boolean => {
+  const foldOne = (
+    action: { readonly _tag: string },
+    cause: DevtoolsCause,
+    routeTo: Mount | undefined,
+  ): boolean => {
     if (outputs.has(action._tag)) {
       emitOutput(action, cause);
       return false;
@@ -1234,7 +1242,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
 
     if (command) {
       const ctx = { tag: action._tag };
-      const accepted = offer({ _tag: "Run", command, ctx });
+      const accepted = offer({ _tag: "Run", command, ctx }, routeTo);
       if (target !== undefined) {
         report({
           _tag: "Command",
@@ -1250,8 +1258,8 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     return moved;
   };
 
-  const fold = (action: { readonly _tag: string }, cause: DevtoolsCause): void => {
-    pending.push({ action, cause });
+  const fold = (action: { readonly _tag: string }, cause: DevtoolsCause, target?: Mount): void => {
+    pending.push({ action, cause, target });
     if (folding) return;
 
     folding = true;
@@ -1260,9 +1268,9 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       while (pending.length > 0) {
         const next = pending.shift()!;
         try {
-          if (foldOne(next.action, next.cause)) moved = true;
+          if (foldOne(next.action, next.cause, next.target)) moved = true;
         } catch (error) {
-          raiseDefect(error, next.action._tag, next.cause);
+          raiseDefect(error, next.action._tag, next.cause, next.target);
         }
       }
     } finally {
@@ -1271,11 +1279,11 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     }
   };
 
-  function raiseDefect(error: unknown, from: string, cause: DevtoolsCause): void {
+  function raiseDefect(error: unknown, from: string, cause: DevtoolsCause, target?: Mount): void {
     const handled = from !== "Error" && handles("Error");
-    const target = devtools();
+    const sink = devtools();
 
-    if (target !== undefined) {
+    if (sink !== undefined) {
       report({
         _tag: "Defect",
         name,
@@ -1292,7 +1300,11 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       return;
     }
 
-    fold({ _tag: "Error", error, cause: Cause.die(error) } as never, { _tag: "Defect", from });
+    fold(
+      { _tag: "Error", error, cause: Cause.die(error) } as never,
+      { _tag: "Defect", from },
+      target,
+    );
   }
 
   const run = (cells: Mount) => {
@@ -1304,15 +1316,12 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
 
     const { interpret } = commandInterpreter({
       book: cells.book,
-      emit: (message, ctx) =>
-        Effect.sync(() => withRouting(cells, () => fold(message, commandCause(ctx)))),
+      emit: (message, ctx) => Effect.sync(() => fold(message, commandCause(ctx), cells)),
       settled: Effect.sync(() => Queue.offerUnsafe(cells.queue, { _tag: "Settled" })),
       onExit: (exit, ctx) =>
         Effect.sync(() => {
           if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) {
-            withRouting(cells, () =>
-              raiseDefect(Cause.squash(exit.cause), ctx.tag, commandCause(ctx)),
-            );
+            raiseDefect(Cause.squash(exit.cause), ctx.tag, commandCause(ctx), cells);
           }
         }),
     });
@@ -1321,7 +1330,11 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     // alive, then drain to quiescence so nothing that command started is lost.
     const teardown = (command: Command<any, any> | undefined) =>
       Effect.gen(function* () {
-        yield* Fiber.interruptAll([...cells.book.groups.values()].flatMap((set) => [...set]));
+        yield* Fiber.interruptAll(
+          [...cells.book.groups.values()].flatMap((byKey) =>
+            [...byKey.values()].flatMap((set) => [...set]),
+          ),
+        );
 
         if (command !== undefined) {
           yield* interpret(command, { tag: "Unmounted" });
@@ -1343,12 +1356,11 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
             Effect.flatMap((finished) =>
               Option.isNone(finished)
                 ? Effect.sync(() =>
-                    withRouting(cells, () =>
-                      raiseDefect(
-                        new Error("Unmounted did not settle within 5s; scope closed anyway"),
-                        "Unmounted",
-                        LIFECYCLE,
-                      ),
+                    raiseDefect(
+                      new Error("Unmounted did not settle within 5s; scope closed anyway"),
+                      "Unmounted",
+                      LIFECYCLE,
+                      cells,
                     ),
                   )
                 : Effect.void,
@@ -1580,11 +1592,13 @@ export const createRuntime: <RootR, RootE>(
 
       useMemo(() => void validateProps(props), [props]);
 
+      // Latest-ref, assigned during render rather than in an effect: a
+      // command fiber can emit an output on a microtask between the commit
+      // and a passive effect's flush, and an effect-updated ref would hand
+      // that emission the previous render's handler. Handlers derive purely
+      // from props, so a discarded render's assignment is harmless.
       const handlersRef = useRef(handlers);
-
-      useEffect(() => {
-        handlersRef.current = handlers;
-      }, [handlers]);
+      handlersRef.current = handlers;
 
       const [defect, setDefect] = useState<{ readonly error: unknown } | undefined>(undefined);
       if (defect) throw defect.error;
