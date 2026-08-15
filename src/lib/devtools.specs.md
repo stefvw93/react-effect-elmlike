@@ -221,7 +221,8 @@ untouched — no existing `component(bp)` call changes.
 - [x] The default predicate (`skipUnchangedAmbient`) drops an unchanged `PropsChanged`/`HookChanged`, keeps a `PropsChanged` that moved state, and keeps `Unmounted` and an unchanged **dispatch**.
 - [x] `skipUnchanged` drops any transition where `previous === next`, including `Unmounted`.
 - [x] `diff: true` prints a **shallow own-keys** diff (`+ key`, `- key`, `~ key: prev → next`).
-- [x] Elapsed time appears from the second event of a given `${name}#${instance}` onward, and the elapsed map **drops its entry on an `Unmounted` transition**.
+- [x] Elapsed time appears from the second event of a given `${name}#${instance}` onward, and the elapsed map **drops its entry on an `Unmounted` transition** — and on the teardown `Command` event (`group: { tag: "Unmounted" }`) that `stop()` emits right after it, which would otherwise re-insert the entry the transition just evicted.
+- [x] A **throwing predicate** does not escape `onEvent` (which would trip the store's disable-on-throw rule and take devtools dark): the event is kept, the throw is reported through `console.error`, and the sink stays alive.
 - [x] `timestamps: false` omits the clock, `timestamps: true` (default) includes it.
 - [x] Everything above is asserted against an injected `DevtoolsConsole`, never the global.
 
@@ -344,7 +345,7 @@ Elapsed uses `performance.now()` in a `Map` keyed by `${name}#${instance}`.
 - **A summariser that can throw defeats both error funnels, which is why `summarizeDefect` is total for `Error` subclasses too.** Both `emitOutput`'s catch and `raiseDefect` summarize _before_ they route. A throw inside the summariser therefore skips the routing entirely: in `emitOutput` the original error escapes into `fold`'s catch and lands in the **feature's own `Error` handler** — precisely what that code path exists to prevent, since a throwing `on<Tag>` prop is the parent's bug — and in `raiseDefect` it skips both `defect()` and the `Error` fold, surfacing as a raw throw out of the interpreter's exit hook. `instanceof Error` does not make a property read safe: a subclass may define `message` or `stack` as a getter, and a library error that formats its message lazily from torn-down state does exactly that. Every property read goes through one defused helper, and an unreadable field is treated the same as an absent one.
 - **The `Defect` event is emitted in `raiseDefect` only.** `onExit` already calls `raiseDefect`, so emitting in both would double every dying command. `handled` comes from the branch that already exists: `from === "Error" || !handles("Error")` → `handled: false`. `emitOutput`'s catch calls `defect()` **directly**, never `raiseDefect` (deliberately), so it needs its own emission with `handled: false`.
 - **A dropped command logs as dropped, not as issued** — hence `offer` returning a boolean.
-- **StrictMode double-invokes the `useState` initialiser**, burning an instance id. Ids are unique, not gapless. The counter is module-global, so ids are unique per page rather than per runtime.
+- **StrictMode double-invokes the `useState` initialiser**, burning an instance id. Ids are unique, not gapless. The counter is a single module-global integer — not per name, not per runtime — so ids are unique per page and two mounts of one blueprint need not be numbered `1` and `2`.
 - `diff` is deliberately shallow: deep-diffing unknown state is unbounded work on a value the library does not own — the same argument `hooksEquivalence` already makes.
 
 ## Known limitations

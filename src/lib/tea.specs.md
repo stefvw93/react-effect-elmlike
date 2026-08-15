@@ -80,6 +80,12 @@ refs, DOM nodes — was built and withdrawn: the annotation and the collection a
 already general, so promoting them is a one-line change if a second caller ever
 turns up. Until then the surface says what it means.
 
+Opaque declarations are **props-only, enforced**: redaction covers
+`PropsChanged.previous`, while a `Transition`'s state is reported verbatim, so
+a state schema declaring `Children` would put raw ReactNodes into every event.
+`define` throws on one rather than silently breaking the devtools
+encodability contract.
+
 ## The command model
 
 A `Command` is a small ADT. The leaf is an `Effect`; everything Effect can
@@ -171,7 +177,7 @@ its own criteria live in `devtools.specs.md`.
 - [x] `Command.keyed(key, command)` names the fiber a command forks, so `Cancel` can address it. Also curried (`Command.keyed(key)`) and so pipeable. An unkeyed command is addressable by tag alone.
 - [x] `Command.restart`, `Command.ignore`, `Command.queue`, the `Policy` type and the `Guarded` node are removed.
 - [x] `Command.batch(...commands)` interprets its members in order under one context. With no policy there is no supersession question and nothing to decide.
-- [x] `Command.cancel(target)` interrupts by tag alone (prefix match, every key under it) or by `{ tag, key }` (exact).
+- [x] `Command.cancel(target)` interrupts by tag alone (every key under that tag) or by `{ tag, key }` (exact). Groups are booked by tag then key — not a `${tag}::${key}` string — so a tag or key containing `::` cannot collide with another group's address.
 - [x] `Command.output(message, payload)` emits an outbound message; passing an internal message is a compile error. _Re-expressed on the new leaf internally; signature unchanged. Removing it is deferred — see Deferred decisions._
 - [x] Commands are `Pipeable`, and piping preserves `A` and `R`.
 
@@ -310,10 +316,19 @@ function` and no implementation, deliberately: they are illustrations of the
   closed by that effect's cleanup. StrictMode forces the split: a store created
   in `useState` survives a simulated unmount, so a single `dispose()` would leave
   the remounted component holding a closed scope.
-- The command queue, group map and in-flight counter are **per mount**, not per
-  store, so a stale fiber can only take from a queue nobody offers to again.
+- The command queue and the fiber book (groups nested by tag then key, plus an
+  in-flight counter — plain mutable fields, since every update is one
+  synchronous step on one thread) are **per mount**, not per store, so a stale
+  fiber can only take from a queue nobody offers to again.
 - A command's emissions route back to the mount whose command emitted them, not
-  to whichever mount is currently installed.
+  to whichever mount is currently installed. Routing is carried per pending
+  action (set only for command-emitted actions), so a fresh `dispatch` a
+  parent's `on<Tag>` handler makes re-entrantly during a teardown drain still
+  targets the live mount.
+- Output handlers are read through a latest-ref assigned **during render**: a
+  command fiber can emit on a microtask between the commit and a passive
+  effect's flush, and an effect-updated ref would hand that emission the
+  previous render's handler.
 - Feature layers are built per mount and released with it. Anything that must
   survive a mount belongs in the root layer.
 - Teardown runs in-band, on the fiber that owns the scope, with the feature's own
@@ -339,6 +354,19 @@ function` and no implementation, deliberately: they are illustrations of the
 
 ## Known limitations
 
+- **`useHooks` sees the pre-`sync` state.** `component` calls the hook spec
+  with the committed state read _before_ `store.sync` folds
+  `PropsChanged`/`HookChanged`, and a sync-driven fold suppresses notification
+  (the change paints on the same render), so a hook value derived from state
+  can lag until the next dispatch or ambient change. A follow-up notification
+  would cost the second render the render-body `sync` exists to avoid; this is
+  part of the deferred `store.sync` redesign below, not a patch.
+- **A `Cancel` awaits the interrupted fibers' finalizers on the mount's run
+  loop.** That await is what guarantees a `Batch` can sequence a `Cancel`
+  before the command replacing it — but it means an uninterruptible finalizer
+  that hangs stalls all subsequent command processing for that feature.
+  Finalizers are expected to be brief; the 5s teardown bound catches the
+  unmount case, and nothing bounds the in-mount case today.
 - **`run` cannot terminate while a never-completing command is in flight.**
   `Command.effect((d) => Effect.never)` pins the in-flight count exactly as
   `Command.stream(Stream.never)` did, so the leaf change does not fix this. The
