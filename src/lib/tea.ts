@@ -882,6 +882,17 @@ export const define: <
 
   readonly useHooks?: HookSpec<PropsOf<PropsSchema>, StateOf<StateSchema>, H>;
 }) => Definition<PropsOf<PropsSchema>, StateOf<StateSchema>, A, O, H> = (spec) => {
+  // Opaque declarations (`Children`) are redacted only in `PropsChanged`
+  // events; state reaches devtools transitions verbatim. Refusing them here
+  // keeps the "every event is encodable" contract honest.
+  const opaqueState = opaqueProps(spec.state as AnyPropsSchema);
+  if (opaqueState.length > 0) {
+    throw new TypeError(
+      `Opaque field "${opaqueState[0]![0]}" declared in the state schema; ` +
+        "opaque declarations like Children belong in props",
+    );
+  }
+
   return {
     initialState: (initialState) => (props) => initialState(props),
     reducer: identity,

@@ -3770,6 +3770,21 @@ describe("createFeatureStore — devtools", () => {
 // ---------------------------------------------------------------------------
 
 describe("Children", () => {
+  it("is rejected in a state schema, where devtools redaction cannot reach", () => {
+    // `reportableAction` redacts opaque fields only in `PropsChanged.previous`;
+    // a Transition's `previous`/`next` state is reported verbatim. A state
+    // schema declaring `Children` would put raw ReactNodes into every event
+    // and silently break the devtools encodability contract, so `define`
+    // refuses it outright.
+    expect(() =>
+      define({
+        props: Schema.Struct({}),
+        state: Schema.Struct({ node: Children }) as never,
+        action: Action.of([Action("Bump", {})]),
+      }),
+    ).toThrow(/node.*state.*props/s);
+  });
+
   const internalsOf = (blueprint: object): Record<string, unknown> => {
     const slot = Object.getOwnPropertySymbols(blueprint).find(
       (symbol) => symbol.description === "@tea/internals",
