@@ -23,7 +23,6 @@ import {
   Option,
   Pipeable,
   Queue,
-  Ref,
   Schema,
   SchemaParser,
 } from "effect";
@@ -456,10 +455,6 @@ export const Command: {
     ) as any,
 };
 
-type GroupEntry = {
-  readonly fiber: Fiber.Fiber<void>;
-};
-
 /**
  * The group a command's fibers belong to. `tag` is the issuing action's, filled
  * by the runtime; `key` is whatever a `Keyed` node named it. See `Group`.
@@ -470,140 +465,96 @@ type CommandContext = {
 };
 
 /**
+ * Mutable bookkeeping for the fibers an interpreter has in flight. Every
+ * mutation is synchronous and JS is single-threaded, so plain fields suffice —
+ * fibers only interleave at yield points.
+ */
+type FiberBook = {
+  readonly groups: Map<string, Set<Fiber.Fiber<void>>>;
+  inFlight: number;
+};
+
+const fiberBook = (): FiberBook => ({ groups: new Map(), inFlight: 0 });
+
+/**
  * The command interpreter, shared by `Blueprint.run` and `createFeatureStore`.
+ *
+ * `interpret` walks a command, forking its leaves: `None` returns, `Effect`
+ * forks the leaf with a `dispatch` bound to `deps.emit`, `Keyed` sets the key
+ * for everything below it (outermost wins), `Batch` interprets members in
+ * order under one context, `Cancel` interrupts every fiber at the address it
+ * names.
  */
 const commandInterpreter = (deps: {
   /**
    * Where a command's emissions go: back to the reducer, or out as an output.
-   *
-   * The `ctx` is the emitting command's group — the address a `Cancel` would
-   * name. It is passed so the store can attribute what it folds to the command
-   * that caused it; `run` ignores it, and a one-parameter function is still
-   * assignable here, which is why `run`'s sink needed no change.
+   * `ctx` is the emitting command's group, so the store can attribute what it
+   * folds; `run` ignores it.
    */
   readonly emit: (message: { readonly _tag: string }, ctx: CommandContext) => Effect.Effect<void>;
   /**
-   * Run after a command's fiber settles, however it settled. `run` needs it to
-   * wake a `Queue.take` that quiescence would otherwise never unblock; the
-   * store has nothing to wake and passes `Effect.void`.
+   * Runs after a command's fiber settles, however it settled — `run` needs it
+   * to wake a `Queue.take` that quiescence would otherwise never unblock.
    */
   readonly settled: Effect.Effect<void>;
   /**
-   * How a command's fiber ended.
-   *
-   * `forkLeaf` forks and returns, so a command that *dies* dies on a fiber
-   * nobody is awaiting — an enclosing `catchCause` around `interpret` sees
-   * nothing, because `interpret` has already returned by the time the command
-   * runs. Without this hook the store's whole documented error contract is
-   * unreachable: every defect from a command is discarded silently.
-   *
-   * Interruption is normal here (that is what `Cancel` and unmount do), so a
-   * caller filters on it rather than treating every non-success as a defect.
+   * How a command's fiber ended. `forkLeaf` forks and returns, so a dying
+   * command dies on a fiber nobody awaits — without this hook every defect
+   * from a command is discarded silently. Interruption is normal here
+   * (`Cancel`, unmount), so callers filter on it.
    */
   readonly onExit?: (exit: Exit.Exit<void>, ctx: CommandContext) => Effect.Effect<void>;
-  readonly inFlight: Ref.Ref<number>;
-  readonly groups: Ref.Ref<Map<string, ReadonlyArray<GroupEntry>>>;
+  readonly book: FiberBook;
 }): {
-  /**
-   * Walk a command, forking its leaves into the mount scope.
-   *
-   * `None` returns. `Effect` forks the leaf, handing it a `dispatch` bound to
-   * `deps.emit`, and registers the fiber under the context's group. `Keyed`
-   * sets the key for everything below it, outermost winning. `Batch`
-   * interprets its members in order under one context. `Cancel` interrupts
-   * every fiber at the address it names.
-   */
   readonly interpret: (
     command: Command<any, any>,
     ctx: CommandContext,
   ) => Effect.Effect<void, never, any>;
 } => {
+  const { book } = deps;
   const groupId = (target: Group): string => `${target.tag}::${target.key ?? ""}`;
 
-  const cancelGroup = (target: Group) =>
-    Effect.gen(function* () {
-      const map = yield* Ref.get(deps.groups);
-      const ids =
-        target.key !== undefined
-          ? [groupId(target)]
-          : Array.from(map.keys()).filter((id) => id.startsWith(`${target.tag}::`));
+  // Every fiber at the address: a bare tag addresses every key under it.
+  const fibersAt = (target: Group): Array<Fiber.Fiber<void>> => {
+    if (target.key !== undefined) return [...(book.groups.get(groupId(target)) ?? [])];
+    const found: Array<Fiber.Fiber<void>> = [];
+    for (const [id, fibers] of book.groups) {
+      if (id.startsWith(`${target.tag}::`)) found.push(...fibers);
+    }
+    return found;
+  };
 
-      // Every fiber at the address, deliberately: `Cancel` addresses a group,
-      // and a batch's members are all of them at that address.
-      for (const id of ids) {
-        for (const entry of map.get(id) ?? []) yield* Fiber.interrupt(entry.fiber);
-      }
-    });
-
-  /**
-   * Fork one leaf, register it under `ctx`'s group, and arrange for it to be
-   * unregistered however it ends.
-   *
-   * What is *not* here is the whole point of the redesign: no policy, no
-   * supersession rule, no per-interpretation occurrence to tell an earlier
-   * dispatch from a sibling forked three lines ago. A leaf forks, and the map
-   * is a plain address book.
-   */
+  /** Fork one leaf, register it under `ctx`'s group, unregister however it ends. */
   const forkLeaf = (ctx: CommandContext, run: Effect.Effect<void, never, any>) =>
     Effect.gen(function* () {
       const id = groupId(ctx);
-
-      yield* Ref.update(deps.inFlight, (n) => n + 1);
+      book.inFlight += 1;
 
       const fiber: Fiber.Fiber<void> = yield* Effect.forkChild(run);
+      const group = book.groups.get(id) ?? new Set();
+      group.add(fiber);
+      book.groups.set(id, group);
 
-      yield* Ref.update(deps.groups, (m) => new Map(m).set(id, [...(m.get(id) ?? []), { fiber }]));
-
-      const cleanup = Effect.gen(function* () {
-        yield* Ref.update(deps.inFlight, (n) => n - 1);
-        yield* Ref.update(deps.groups, (m) => {
-          const next = new Map(m);
-          const remaining = (next.get(id) ?? []).filter((entry) => entry.fiber !== fiber);
-          if (remaining.length > 0) next.set(id, remaining);
-          else next.delete(id);
-          return next;
-        });
-        yield* deps.settled;
+      const cleanup = Effect.sync(() => {
+        book.inFlight -= 1;
+        group.delete(fiber);
+        if (group.size === 0 && book.groups.get(id) === group) book.groups.delete(id);
       });
 
       // A fiber interrupted before the scheduler has started it never runs its
-      // own body — including an `Effect.ensuring` baked into that body — so
-      // cleanup cannot live there. A separate watcher on `Fiber.await` observes
-      // the Exit whether or not the fiber ever got to start.
-      //
-      // `ensuring`, not `andThen`: chaining `cleanup` behind `onExit` meant an
-      // `onExit` that died skipped the `inFlight` decrement and the `groups`
-      // removal, leaving a settled fiber in its group forever. The bookkeeping
-      // has to survive a reporting failure.
+      // own body — including an `Effect.ensuring` baked into that body —
+      // verified against the installed effect version. So cleanup cannot live
+      // in the leaf; a separate watcher on `Fiber.await` observes the Exit
+      // whether or not the fiber ever got to start. `ensuring`, not `andThen`:
+      // the bookkeeping has to survive an `onExit` that dies.
       yield* Fiber.await(fiber).pipe(
         Effect.flatMap((exit) =>
           deps.onExit === undefined ? Effect.void : deps.onExit(exit, ctx),
         ),
-        Effect.ensuring(cleanup),
+        Effect.ensuring(Effect.andThen(cleanup, deps.settled)),
         Effect.forkChild,
       );
     });
-
-  /**
-   * What a leaf emits with. Bound to `deps.emit`, which is the whole difference
-   * between the two callers — `run`'s queue, or the store's synchronous fold.
-   *
-   * Returns an `Effect`, so it composes with the effect that called it. That is
-   * what lets a long-lived source be `Stream.runForEach(source, dispatch)` and
-   * a one-shot be `Effect.flatMap(load, dispatch)`, with no separate variant
-   * for either.
-   *
-   * Built per leaf rather than once for the interpreter, because the ctx it
-   * closes over is what tells the store which command emitted. A single shared
-   * closure cannot carry it: `Keyed` refines the ctx on the way down, so by the
-   * time a leaf runs, its ctx is not the one the interpreter was constructed
-   * with. One extra closure per forked leaf, which is nothing beside forking
-   * the fiber it belongs to.
-   */
-  const dispatchFor =
-    (ctx: CommandContext): Dispatcher<any> =>
-    (action) =>
-      deps.emit(action, ctx);
 
   const interpret = (
     command: Command<any, any>,
@@ -615,30 +566,26 @@ const commandInterpreter = (deps: {
           return;
         case "Effect":
           // `suspend`, so a leaf builder that throws synchronously dies on the
-          // command's own fiber and is reported through `onExit`, rather than
-          // escaping into whoever called `interpret` — which is the fold, and
-          // has no business catching it.
+          // command's own fiber and is reported through `onExit` rather than
+          // escaping into the fold that called `interpret`.
           return yield* forkLeaf(
             ctx,
-            Effect.asVoid(Effect.suspend(() => command.effect(dispatchFor(ctx)))),
+            Effect.asVoid(Effect.suspend(() => command.effect((action) => deps.emit(action, ctx)))),
           );
         case "Keyed":
-          // Outermost wins: an inner `Keyed` under an outer one keeps `ctx`
-          // whole. Nesting is answerable rather than an error because a keyed
-          // command composes into a batch that is itself keyed.
+          // Outermost wins: an inner `Keyed` under an outer one keeps `ctx` whole.
           return yield* interpret(
             command.command,
             ctx.key === undefined ? { tag: ctx.tag, key: command.key } : ctx,
           );
         case "Batch":
-          // One `ctx`, so every member shares the issuing action's group — the
-          // address `Cancel` names. In order, because the one thing this node
-          // can do that `Effect.all` cannot is put a `Cancel` before the
-          // command replacing it.
+          // One `ctx`, so every member shares the issuing action's group. In
+          // order, because the one thing this node can do that `Effect.all`
+          // cannot is put a `Cancel` before the command replacing it.
           for (const member of command.commands) yield* interpret(member, ctx);
           return;
         case "Cancel":
-          return yield* cancelGroup(command.target);
+          return yield* Effect.suspend(() => Fiber.interruptAll(fibersAt(command.target)));
       }
     });
 
@@ -954,7 +901,32 @@ export const define: <
     create: (parts) => {
       const outputTags = spec.output ? Object.keys(spec.output.cases) : [];
       const outputTagSet = new Set(outputTags);
-      const opaqueFields = opaqueProps(spec.props);
+
+      /**
+       * A missing handler is the documented no-op only for a *lifecycle* tag —
+       * every `LifecycleHandlers` entry is optional by design. A missing
+       * handler for anything else is a defect: `Reducer` requires one for
+       * every declared action tag, so reaching that branch means the action
+       * arrived without going through the typed surface.
+       *
+       * `Unmounted`'s returned state is discarded: the component is gone, so
+       * the state has nowhere to go. Only the command survives — `run` and the
+       * store both fold through here, so they cannot disagree.
+       */
+      const reduce = (
+        action: { readonly _tag: string },
+        snapshot: Snapshot<any, any, any>,
+      ): Next<any, any, any> => {
+        const handler = handlerFor(parts.reducer, action._tag);
+        if (handler) {
+          const next = handler(action as never, snapshot);
+          if (action._tag !== "Unmounted") return next;
+          const command = Next.command(next);
+          return command === undefined ? snapshot.state : [snapshot.state, command];
+        }
+        if (isLifecycleTag(action._tag)) return snapshot.state;
+        throw new TypeError(`No reducer handler for action "${action._tag}"`);
+      };
 
       return {
         [internals]: {
@@ -963,34 +935,11 @@ export const define: <
           useHooks: spec.useHooks,
           props: spec.props,
           outputTags,
-          opaqueProps: opaqueFields,
+          opaqueProps: opaqueProps(spec.props),
           handles: (tag) => handlerFor(parts.reducer, tag) !== undefined,
         },
 
-        /**
-         * A missing handler is the documented no-op only for a *lifecycle*
-         * tag — every `LifecycleHandlers` entry is optional by design. A
-         * missing handler for anything else is a defect: `Reducer` requires
-         * one for every declared action tag, so reaching this branch means
-         * the action arrived without going through the typed surface.
-         */
-        reduce: (action, snapshot) => {
-          const handler = handlerFor(parts.reducer, action._tag);
-          if (handler) {
-            const next = handler(action, snapshot);
-            if (action._tag !== "Unmounted") return next;
-
-            /**
-             * `Unmounted`'s returned state is discarded here for the same
-             * reason `run`'s `step` discards it: the component is gone, so the
-             * state has nowhere to go. Only the command survives.
-             */
-            const command = Next.command(next);
-            return command === undefined ? snapshot.state : [snapshot.state, command];
-          }
-          if (isLifecycleTag(action._tag)) return snapshot.state;
-          throw new TypeError(`No reducer handler for action "${action._tag}"`);
-        },
+        reduce,
 
         run: (actions, options) =>
           discharge(
@@ -1001,8 +950,7 @@ export const define: <
               };
 
               const queue = yield* Queue.unbounded<Entry>();
-              const inFlight = yield* Ref.make(0);
-              const groups = yield* Ref.make(new Map<string, ReadonlyArray<GroupEntry>>());
+              const book = fiberBook();
               const emitted: { _tag: string }[] = [];
               const outputs: { _tag: string }[] = [];
               const snapshot = { props: options.props, hooks: options.hooks };
@@ -1015,8 +963,7 @@ export const define: <
               const isOutput = (action: { _tag: string }): boolean => outputTagSet.has(action._tag);
 
               const { interpret } = commandInterpreter({
-                inFlight,
-                groups,
+                book,
                 emit: (msg) => Queue.offer(queue, { msg, origin: "command" }).pipe(Effect.asVoid),
                 // A command that settles without ever emitting (a `Command.effect`,
                 // an interrupted/cancelled group) still has to wake the drain loop's
@@ -1028,38 +975,22 @@ export const define: <
                 }).pipe(Effect.asVoid),
               });
 
-              const step = ({ msg: action, origin }: Entry) =>
-                Effect.gen(function* () {
-                  if (origin === "settled") return;
-
-                  if (isOutput(action)) return void outputs.push(action);
-
-                  const handler = handlerFor(parts.reducer, action._tag);
-                  if (!handler) {
-                    if (isLifecycleTag(action._tag)) return;
-                    throw new TypeError(`No reducer handler for action "${action._tag}"`);
-                  }
-
-                  const next = handler(action, { ...snapshot, state });
-                  const command = Next.command(next);
-                  if (action._tag !== "Unmounted") state = Next.state(next);
-                  if (command) yield* interpret(command, { tag: action._tag });
-                });
-
-              // drain until empty: nothing queued and nothing running.
-              //
-              // `inFlight` first, then the queue: a fiber offers its follow-up
-              // work *before* `cleanup` decrements, so reading in that order
-              // means a fiber that slips between the two reads can only make
-              // the check more conservative. The other order has a real hole —
-              // see the teardown drain, which had the same one.
-              while (true) {
-                const inFlightCount = yield* Ref.get(inFlight);
-                const queueSize = yield* Queue.size(queue);
-                if (queueSize === 0 && inFlightCount === 0) break;
+              // Drain until quiescent: nothing queued and nothing running. The
+              // two reads are synchronous back to back, so no fiber can settle
+              // or emit between them.
+              while (book.inFlight > 0 || Queue.sizeUnsafe(queue) > 0) {
                 const entry = yield* Queue.take(queue);
-                if (entry.origin === "command" && !isOutput(entry.msg)) emitted.push(entry.msg);
-                yield* step(entry);
+                if (entry.origin === "settled") continue;
+                if (isOutput(entry.msg)) {
+                  outputs.push(entry.msg);
+                  continue;
+                }
+                if (entry.origin === "command") emitted.push(entry.msg);
+
+                const next = reduce(entry.msg, { ...snapshot, state });
+                const command = Next.command(next);
+                state = Next.state(next);
+                if (command) yield* interpret(command, { tag: entry.msg._tag });
               }
 
               return { state, emitted, outputs };
@@ -1089,9 +1020,10 @@ export interface FeatureStore<Props, State, Action, H extends AnyHooks> {
   /**
    * The snapshot's ambient half, and — because it is the only thing that sees
    * both the old and new values — the place `PropsChanged` and `HookChanged`
-   * are detected and raised.
+   * are detected and raised. Returns the post-fold state, so a caller driving
+   * the store by hand sees the change the sync just caused.
    */
-  readonly sync: (props: Props, hooks: H) => void;
+  readonly sync: (props: Props, hooks: H) => State;
 
   /**
    * Open the mount scope, build the feature layer inside it, raise `Mounted`.
@@ -1110,13 +1042,8 @@ export interface FeatureStore<Props, State, Action, H extends AnyHooks> {
   readonly stop: () => void;
 }
 
-const instanceCounts = new Map<string, number>();
-
-const nextInstance = (name: string): string => {
-  const next = (instanceCounts.get(name) ?? 0) + 1;
-  instanceCounts.set(name, next);
-  return String(next);
-};
+/** Devtools instance ids: unique per page, not gapless, not per-name. */
+let instanceCount = 0;
 
 const DISPATCH: DevtoolsCause = Object.freeze({ _tag: "Dispatch" as const });
 const LIFECYCLE: DevtoolsCause = Object.freeze({ _tag: "Lifecycle" as const });
@@ -1178,7 +1105,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
   const { initialState, outputTags, opaqueProps: opaqueFields, handles } = blueprint[internals];
 
   const name = args.name ?? "TeaFeature";
-  const instance = args.instance ?? nextInstance(name);
+  const instance = args.instance ?? String(++instanceCount);
 
   let resolved = false;
   let sink: DevtoolsSink | undefined;
@@ -1224,8 +1151,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
 
   type Mount = {
     readonly queue: Queue.Queue<Work>;
-    readonly groups: Ref.Ref<Map<string, ReadonlyArray<GroupEntry>>>;
-    readonly inFlight: Ref.Ref<number>;
+    readonly book: FiberBook;
   };
 
   let mount: Mount | undefined;
@@ -1392,8 +1318,6 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
   }
 
   const run = (cells: Mount) => {
-    let context: Context.Context<never> | undefined;
-
     const release = (): void => {
       if (mount !== cells) return;
       mount = undefined;
@@ -1401,8 +1325,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     };
 
     const { interpret } = commandInterpreter({
-      inFlight: cells.inFlight,
-      groups: cells.groups,
+      book: cells.book,
       emit: (message, ctx) =>
         Effect.sync(() => withRouting(cells, () => fold(message, commandCause(ctx)))),
       settled: Effect.sync(() => Queue.offerUnsafe(cells.queue, { _tag: "Settled" })),
@@ -1416,35 +1339,23 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
         }),
     });
 
-    const provided = (effect: Effect.Effect<void, never, any>) =>
-      context === undefined ? effect : Effect.provide(effect, context);
-
+    // Interrupt in-flight work, run the `Unmounted` command with services still
+    // alive, then drain to quiescence so nothing that command started is lost.
     const teardown = (command: Command<any, any> | undefined) =>
       Effect.gen(function* () {
-        const running = yield* Ref.get(cells.groups);
-        for (const entries of running.values()) {
-          for (const entry of entries) yield* Fiber.interrupt(entry.fiber);
-        }
+        yield* Fiber.interruptAll([...cells.book.groups.values()].flatMap((set) => [...set]));
 
         if (command !== undefined) {
-          yield* provided(interpret(command, { tag: "Unmounted" }));
+          yield* interpret(command, { tag: "Unmounted" });
         }
 
-        while (true) {
-          const inFlight = yield* Ref.get(cells.inFlight);
-          const queued = yield* Queue.size(cells.queue);
-          if (queued === 0 && inFlight === 0) return;
-
+        while (cells.book.inFlight > 0 || Queue.sizeUnsafe(cells.queue) > 0) {
           const work = yield* Queue.take(cells.queue);
-          if (work._tag === "Run") yield* provided(interpret(work.command, work.ctx));
+          if (work._tag === "Run") yield* interpret(work.command, work.ctx);
         }
       });
 
-    return Effect.gen(function* () {
-      if (layer !== undefined) {
-        context = (yield* Effect.orDie(Layer.build(layer))) as Context.Context<never>;
-      }
-
+    const loop = Effect.gen(function* () {
       while (true) {
         const work = yield* Queue.take(cells.queue);
 
@@ -1470,10 +1381,14 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
 
         if (work._tag === "Settled") continue;
 
-        yield* provided(interpret(work.command, work.ctx));
+        yield* interpret(work.command, work.ctx);
       }
-    }).pipe(
-      Effect.scoped,
+    });
+
+    // `Effect.provide` builds the feature layer once for the mount and releases
+    // it when the loop ends; commands forked inside inherit its services. A
+    // layer that fails to build surfaces in `catchCause` below.
+    return (layer === undefined ? loop : Effect.provide(loop, layer)).pipe(
       Effect.catchCause((cause) =>
         Effect.sync(() => {
           if (Cause.hasInterruptsOnly(cause)) return;
@@ -1481,7 +1396,6 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
           raiseDefect(Cause.squash(cause), "Mounted", LIFECYCLE);
         }),
       ),
-
       Effect.ensuring(Effect.sync(release)),
     );
   };
@@ -1530,10 +1444,12 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       active = true;
       everStarted = true;
 
+      // `Queue.unbounded` captures the current fiber's dispatcher, so there is
+      // no synchronous constructor to reach for; `runSync` of a sync effect is
+      // exactly that constructor.
       const cells: Mount = {
         queue: Effect.runSync(Queue.unbounded<Work>()),
-        groups: Effect.runSync(Ref.make(new Map<string, ReadonlyArray<GroupEntry>>())),
-        inFlight: Effect.runSync(Ref.make(0)),
+        book: fiberBook(),
       };
 
       mount = cells;
@@ -1544,10 +1460,10 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
     },
 
     stop: () => {
-      const cells = mount;
       if (!active) return;
       active = false;
 
+      const cells = mount;
       if (cells === undefined) return;
 
       let teardown: Command<any, any> | undefined;
@@ -1589,20 +1505,6 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
       if (thrown !== undefined) raiseDefect(thrown.error, "Unmounted", LIFECYCLE);
     },
   };
-};
-
-const propsValidators = new WeakMap<AnyPropsSchema, (props: unknown) => unknown>();
-
-const validateProps = (schema: AnyPropsSchema, props: unknown): void => {
-  let validate = propsValidators.get(schema);
-  if (validate === undefined) {
-    validate = SchemaParser.decodeUnknownSync(
-      schema as AnyPropsSchema & { readonly DecodingServices: never },
-      { onExcessProperty: "error", errors: "all" },
-    );
-    propsValidators.set(schema, validate);
-  }
-  validate(props);
 };
 
 const splitOutputProps = (
@@ -1685,6 +1587,11 @@ export const createRuntime: <RootR, RootE>(
       hooks: hooksEquivalence,
     };
 
+    const validateProps = SchemaParser.decodeUnknownSync(
+      propsSchema as AnyPropsSchema & { readonly DecodingServices: never },
+      { onExcessProperty: "error", errors: "all" },
+    );
+
     const Feature: FC<Record<string, unknown>> = (incoming) => {
       const rootRuntime = useContext(context);
 
@@ -1693,7 +1600,7 @@ export const createRuntime: <RootR, RootE>(
         [incoming],
       );
 
-      useMemo(() => validateProps(propsSchema, props), [props]);
+      useMemo(() => void validateProps(props), [props]);
 
       const handlersRef = useRef(handlers);
 
