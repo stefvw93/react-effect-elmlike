@@ -174,7 +174,7 @@ untouched — no existing `component(bp)` call changes.
 - [x] `cause` is **required** on every member; every emission site knows its cause.
 - [x] `DevtoolsCause` has exactly four variants: `Dispatch`, `Command` (with `action` and optional `key`), `Lifecycle`, `Defect` (with `from`). The old `cause: { _tag: "Output" }` variant is **deleted, not made optional** — see Expected Behavior.
 - [x] `summarizeCommand` erases the effect (`{ _tag: "Effect" }` carries no function), preserves `Keyed` nesting and `Batch` order, and passes `Cancel`'s target through.
-- [ ] `summarizeCommand(Command.restart(name, cmd))` is the desugared batch summary — `Batch [ Cancel name, Keyed name … ]` — identical to summarizing the hand-written pair. The sugar adds no `CommandSummary` member.
+- [x] `summarizeCommand(Command.restart(name, cmd))` is the desugared batch summary — `Batch [ Cancel name, Keyed name … ]` — identical to summarizing the hand-written pair. The sugar adds no `CommandSummary` member.
 - [x] `summarizeDefect` produces `{ message }` plus optional `name`/`stack` from an `Error`, from a string, from a symbol, and from `undefined`, and never throws.
 - [x] Every event is **JSON round-trippable**: `JSON.parse(JSON.stringify(event))` deep-equals the event, given encodable state and actions.
 - [x] The `Transition` for the runtime's own `Error` action carries `action: { _tag: "Error" }` and not the action object the runtime built, which holds a live `Error` and a `Cause`. See Expected Behavior.
@@ -194,7 +194,7 @@ untouched — no existing `component(bp)` call changes.
 - [x] `start()` emits a `Transition` for `Mounted` with `cause: Lifecycle`.
 - [x] `dispatch(action)` emits a `Transition` with `cause: { _tag: "Dispatch" }`, the store's `name` and `instance`, and `previous`/`next` as the actual state references.
 - [x] `sync` with changed props emits a `PropsChanged` `Transition` with `cause: Lifecycle`; a handler that returns the same state gives `previous === next`.
-- [ ] A reducer returning a command emits one `Command` event whose `command` is the summary, whose `group` is the default address (the issuing action's tag — where the command's unkeyed leaves book; keyed leaves carry their own names in the summary), and whose `dropped` reflects whether any mount was there to take it.
+- [x] A reducer returning a command emits one `Command` event whose `command` is the summary, whose `group` is the default address (the issuing action's tag — where the command's unkeyed leaves book; keyed leaves carry their own names in the summary), and whose `dropped` reflects whether any mount was there to take it.
 - [x] An action a command dispatches carries `cause: { _tag: "Command", action, key? }`; `key` is present when the command was `Keyed`, proving the key reached the leaf. Attribution is untouched by the flat namespace — both fields stay; the name a `Cancel` would use is `key ?? action`.
 - [x] `Command.output(…)` emits an `Output` event carrying the **whole message including `_tag`** (unlike the `on<Tag>` prop, which gets `_tag` stripped), and it lands **before** the `on<Tag>` handler runs.
 - [x] A dying command emits **exactly one** `Defect` (`from` = the action tag, `handled: true` when an `Error` handler takes it), followed by a `Transition` for `Error` with `cause: { _tag: "Defect", from }`. That second event is not a duplicate — see Expected Behavior.

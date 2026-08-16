@@ -62,26 +62,31 @@ Concurrency is userland. Debounce, throttle, switch-to-latest and run-at-most-N
 are Effect combinators written inside the effect, not a policy vocabulary the
 runtime interprets. What the runtime does own is the one thing a handler cannot
 do for itself: naming a running fiber so a _different_ action's handler can
-interrupt it. That is `Command.keyed` plus `Command.cancel`, and `Command.batch`
-is what puts the cancel ahead of the command replacing it:
+interrupt it. A group is one string name — `Command.keyed(name)` sets a
+command's whole address, an unkeyed command books under its issuing action's
+tag, and `Command.cancel(name)` interrupts that one group. Take-latest is the
+common case, so it is one word:
 
 ```ts
 TextEdited: (action, { state }) => [
   { ...state, text: action.text, pending: true },
-  Command.batch(
-    Command.cancel({ tag: "TextEdited", key: "query" }),
-    Command.keyed(
-      "query",
-      Command.effect((dispatch) =>
-        Effect.sleep("300 millis").pipe(
-          Effect.andThen(search(action.text)),
-          Effect.flatMap((hits) => dispatch({ _tag: "HitsArrived", hits })),
-        ),
+  Command.restart(
+    "query",
+    Command.effect((dispatch) =>
+      Effect.sleep("300 millis").pipe(
+        Effect.andThen(search(action.text)),
+        Effect.flatMap((hits) => dispatch({ _tag: "HitsArrived", hits })),
       ),
     ),
   ),
 ];
 ```
+
+`Command.restart(name, command)` is pure sugar for
+`Command.batch(Command.cancel(name), Command.keyed(name, command))` — the
+cancel sequenced ahead of the replacement — so devtools show the desugared
+batch and the hand-written pair stays available wherever the sugar does not
+fit.
 
 A long-lived source is `Stream.runForEach(source, dispatch)` inside the same
 leaf, so the whole `Stream` vocabulary stays available one call earlier.
@@ -89,9 +94,9 @@ leaf, so the whole `Stream` vocabulary stays available one call earlier.
 `dispatch` is typed by the feature's own action vocabulary, which reaches the
 leaf through the handler's contextual type. Two places that context cannot
 reach, both by TypeScript's rules rather than this library's: a `.pipe` receiver
-(so `Command.keyed(key, command)` exists alongside the curried form), and a
-command hoisted into a `const` (name the type there:
-`Command.effect<MyAction>(…)`).
+(so `Command.keyed(key, command)` and `Command.restart(name, command)` exist
+alongside their curried forms), and a command hoisted into a `const` (name the
+type there: `Command.effect<MyAction>(…)`).
 
 To mount one, build a root runtime once and turn blueprints into components:
 

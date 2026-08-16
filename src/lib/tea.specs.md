@@ -170,9 +170,9 @@ Mounted: (_action, { props, state }) => [
 
 `[x]` holds today. The command-leaf pass landed, and what it did not do is in
 Open work and Deferred decisions rather than left as an unchecked criterion
-here. The devtools pass closed the last two; its criteria live in
-`devtools.specs.md`. The unchecked boxes below are the flat-group-namespace +
-`Command.restart` pass, spec'd ahead of its red tests.
+here. The devtools pass closed the last two (its criteria live in
+`devtools.specs.md`), and the flat-group-namespace + `Command.restart` pass
+landed with every box checked again.
 
 ### Vocabularies (`Action`, `Action.output`, `Action.of`)
 
@@ -191,11 +191,11 @@ here. The devtools pass closed the last two; its criteria live in
 - [x] `Command.stream` and the `Stream` variant are removed. A long-lived source is `Stream.runForEach(source, dispatch)` inside the effect, so the whole `Stream` vocabulary stays available one call earlier.
 - [x] `Command.keyed(key, command)` names the group a command's fibers book under — the whole address, outermost wins. Also curried (`Command.keyed(key)`) and so pipeable. An unkeyed command books under its issuing action's tag.
 - [x] `Command.ignore`, `Command.queue`, the `Policy` type and the `Guarded` node are removed.
-- [ ] `Command.restart(name, command)` returns — as pure sugar, not a policy: it constructs exactly `Command.batch(Command.cancel(name), Command.keyed(name, command))`. Also curried (`Command.restart(name)`) and so pipeable.
+- [x] `Command.restart(name, command)` returns — as pure sugar, not a policy: it constructs exactly `Command.batch(Command.cancel(name), Command.keyed(name, command))`. Also curried (`Command.restart(name)`) and so pipeable.
 - [x] `Command.batch(...commands)` interprets its members in order under one context. With no policy there is no supersession question and nothing to decide.
-- [ ] `Command.cancel(name)` interrupts the one group booked under `name`, whatever action tags forked its members. The fiber book is a flat map by name — no tag level, no delimiter encoding.
-- [ ] Bare-tag `cancel("Tag")` reaches only the **unkeyed** fibers of that tag; work forked under `keyed(name)` is addressed by `name` alone.
-- [ ] Cancelling work started from several action tags under one `keyed(name)` is one line — `cancel(name)` — naming no foreign tag.
+- [x] `Command.cancel(name)` interrupts the one group booked under `name`, whatever action tags forked its members. The fiber book is a flat map by name — no tag level, no delimiter encoding.
+- [x] Bare-tag `cancel("Tag")` reaches only the **unkeyed** fibers of that tag; work forked under `keyed(name)` is addressed by `name` alone.
+- [x] Cancelling work started from several action tags under one `keyed(name)` is one line — `cancel(name)` — naming no foreign tag.
 - [x] `Command.output(message, payload)` emits an outbound message; passing an internal message is a compile error. _Re-expressed on the new leaf internally; signature unchanged. Removing it is deferred — see Deferred decisions._
 - [x] Commands are `Pipeable`, and piping preserves `A` and `R`.
 
@@ -217,7 +217,7 @@ here. The devtools pass closed the last two; its criteria live in
 - [x] Seeded actions are processed but are not recorded in `emitted`.
 - [x] Actions a command emits feed back into the reducer loop; `emitted` collects them.
 - [x] `outputs` collects messages whose tag is a declared output; an output never re-enters the reducer.
-- [ ] `Command.cancel(name)` interrupts the group booked under `name`; an unkeyed command's group is its issuing action's tag.
+- [x] `Command.cancel(name)` interrupts the group booked under `name`; an unkeyed command's group is its issuing action's tag.
 - [x] `Command.batch` members run in order, sharing the issuing action's context.
 - [x] Services a command requests (`R`) are satisfied from `options.layer`.
 - [x] `run` resolves only at quiescence: nothing queued, nothing in flight — including fibers that settle without emitting.
@@ -254,9 +254,9 @@ here. The devtools pass closed the last two; its criteria live in
 - [x] Inside a handler, `dispatch` is typed by the feature's own vocabulary: `A` arrives from the contextual type of the handler's return. An undeclared tag and a declared tag with the wrong payload are both compile errors.
 - [x] `Command.keyed` preserves `A` and `R`, through `.pipe`, applied directly, and nested. The key is a required string.
 - [x] `Command.batch` preserves `A` and `R`, and a `Command<never>` member — the `Cancel` the variant exists to sequence — does not collapse the batch to `never`.
-- [ ] `Command.cancel` is `Command<never>` and takes exactly one string. An object target — `{ tag }` or `{ tag, key }` — is a compile error, as are a number and a zero-argument call.
+- [x] `Command.cancel` is `Command<never>` and takes exactly one string. An object target — `{ tag }` or `{ tag, key }` — is a compile error, as are a number and a zero-argument call.
 - [x] `ignore`/`queue`/`stream` are absent from the constructor set, and the `Stream` and `Guarded` variants are absent from the ADT.
-- [ ] `restart` is a constructor-set member, not an ADT variant, and preserves `A` and `R` in both forms. The two-argument form keeps contextual `A` (the same rule as `keyed`); the `.pipe` form severs it, pinned with `@ts-expect-error` on identical terms.
+- [x] `restart` is a constructor-set member, not an ADT variant, and preserves `A` and `R` in both forms. The two-argument form keeps contextual `A` (the same rule as `keyed`); the `.pipe` form severs it, pinned with `@ts-expect-error` on identical terms.
 
 **How `A` reaches the leaf.** `A` appears only inside `Dispatcher<A>`, in a
 parameter position, so nothing in the argument can infer it — it is resolved from
