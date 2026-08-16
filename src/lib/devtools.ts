@@ -21,8 +21,8 @@ export type DevtoolsCause =
   /**
    * An action a running command emitted. `action` is the tag of the action
    * whose handler returned that command, and `key` is present when the command
-   * was `Command.keyed` — the pair is exactly the {@link Group} address a
-   * `Cancel` would have used to interrupt it.
+   * was `Command.keyed`. The name a `Cancel` would have used to interrupt the
+   * emitting fiber is `key ?? action` — the flat {@link Group} address.
    */
   | { readonly _tag: "Command"; readonly action: string; readonly key?: string }
 
@@ -72,11 +72,12 @@ export interface DevtoolsTransition extends DevtoolsEnvelope {
 export interface DevtoolsCommand extends DevtoolsEnvelope {
   readonly _tag: "Command";
   /**
-   * The **tag-level** address of this work: `Command.cancel(group.tag)`
-   * interrupts every fiber this command forks. Deliberately not an exact
-   * `{ tag, key }` — a `Batch` can hold members under several keys, so no
-   * single precise address exists in general. The keys are in `command`, on
-   * each `Keyed` node.
+   * The **default** address of this work: the issuing action's tag, which is
+   * where the command's *unkeyed* leaves book. `Command.cancel(group)` reaches
+   * those and misses every leaf forked under `keyed(name)` — the names are in
+   * `command`, on each `Keyed` node. Deliberately not "the" address: a `Batch`
+   * can book members under several names, so no single one covers a command
+   * in general.
    */
   readonly group: Group;
   readonly command: CommandSummary;
@@ -457,7 +458,7 @@ export const createConsoleDevtools = (options: ConsoleDevtoolsOptions = {}): Dev
       // it re-inserts the entry the transition just removed.
       const unmounting =
         (event._tag === "Transition" && event.action._tag === "Unmounted") ||
-        (event._tag === "Command" && event.group.tag === "Unmounted");
+        (event._tag === "Command" && event.group === "Unmounted");
 
       // The predicate is user code reading user state, so a throw is a
       // property of one value, not of the sink. Escaping would reach the
@@ -542,7 +543,7 @@ const headline = (event: DevtoolsEvent): string => {
     case "Transition":
       return `${who}  ${event.action._tag}`;
     case "Command":
-      return `${who}  ⟶ ${address(event.group)}  ${formatCommand(event.command)}${
+      return `${who}  ⟶ ${event.group}  ${formatCommand(event.command)}${
         event.dropped ? "  (dropped)" : ""
       }`;
     case "Output":
@@ -574,7 +575,7 @@ const body = (
     }
     case "Command": {
       output.log("%ccommand     ", palette.command, formatCommand(event.command));
-      output.log("%cgroup       ", palette.command, address(event.group));
+      output.log("%cgroup       ", palette.command, event.group);
       output.log("%ccause       ", palette.header, event.cause);
       return;
     }
@@ -623,10 +624,6 @@ const printDiff = (
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-/** `Bump` or `Bump#key` — how a `Cancel` would name this work. */
-const address = (group: Group): string =>
-  group.key === undefined ? group.tag : `${group.tag}#${group.key}`;
-
 /** `batch(cancel(Bump), keyed(q, effect))` — the reducer's own shape, in one line. */
 const formatCommand = (summary: CommandSummary): string => {
   switch (summary._tag) {
@@ -639,7 +636,7 @@ const formatCommand = (summary: CommandSummary): string => {
     case "Batch":
       return `batch(${summary.commands.map(formatCommand).join(", ")})`;
     case "Cancel":
-      return `cancel(${address(summary.target)})`;
+      return `cancel(${summary.target})`;
   }
 };
 

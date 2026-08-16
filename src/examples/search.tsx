@@ -1,17 +1,19 @@
 /**
  * Search-as-you-type: the case Elm has no good answer for.
  *
- * The debounce is not an operator, and not a timer in the state. `TextEdited`
- * cancels its own group before forking the replacement, so each keystroke
- * interrupts the pending request from the previous keystroke — mid-delay,
- * before it was ever sent. Debounce, cancellation and last-write-wins all fall
- * out of those two lines, and the stale-response race is gone structurally
- * rather than by comparing sequence numbers in the reducer.
+ * The debounce is not an operator, and not a timer in the state.
+ * `Command.restart("query", …)` interrupts the group's previous fiber before
+ * forking the replacement, so each keystroke kills the pending request from
+ * the last one — mid-delay, before it was ever sent. Debounce, cancellation
+ * and last-write-wins all fall out of that one call, and the stale-response
+ * race is gone structurally rather than by comparing sequence numbers in the
+ * reducer.
  *
- * It used to fall out of one *word* — the handler was declared `"restart"` and
- * the runtime owned a policy vocabulary to make that mean something. The word
- * was shorter; it was also a fiber supervisor reimplementing combinators Effect
- * already had. What replaced it is visible in the handler, which is the point.
+ * It is one *word* again — but a different kind of word. The old `"restart"`
+ * was a policy the runtime interpreted; this one is sugar for
+ * `batch(cancel("query"), keyed("query", …))`, two primitives that stay
+ * visible in devtools and can be written by hand wherever the sugar does not
+ * fit. The supervisor vocabulary did not come back.
  */
 
 import { Context, Effect, Schema } from "effect";
@@ -81,11 +83,12 @@ const getInitialSearchState = () => ({
  * the user made it clear they no longer want it. A cancel here is one line, and
  * without it this file's headline claim — that cancellation is visible in the
  * handler — is only true of the paths that happen to issue a new query.
+ *
+ * One line *naming only the work*: `"query"` is the whole address, so this
+ * handler does not have to spell out which foreign tag started the fiber it is
+ * killing — the wart the flat group namespace removed.
  */
-const cleared = [
-  getInitialSearchState(),
-  Command.cancel({ tag: "TextEdited", key: "query" }),
-] as const;
+const cleared = [getInitialSearchState(), Command.cancel("query")] as const;
 
 export const search = Search.create({
   initialState: () => getInitialSearchState(),
@@ -96,36 +99,33 @@ export const search = Search.create({
         ? cleared
         : [
             { ...state, text: action.text, pending: true, error: null },
-            Command.batch(
-              // Restart-on-keystroke, written where the reader can see the
-              // interrupt. The cancel has to run *before* the replacement is
-              // registered, which is the one thing this node does that no
-              // combinator inside the effect below can.
-              Command.cancel({ tag: "TextEdited", key: "query" }),
-              Command.keyed(
-                "query",
-                Command.effect((dispatch) =>
-                  Effect.match(
-                    // The delay sits inside the interruptible region, which is
-                    // what makes the cancel above a debounce rather than just a
-                    // cancel.
-                    Effect.delay(
-                      Effect.flatMap(SearchApi, (api) => api.query(action.text, props.filter)),
-                      "300 millis",
-                    ),
-                    {
-                      onFailure: (error: Unreachable) => ({
-                        _tag: "QueryFailed" as const,
-                        status: error.status,
-                      }),
-                      onSuccess: (hits) => ({
-                        _tag: "HitsArrived" as const,
-                        for: action.text,
-                        hits,
-                      }),
-                    },
-                  ).pipe(Effect.flatMap(dispatch)),
-                ),
+            // Restart-on-keystroke as one word — sugar for
+            // `batch(cancel("query"), keyed("query", …))`, so the cancel still
+            // runs *before* the replacement is registered, which is the one
+            // thing no combinator inside the effect below can do for itself.
+            Command.restart(
+              "query",
+              Command.effect((dispatch) =>
+                Effect.match(
+                  // The delay sits inside the interruptible region, which is
+                  // what makes the restart above a debounce rather than just a
+                  // cancel.
+                  Effect.delay(
+                    Effect.flatMap(SearchApi, (api) => api.query(action.text, props.filter)),
+                    "300 millis",
+                  ),
+                  {
+                    onFailure: (error: Unreachable) => ({
+                      _tag: "QueryFailed" as const,
+                      status: error.status,
+                    }),
+                    onSuccess: (hits) => ({
+                      _tag: "HitsArrived" as const,
+                      for: action.text,
+                      hits,
+                    }),
+                  },
+                ).pipe(Effect.flatMap(dispatch)),
               ),
             ),
           ],

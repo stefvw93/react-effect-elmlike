@@ -123,21 +123,34 @@ describe("summarizeCommand", () => {
     expect(summary).toEqual({
       _tag: "Batch",
       commands: [
-        { _tag: "Cancel", target: { tag: "Bump" } },
+        { _tag: "Cancel", target: "Bump" },
         { _tag: "Keyed", key: "q", command: { _tag: "Effect" } },
         { _tag: "None" },
       ],
     });
   });
 
-  it("passes a `Cancel` target through, keyed and unkeyed", () => {
+  it("passes a `Cancel` target through", () => {
     expect(summarizeCommand(Command.cancel("Bump"))).toEqual({
       _tag: "Cancel",
-      target: { tag: "Bump" },
+      target: "Bump",
     });
-    expect(summarizeCommand(Command.cancel({ tag: "Bump", key: "k" }))).toEqual({
-      _tag: "Cancel",
-      target: { tag: "Bump", key: "k" },
+  });
+
+  it("summarizes `Command.restart` as the desugared batch", () => {
+    // The sugar-drift lock's devtools half: restart adds no `CommandSummary`
+    // member, so the log shows the honest pair.
+    const leaf = Command.effect(() => Effect.void);
+
+    expect(summarizeCommand(Command.restart("q", leaf))).toEqual(
+      summarizeCommand(Command.batch(Command.cancel("q"), Command.keyed("q", leaf))),
+    );
+    expect(summarizeCommand(Command.restart("q", leaf))).toEqual({
+      _tag: "Batch",
+      commands: [
+        { _tag: "Cancel", target: "q" },
+        { _tag: "Keyed", key: "q", command: { _tag: "Effect" } },
+      ],
     });
   });
 
@@ -495,7 +508,7 @@ describe("skipUnchangedAmbient — the console default", () => {
         _tag: "Command",
         ...envelope,
         cause: { _tag: "Dispatch" },
-        group: { tag: "Bump" },
+        group: "Bump",
         command: { _tag: "Effect" },
         dropped: false,
       }),
@@ -684,11 +697,11 @@ describe("createConsoleDevtools", () => {
       _tag: "Command",
       ...envelope,
       cause: { _tag: "Dispatch" },
-      group: { tag: "Bump" },
+      group: "Bump",
       command: {
         _tag: "Batch",
         commands: [
-          { _tag: "Cancel", target: { tag: "Bump" } },
+          { _tag: "Cancel", target: "Bump" },
           { _tag: "Keyed", key: "q", command: { _tag: "Effect" } },
         ],
       },
@@ -709,7 +722,7 @@ describe("createConsoleDevtools", () => {
       _tag: "Command",
       ...envelope,
       cause: { _tag: "Dispatch" },
-      group: { tag: "Bump" },
+      group: "Bump",
       command: { _tag: "Effect" },
       dropped: true,
     });
@@ -849,7 +862,7 @@ describe("createConsoleDevtools", () => {
       _tag: "Command",
       ...envelope,
       cause: { _tag: "Lifecycle" },
-      group: { tag: "Unmounted" },
+      group: "Unmounted",
       command: { _tag: "Effect" },
       dropped: false,
     });

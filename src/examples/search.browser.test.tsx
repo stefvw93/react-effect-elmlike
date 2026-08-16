@@ -4,9 +4,10 @@
  * The demo's headline behaviour is the one the command-leaf redesign rewrote:
  * each keystroke cancels the keystroke before it, mid-delay, and only the last
  * one reaches the service. That used to be a `"restart"` policy the runtime
- * interpreted; it is now a `Cancel` sequenced ahead of a `keyed` leaf, written
- * in the handler. The observable behaviour has to be identical, and a counting
- * fake service is what says so.
+ * interpreted; the handler now writes `Command.restart("query", …)` — sugar
+ * for a `Cancel` sequenced ahead of a `keyed` leaf, not a policy. The
+ * observable behaviour has to be identical across all three spellings, and a
+ * counting fake service is what says so.
  *
  * The node suite cannot answer this one: the debounce is only meaningful
  * against real typing into a real input, where each `change` is a separate
@@ -115,9 +116,9 @@ test("each keystroke interrupts the one before it, so only the last query is sen
   await mount();
 
   // Four keystrokes inside one debounce window. Under the old `"restart"`
-  // policy the runtime superseded the in-flight fiber; now the handler cancels
-  // its own group before forking the replacement. Either way the user typed
-  // one word and the service must see one query.
+  // policy the runtime superseded the in-flight fiber; now the handler's
+  // `Command.restart` desugars to a cancel ahead of the replacement. Either
+  // way the user typed one word and the service must see one query.
   await type("e");
   await type("ef");
   await type("eff");
