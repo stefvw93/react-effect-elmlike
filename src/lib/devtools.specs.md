@@ -77,7 +77,7 @@ export interface DevtoolsTransition extends DevtoolsEnvelope {
 }
 export interface DevtoolsCommand extends DevtoolsEnvelope {
   readonly _tag: "Command";
-  readonly group: Group; // tag-level: `cancel(group.tag)` reaches every fiber this forked
+  readonly group: Group; // the default address — the issuing tag, where unkeyed leaves book
   readonly command: CommandSummary;
   readonly dropped: boolean; // nothing was draining the queue when it was offered
 }
@@ -174,6 +174,7 @@ untouched — no existing `component(bp)` call changes.
 - [x] `cause` is **required** on every member; every emission site knows its cause.
 - [x] `DevtoolsCause` has exactly four variants: `Dispatch`, `Command` (with `action` and optional `key`), `Lifecycle`, `Defect` (with `from`). The old `cause: { _tag: "Output" }` variant is **deleted, not made optional** — see Expected Behavior.
 - [x] `summarizeCommand` erases the effect (`{ _tag: "Effect" }` carries no function), preserves `Keyed` nesting and `Batch` order, and passes `Cancel`'s target through.
+- [ ] `summarizeCommand(Command.restart(name, cmd))` is the desugared batch summary — `Batch [ Cancel name, Keyed name … ]` — identical to summarizing the hand-written pair. The sugar adds no `CommandSummary` member.
 - [x] `summarizeDefect` produces `{ message }` plus optional `name`/`stack` from an `Error`, from a string, from a symbol, and from `undefined`, and never throws.
 - [x] Every event is **JSON round-trippable**: `JSON.parse(JSON.stringify(event))` deep-equals the event, given encodable state and actions.
 - [x] The `Transition` for the runtime's own `Error` action carries `action: { _tag: "Error" }` and not the action object the runtime built, which holds a live `Error` and a `Cause`. See Expected Behavior.
@@ -193,8 +194,8 @@ untouched — no existing `component(bp)` call changes.
 - [x] `start()` emits a `Transition` for `Mounted` with `cause: Lifecycle`.
 - [x] `dispatch(action)` emits a `Transition` with `cause: { _tag: "Dispatch" }`, the store's `name` and `instance`, and `previous`/`next` as the actual state references.
 - [x] `sync` with changed props emits a `PropsChanged` `Transition` with `cause: Lifecycle`; a handler that returns the same state gives `previous === next`.
-- [x] A reducer returning a command emits one `Command` event whose `command` is the summary, whose `group` is the address `Cancel` would name, and whose `dropped` reflects whether any mount was there to take it.
-- [x] An action a command dispatches carries `cause: { _tag: "Command", action, key? }`; `key` is present when the command was `Keyed`, proving the key reached the leaf.
+- [ ] A reducer returning a command emits one `Command` event whose `command` is the summary, whose `group` is the default address (the issuing action's tag — where the command's unkeyed leaves book; keyed leaves carry their own names in the summary), and whose `dropped` reflects whether any mount was there to take it.
+- [x] An action a command dispatches carries `cause: { _tag: "Command", action, key? }`; `key` is present when the command was `Keyed`, proving the key reached the leaf. Attribution is untouched by the flat namespace — both fields stay; the name a `Cancel` would use is `key ?? action`.
 - [x] `Command.output(…)` emits an `Output` event carrying the **whole message including `_tag`** (unlike the `on<Tag>` prop, which gets `_tag` stripped), and it lands **before** the `on<Tag>` handler runs.
 - [x] A dying command emits **exactly one** `Defect` (`from` = the action tag, `handled: true` when an `Error` handler takes it), followed by a `Transition` for `Error` with `cause: { _tag: "Defect", from }`. That second event is not a duplicate — see Expected Behavior.
 - [x] With no `Error` handler declared, the same defect emits one `Defect` with `handled: false`, and the error still reaches the store's `defect` sink.
@@ -221,7 +222,7 @@ untouched — no existing `component(bp)` call changes.
 - [x] The default predicate (`skipUnchangedAmbient`) drops an unchanged `PropsChanged`/`HookChanged`, keeps a `PropsChanged` that moved state, and keeps `Unmounted` and an unchanged **dispatch**.
 - [x] `skipUnchanged` drops any transition where `previous === next`, including `Unmounted`.
 - [x] `diff: true` prints a **shallow own-keys** diff (`+ key`, `- key`, `~ key: prev → next`).
-- [x] Elapsed time appears from the second event of a given `${name}#${instance}` onward, and the elapsed map **drops its entry on an `Unmounted` transition** — and on the teardown `Command` event (`group: { tag: "Unmounted" }`) that `stop()` emits right after it, which would otherwise re-insert the entry the transition just evicted.
+- [x] Elapsed time appears from the second event of a given `${name}#${instance}` onward, and the elapsed map **drops its entry on an `Unmounted` transition** — and on the teardown `Command` event (`group: "Unmounted"`) that `stop()` emits right after it, which would otherwise re-insert the entry the transition just evicted.
 - [x] A **throwing predicate** does not escape `onEvent` (which would trip the store's disable-on-throw rule and take devtools dark): the event is kept, the throw is reported through `console.error`, and the sink stays alive.
 - [x] `timestamps: false` omits the clock, `timestamps: true` (default) includes it.
 - [x] Everything above is asserted against an injected `DevtoolsConsole`, never the global.
@@ -321,7 +322,7 @@ existing 2934-line `tea.test.ts` goes red — which `/unit-test` forbids. So:
     action       { _tag: "Bump" }      %c #03A9F4
     next state   { count: 1 }          %c #4CAF50
     cause        { _tag: "Dispatch" }
-▸ cart#1  ⟶ Bump  batch(cancel(Bump), keyed(q, effect))    %c #9C27B0
+▸ cart#1  ⟶ Bump  batch(cancel(query), keyed(query, effect))    %c #9C27B0
 ▸ cart#1  ⇢ OrderPlaced                                     %c #009688
 ▸ cart#1  ✖ CheckoutRequested: network down (unhandled)     %c #F20404
 ```
@@ -351,7 +352,7 @@ Elapsed uses `performance.now()` in a `Map` keyed by `${name}#${instance}`.
 ## Known limitations
 
 - **`dropped: false` means "handed to a live mount", not "ran".** The flag answers what the runtime can know at the offer. A fiber can accept a command and then be torn down before interpreting it — teardown exceeding its 5s bound is the real case, and `tea.ts` says so at that site — and a synchronous event emitted at the offer cannot be revised afterwards. Making it accurate would mean either deferring the event until the work was interpreted, which loses the ordering the log is for, or a second "and it actually ran" event, which is a bigger surface than the problem.
-- **`group` is the tag-level address, not always the exact one.** `Command.cancel(group.tag)` interrupts everything the command forked, but a `Batch` can hold members under several keys, so no single precise `{ tag, key }` exists in general. Reporting a precise address only when one happened to exist would make the field mean different things on different events. The keys are in `command`, on each `Keyed` node.
+- **`group` is the default address, not a cancel-everything handle.** It is the issuing action's tag — the name the command's **unkeyed** leaves book under. `cancel(group)` reaches those and misses every leaf forked under `keyed(name)`; those names are in `command`, on each `Keyed` node. A `Batch` can book members under several names, so no single address covering the whole command exists in general — the old reading, that cancelling the group interrupts everything the command forked, is dead.
 - **A mount whose fiber died emits no `Unmounted`.** A feature layer that fails to build kills the mount fiber, `release()` clears `active`, and the `stop()` React then calls returns at its `active` guard before reaching the emission. The log shows the feature going quiet with no terminal event. This is the devtools face of `tea.specs.md` open work #1 — the store cannot currently re-arm from `component` either — and it is that item's fix to make, not a second emission site here. Distinct from a teardown handler that _throws_, which does emit: that path still reaches `stop()`'s emission. The console logger's elapsed map no longer depends on the terminal event either way — it is bounded independently.
 
 - **The blind window before the root context exists.** With a synchronous root layer, only folds _before_ `start()` are lost — a descendant's `useLayoutEffect` dispatch (the buffered path) and the first render's `sync`. With an **asynchronous** root layer, everything until the layer resolves is lost. Warming the context with a `runFork(Effect.void)` inside `createRuntime` would close the sync window, but it moves _when the root layer builds_, which is observable through any layer's acquire side effects — not a debugging tool's call to make.

@@ -102,8 +102,18 @@ type Command<A, R> =
 // `Dispatcher`, not `Dispatch`: the latter is the React-facing dispatch handed
 // to `render`, which returns void because it is called from an event handler.
 type Dispatcher<A> = (action: A) => Effect<void>;
-type Group = { tag: string; key?: string };
+type Group = string;
 ```
+
+**Groups are one flat namespace per mount.** A `Group` is a string name, not a
+`{ tag, key }` pair. `keyed(name)` sets a command's whole address — outermost
+wins, unchanged — and an unkeyed command books under its issuing action's tag,
+so the booking address is always `key ?? tag`. `cancel(name)` interrupts that
+one group. A key equal to some action's tag is not a collision to defend
+against; it is deliberate sharing — one namespace means one meaning per name.
+The semantic narrowing to document: bare-tag `cancel("Tag")` reaches only the
+**unkeyed** fibers of that tag, because keyed work is addressed by its own name
+only.
 
 **Concurrency is userland.** Debounce, throttle, switch-to-latest, run-at-most-N
 — all of them are Effect combinators the handler writes inside its own effect.
@@ -114,27 +124,31 @@ second one written as data can only be a worse copy.
 naming a running fiber so that a _different_ action's handler can interrupt it.
 That is `Keyed` + `Cancel`, and it is the whole supervisor.
 
+**Take-latest is sugar, not a variant.** `Command.restart(name, command)` is
+definitionally `Command.batch(Command.cancel(name), Command.keyed(name,
+command))` — the 80% pattern written as one word, without the ordering mistake
+hand-writing the pair invites. No new ADT variant, no interpreter branch, no
+new `CommandSummary` member: devtools show the desugared batch honestly.
+
 `Batch` sequences commands. After the leaf change its one irreplaceable job is
 putting a `Cancel` before the command that replaces it — the cancel has to run
 before the new fiber is registered, and nothing inside that fiber can do it.
 Composing two _effects_ is `Effect.all`, not `Batch`.
 
 ```ts
-// restart-on-keystroke, written where the reader can see the interrupt
+// restart-on-keystroke — take-latest as one word
 TextEdited: (action, { state }) => [
   { ...state, text: action.text, pending: true },
-  Command.batch(
-    Command.cancel({ tag: "TextEdited", key: "query" }),
-    Command.keyed(
-      "query",
-      Command.effect((dispatch) =>
-        Effect.sleep("300 millis").pipe(
-          Effect.andThen(search(action.text)),
-          Effect.flatMap((hits) => dispatch({ _tag: "HitsArrived", hits })),
-        ),
+  Command.restart(
+    "query",
+    Command.effect((dispatch) =>
+      Effect.sleep("300 millis").pipe(
+        Effect.andThen(search(action.text)),
+        Effect.flatMap((hits) => dispatch({ _tag: "HitsArrived", hits })),
       ),
     ),
   ),
+  // ≡ Command.batch(Command.cancel("query"), Command.keyed("query", …))
 ];
 
 // two effects, one fiber
@@ -156,8 +170,9 @@ Mounted: (_action, { props, state }) => [
 
 `[x]` holds today. The command-leaf pass landed, and what it did not do is in
 Open work and Deferred decisions rather than left as an unchecked criterion
-here. Every box is checked again: the devtools pass closed the last two, and
-its own criteria live in `devtools.specs.md`.
+here. The devtools pass closed the last two; its criteria live in
+`devtools.specs.md`. The unchecked boxes below are the flat-group-namespace +
+`Command.restart` pass, spec'd ahead of its red tests.
 
 ### Vocabularies (`Action`, `Action.output`, `Action.of`)
 
@@ -174,10 +189,13 @@ its own criteria live in `devtools.specs.md`.
 - [x] `Command.none` is the `{ _tag: "None" }` no-op.
 - [x] `Command.effect((dispatch) => Effect<unknown, never, R>)` is the only leaf. A command that emits nothing ignores the parameter.
 - [x] `Command.stream` and the `Stream` variant are removed. A long-lived source is `Stream.runForEach(source, dispatch)` inside the effect, so the whole `Stream` vocabulary stays available one call earlier.
-- [x] `Command.keyed(key, command)` names the fiber a command forks, so `Cancel` can address it. Also curried (`Command.keyed(key)`) and so pipeable. An unkeyed command is addressable by tag alone.
-- [x] `Command.restart`, `Command.ignore`, `Command.queue`, the `Policy` type and the `Guarded` node are removed.
+- [x] `Command.keyed(key, command)` names the group a command's fibers book under — the whole address, outermost wins. Also curried (`Command.keyed(key)`) and so pipeable. An unkeyed command books under its issuing action's tag.
+- [x] `Command.ignore`, `Command.queue`, the `Policy` type and the `Guarded` node are removed.
+- [ ] `Command.restart(name, command)` returns — as pure sugar, not a policy: it constructs exactly `Command.batch(Command.cancel(name), Command.keyed(name, command))`. Also curried (`Command.restart(name)`) and so pipeable.
 - [x] `Command.batch(...commands)` interprets its members in order under one context. With no policy there is no supersession question and nothing to decide.
-- [x] `Command.cancel(target)` interrupts by tag alone (every key under that tag) or by `{ tag, key }` (exact). Groups are booked by tag then key — not a `${tag}::${key}` string — so a tag or key containing `::` cannot collide with another group's address.
+- [ ] `Command.cancel(name)` interrupts the one group booked under `name`, whatever action tags forked its members. The fiber book is a flat map by name — no tag level, no delimiter encoding.
+- [ ] Bare-tag `cancel("Tag")` reaches only the **unkeyed** fibers of that tag; work forked under `keyed(name)` is addressed by `name` alone.
+- [ ] Cancelling work started from several action tags under one `keyed(name)` is one line — `cancel(name)` — naming no foreign tag.
 - [x] `Command.output(message, payload)` emits an outbound message; passing an internal message is a compile error. _Re-expressed on the new leaf internally; signature unchanged. Removing it is deferred — see Deferred decisions._
 - [x] Commands are `Pipeable`, and piping preserves `A` and `R`.
 
@@ -199,8 +217,8 @@ its own criteria live in `devtools.specs.md`.
 - [x] Seeded actions are processed but are not recorded in `emitted`.
 - [x] Actions a command emits feed back into the reducer loop; `emitted` collects them.
 - [x] `outputs` collects messages whose tag is a declared output; an output never re-enters the reducer.
-- [x] `Command.cancel({ tag })` interrupts every group under that tag; `Command.cancel({ tag, key })` interrupts only that group.
-- [x] `Command.batch` members run in order, sharing the issuing action's group.
+- [ ] `Command.cancel(name)` interrupts the group booked under `name`; an unkeyed command's group is its issuing action's tag.
+- [x] `Command.batch` members run in order, sharing the issuing action's context.
 - [x] Services a command requests (`R`) are satisfied from `options.layer`.
 - [x] `run` resolves only at quiescence: nothing queued, nothing in flight — including fibers that settle without emitting.
 - [x] **`run` does not terminate on a never-completing command**, and its test asserts that deliberately. See Known limitations.
@@ -236,8 +254,9 @@ its own criteria live in `devtools.specs.md`.
 - [x] Inside a handler, `dispatch` is typed by the feature's own vocabulary: `A` arrives from the contextual type of the handler's return. An undeclared tag and a declared tag with the wrong payload are both compile errors.
 - [x] `Command.keyed` preserves `A` and `R`, through `.pipe`, applied directly, and nested. The key is a required string.
 - [x] `Command.batch` preserves `A` and `R`, and a `Command<never>` member — the `Cancel` the variant exists to sequence — does not collapse the batch to `never`.
-- [x] `Command.cancel` is `Command<never>` and addresses `"Tag"` or `{ tag, key }`; a keyed-only target is a compile error.
-- [x] `restart`/`ignore`/`queue`/`stream` are absent from the constructor set, and the `Stream` and `Guarded` variants are absent from the ADT.
+- [ ] `Command.cancel` is `Command<never>` and takes exactly one string. An object target — `{ tag }` or `{ tag, key }` — is a compile error, as are a number and a zero-argument call.
+- [x] `ignore`/`queue`/`stream` are absent from the constructor set, and the `Stream` and `Guarded` variants are absent from the ADT.
+- [ ] `restart` is a constructor-set member, not an ADT variant, and preserves `A` and `R` in both forms. The two-argument form keeps contextual `A` (the same rule as `keyed`); the `.pipe` form severs it, pinned with `@ts-expect-error` on identical terms.
 
 **How `A` reaches the leaf.** `A` appears only inside `Dispatcher<A>`, in a
 parameter position, so nothing in the argument can infer it — it is resolved from
@@ -252,12 +271,11 @@ above rather than by reasoning about it:
 
 - **`Command.cancel` is generic in `A`, defaulting to `never`.** A concrete
   `Command<never>` argument is an inference source at higher priority than the
-  contextual return type, so a cancel written _first_ in a batch — which is the
-  only position it is ever written in, because sequencing it first is the node's
-  whole purpose — fixed the batch's `A` to `never` before the sibling leaf was
-  checked, and `dispatch` accepted nothing. Generic-with-a-default, the cancel
-  adopts the batch's `A` instead of pinning it, and standalone it is still
-  `Command<never>`.
+  contextual return type, so a cancel written _first_ in a batch — the position
+  `restart` desugars into — fixed the batch's `A` to `never` before the sibling
+  leaf was checked, and `dispatch` accepted nothing. Generic-with-a-default, the
+  cancel adopts the batch's `A` instead of pinning it, and standalone — the
+  cross-tag one-liner — it is still `Command<never>`.
 - **`Command.keyed` takes `(key, command)` as well as `(key)`.** A `.pipe`
   receiver is checked before `.pipe`'s own contextual type exists, so
   `Command.effect((dispatch) => …).pipe(Command.keyed("q"))` severs the
@@ -290,8 +308,10 @@ has — and repaints it from a dispatch.
 search is the right demo for it: the debounce is only meaningful against real
 typing, where each keystroke is a separate event and the interrupt lands between
 them. It asserts through a counting fake service that four keystrokes inside one
-window send exactly one query — the behaviour the `"restart"` policy used to
-provide and a `Cancel` ahead of a `keyed` leaf now does.
+window send exactly one query — the behaviour the old `"restart"` policy
+provided, then a hand-written `Cancel` ahead of a `keyed` leaf, and now
+`Command.restart` — sugar for exactly that pair. The suite must pass unchanged:
+the sugar changes spelling, not behaviour.
 
 - e2e: not applicable for `src/examples/cart.tsx` and `src/examples/presence.tsx`
   — **neither can be mounted in any environment.** Both declare their ambient
@@ -316,8 +336,8 @@ function` and no implementation, deliberately: they are illustrations of the
   closed by that effect's cleanup. StrictMode forces the split: a store created
   in `useState` survives a simulated unmount, so a single `dispose()` would leave
   the remounted component holding a closed scope.
-- The command queue and the fiber book (groups nested by tag then key, plus an
-  in-flight counter — plain mutable fields, since every update is one
+- The command queue and the fiber book (a flat map from group name to fibers,
+  plus an in-flight counter — plain mutable fields, since every update is one
   synchronous step on one thread) are **per mount**, not per store, so a stale
   fiber can only take from a queue nobody offers to again.
 - A command's emissions route back to the mount whose command emitted them, not
@@ -362,6 +382,10 @@ function` and no implementation, deliberately: they are illustrations of the
   failure its `Error` handler existed to handle.
 - Unmount interrupts in-flight work **before** running the `Unmounted` command.
   Flush-on-exit therefore belongs in the `Unmounted` handler. See open work #2.
+- Teardown's `Unmounted` command is unkeyed, so it books under `"Unmounted"` in
+  the flat namespace. A user group named `"Unmounted"` cannot collide
+  observably: the teardown sweep interrupts every user fiber before that
+  command is interpreted.
 
 ## Known limitations
 
