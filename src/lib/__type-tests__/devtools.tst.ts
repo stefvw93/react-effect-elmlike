@@ -207,8 +207,9 @@ type Json =
  *
  * Needed because of a TypeScript rule rather than anything about these types:
  * an object literal or mapped type gets an implicit index signature and an
- * **interface does not**, so `Group` and `DefectSummary` — both interfaces —
- * would fail `Json` for a reason that has nothing to do with encodability.
+ * **interface does not**, so `DefectSummary` — an interface — would fail
+ * `Json` for a reason that has nothing to do with encodability. (`Group` is a
+ * string alias now, but the mapping is harmless to it.)
  * This is structure-preserving, so what the assertions below check is still
  * the real shape. Functions are passed through deliberately: mapping over one
  * would yield `{}` and quietly let a callback satisfy `Json`, which is the

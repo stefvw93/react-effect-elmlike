@@ -82,10 +82,7 @@ const getInitialSearchState = () => ({
  * without it this file's headline claim — that cancellation is visible in the
  * handler — is only true of the paths that happen to issue a new query.
  */
-const cleared = [
-  getInitialSearchState(),
-  Command.cancel({ tag: "TextEdited", key: "query" }),
-] as const;
+const cleared = [getInitialSearchState(), Command.cancel("query")] as const;
 
 export const search = Search.create({
   initialState: () => getInitialSearchState(),
@@ -101,7 +98,7 @@ export const search = Search.create({
               // interrupt. The cancel has to run *before* the replacement is
               // registered, which is the one thing this node does that no
               // combinator inside the effect below can.
-              Command.cancel({ tag: "TextEdited", key: "query" }),
+              Command.cancel("query"),
               Command.keyed(
                 "query",
                 Command.effect((dispatch) =>

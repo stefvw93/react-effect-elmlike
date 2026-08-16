@@ -563,7 +563,7 @@ test("`Dispatcher` is contravariant in `A`, which is what makes `Command` covari
 });
 
 // ---------------------------------------------------------------------------
-// `keyed`, `batch`, `cancel` — the supervisor's whole vocabulary
+// `keyed`, `restart`, `batch`, `cancel` — the supervisor's whole vocabulary
 // ---------------------------------------------------------------------------
 
 test("`Command.keyed` names a command and preserves `A` and `R`", () => {
@@ -634,6 +634,65 @@ test("a leaf keeps its contextual `A` through `keyed(key, command)`, and loses i
   });
 });
 
+test("`Command.restart` names a command and preserves `A` and `R`", () => {
+  // Sugar for `batch(cancel(name), keyed(name, command))`, so its type surface
+  // mirrors `keyed`'s exactly: pipeable, curried, and two-argument.
+  expect(named.pipe(Command.restart("query"))).type.toBe<
+    Command<{ readonly _tag: "X" }, PipeableFooService>
+  >();
+
+  expect(Command.restart("query")(named)).type.toBe<
+    Command<{ readonly _tag: "X" }, PipeableFooService>
+  >();
+
+  expect(Command.restart("query", named)).type.toBe<
+    Command<{ readonly _tag: "X" }, PipeableFooService>
+  >();
+
+  // The name is required, and it is a string — the same rule as `keyed`.
+  expect(Command.restart).type.not.toBeCallableWith();
+  expect(Command.restart).type.not.toBeCallableWith(1);
+  expect(Command.restart).type.not.toBeCallableWith(named, "query");
+});
+
+test("a leaf keeps its contextual `A` through `restart(name, command)`, and loses it through `.pipe`", () => {
+  // Same receiver rule as `keyed`: the two-argument form puts the leaf in an
+  // argument position, where the enclosing call's contextual type reaches it.
+  Contextual.create({
+    initialState: () => ({ count: 0 }),
+    reducer: {
+      Ping: () =>
+        [
+          { count: 1 },
+          Command.restart(
+            "q",
+            Command.effect((dispatch) => dispatch({ _tag: "Pong", at: 1 })),
+          ),
+        ] as const,
+      Pong: (_action, snapshot) => snapshot.state,
+    },
+    render: () => null,
+  });
+
+  // And `.pipe` severs it, on identical terms — pinned so the two-argument
+  // form is never "simplified" away.
+  Contextual.create({
+    initialState: () => ({ count: 0 }),
+    reducer: {
+      Ping: () =>
+        [
+          { count: 1 },
+          // @ts-expect-error is not assignable to parameter of type 'never'
+          Command.effect((dispatch) => dispatch({ _tag: "Pong", at: 1 })).pipe(
+            Command.restart("q"),
+          ),
+        ] as const,
+      Pong: (_action, snapshot) => snapshot.state,
+    },
+    render: () => null,
+  });
+});
+
 test("`Command.batch` composes commands and preserves `A` and `R`", () => {
   expect(Command.batch(named, named)).type.toBe<
     Command<{ readonly _tag: "X" }, PipeableFooService>
@@ -664,7 +723,7 @@ test("a cancel written first in a batch does not pin the batch's `A` to `never`"
         [
           { count: 1 },
           Command.batch(
-            Command.cancel({ tag: "Ping", key: "q" }),
+            Command.cancel("q"),
             Command.keyed(
               "q",
               Command.effect((dispatch) => dispatch({ _tag: "Pong", at: 1 })),
@@ -685,7 +744,7 @@ test("a cancel written first in a batch does not pin the batch's `A` to `never`"
         [
           { count: 1 },
           Command.batch(
-            Command.cancel({ tag: "Ping", key: "q" }),
+            Command.cancel("q"),
             // @ts-expect-error is not assignable to type '"Ping" | "Pong"'
             Command.effect((dispatch) => dispatch({ _tag: "Nope" })),
           ),
@@ -696,23 +755,24 @@ test("a cancel written first in a batch does not pin the batch's `A` to `never`"
   });
 });
 
-test("`Command.cancel` addresses a group by tag, or by tag and key, and emits nothing", () => {
+test("`Command.cancel` addresses one flat group name and emits nothing", () => {
   // `Command<never>`, so a cancel fits any feature's slot without widening it.
   expect(Command.cancel("Search")).type.toBe<Command<never, never>>();
-  expect(Command.cancel({ tag: "Search" })).type.toBe<Command<never, never>>();
-  expect(Command.cancel({ tag: "Search", key: "q" })).type.toBe<Command<never, never>>();
 
-  // `tag` is the address; there is no keyed-only target, because a key only
-  // refines within a tag.
+  // Exactly one string. A group is one name in one flat namespace, so the old
+  // object forms are compile errors, not a second spelling of the same address.
+  expect(Command.cancel).type.not.toBeCallableWith({ tag: "Search" });
+  expect(Command.cancel).type.not.toBeCallableWith({ tag: "Search", key: "q" });
   expect(Command.cancel).type.not.toBeCallableWith({ key: "q" });
-  expect(Command.cancel).type.not.toBeCallableWith({ tag: "Search", keys: "q" });
-  expect(Command.cancel).type.not.toBeCallableWith({ tag: 1 });
+  expect(Command.cancel).type.not.toBeCallableWith(1);
+  expect(Command.cancel).type.not.toBeCallableWith();
 });
 
 test("the policy vocabulary and the `Stream` leaf are gone from the surface", () => {
   // Removed with the redesign: concurrency is Effect's, not a second data
   // vocabulary. Asserted by name so a re-introduction has to argue with a test.
-  expect(Command).type.not.toHaveProperty("restart");
+  // `restart` is deliberately not in this list — it returned as pure sugar
+  // over `batch(cancel, keyed)`, not as a policy.
   expect(Command).type.not.toHaveProperty("ignore");
   expect(Command).type.not.toHaveProperty("queue");
   expect(Command).type.not.toHaveProperty("stream");
@@ -720,7 +780,7 @@ test("the policy vocabulary and the `Stream` leaf are gone from the surface", ()
   // And the whole constructor set, so a node added without a spec change fails
   // here rather than quietly widening the ADT.
   expect<keyof typeof Command>().type.toBe<
-    "none" | "effect" | "keyed" | "batch" | "cancel" | "output"
+    "none" | "effect" | "keyed" | "batch" | "cancel" | "restart" | "output"
   >();
 
   // The `Stream` variant is gone from the ADT itself, not merely from the

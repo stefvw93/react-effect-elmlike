@@ -152,12 +152,23 @@ describe("Command", () => {
     expect(Object.keys(Command.none).sort()).toEqual(["_tag", "pipe"]);
   });
 
-  it("cancel accepts a bare tag string or a { tag, key } group", () => {
-    expect(Command.cancel("Foo")).toMatchObject({ _tag: "Cancel", target: { tag: "Foo" } });
-    expect(Command.cancel({ tag: "Foo", key: "sku-1" })).toMatchObject({
-      _tag: "Cancel",
-      target: { tag: "Foo", key: "sku-1" },
-    });
+  it("cancel takes one group name and carries it as the target", () => {
+    // A `Group` is a plain string in one flat namespace — there is no object
+    // form and no tag/key split for the interpreter to reassemble.
+    expect(Command.cancel("Foo")).toMatchObject({ _tag: "Cancel", target: "Foo" });
+  });
+
+  it("restart desugars to batch(cancel(name), keyed(name, command))", () => {
+    // Sugar, not a variant: devtools and the interpreter see the hand-written
+    // pair. JSON strips the leaf callback and `pipe`, leaving pure structure.
+    const leaf = Command.effect(() => Effect.void);
+    const strip = (command: unknown) => JSON.parse(JSON.stringify(command));
+    const expected = strip(Command.batch(Command.cancel("q"), Command.keyed("q", leaf)));
+
+    expect(strip(Command.restart("q", leaf))).toEqual(expected);
+    // The curried form builds the identical structure, and is pipeable.
+    expect(strip(Command.restart("q")(leaf))).toEqual(expected);
+    expect(strip(leaf.pipe(Command.restart("q")))).toEqual(expected);
   });
 });
 
@@ -1468,18 +1479,15 @@ describe("createFeatureStore — defects from commands (review regression)", () 
     // non-success Exit as a defect would fire `Error` on ordinary cancellation.
     //
     // The second dispatch used to be what interrupted the first, via a
-    // `restart` policy. With the policy vocabulary gone the handler cancels its
-    // own group before forking again, which is the same story told where the
-    // reader can see it.
+    // `restart` policy. `Command.restart` is that story back as sugar over
+    // `batch(cancel(name), keyed(name, command))` — the second dispatch's
+    // cancel interrupts the first fiber, and an interrupt is not a defect.
     const { store, defects } = setup({
       Boom: (_a: unknown, s: any) => [
         s.state,
-        Command.batch(
-          Command.cancel({ tag: "Boom", key: "sleep" }),
-          Command.keyed(
-            "sleep",
-            Command.effect(() => Effect.sleep("5 seconds")),
-          ),
+        Command.restart(
+          "sleep",
+          Command.effect(() => Effect.sleep("5 seconds")),
         ),
       ],
       Error: (_a: unknown, s: any) => ({ handled: s.state.handled + 1 }),
@@ -1894,8 +1902,8 @@ describe("Command.batch grouping (review iteration 3)", () => {
 
   it("keyed `Command.cancel` reaches every member of a keyed batch", async () => {
     // Indexing batch members into per-member groups broke exactly this:
-    // `cancelGroup` matches an explicit key *exactly*, so `Load::k#0` was
-    // unreachable from `cancel({ tag, key })` and nothing was interrupted.
+    // an exact-match cancel could not see a per-member `k#0` sub-address, so
+    // nothing was interrupted. One `keyed` name books every member under it.
     const log: Array<string> = [];
 
     const s = store({
@@ -1903,10 +1911,7 @@ describe("Command.batch grouping (review iteration 3)", () => {
         snap.state,
         Command.keyed("k", Command.batch(slow("a", 60, log), slow("b", 60, log))),
       ],
-      Stop: (_a: unknown, snap: { readonly state: unknown }) => [
-        snap.state,
-        Command.cancel({ tag: "Go", key: "k" }),
-      ],
+      Stop: (_a: unknown, snap: { readonly state: unknown }) => [snap.state, Command.cancel("k")],
     });
 
     s.start();
@@ -2574,14 +2579,16 @@ describe("Command — the effect leaf", () => {
     // command replacing it would interrupt the replacement.
     expect(cmd).toMatchObject({
       _tag: "Batch",
-      commands: [{ _tag: "Cancel", target: { tag: "Foo" } }, { _tag: "None" }],
+      commands: [{ _tag: "Cancel", target: "Foo" }, { _tag: "None" }],
     });
   });
 
   it("has no policy vocabulary and no stream leaf left on it", () => {
     // Concurrency is Effect's. Asserted by name so a re-introduction has to
-    // argue with a test rather than merely compile.
-    for (const removed of ["restart", "ignore", "queue", "stream"]) {
+    // argue with a test rather than merely compile. `restart` is deliberately
+    // not in this list — it returned as sugar over `batch(cancel, keyed)`,
+    // not as a policy.
+    for (const removed of ["ignore", "queue", "stream"]) {
       expect(Command).not.toHaveProperty(removed);
     }
     expect(Object.keys(Command).sort()).toEqual([
@@ -2591,6 +2598,7 @@ describe("Command — the effect leaf", () => {
       "keyed",
       "none",
       "output",
+      "restart",
     ]);
   });
 
@@ -2727,7 +2735,7 @@ describe("Blueprint.run — the effect leaf", () => {
     ]);
   });
 
-  it("`Command.keyed` names the fiber, so a tag+key `Cancel` reaches only that one", async () => {
+  it("`Command.keyed` names the group, so `cancel(name)` reaches only that one", async () => {
     const { ref, layer } = makeLogLayer();
     const Feature = define({
       props: RunProps,
@@ -2758,7 +2766,9 @@ describe("Blueprint.run — the effect leaf", () => {
             Effect.andThen(Effect.sleep("20 millis"), dispatch({ _tag: "Stop", id: "a" })),
           ),
         ],
-        Stop: (action) => [{ count: 0 }, Command.cancel({ tag: "Go", key: action.id })],
+        // The flat namespace's whole point, seen from the caller: `Stop` names
+        // the logical work and nothing else — no foreign tag, no object form.
+        Stop: (action) => [{ count: 0 }, Command.cancel(action.id)],
       },
       render: () => null,
     });
@@ -2780,11 +2790,10 @@ describe("Blueprint.run — the effect leaf", () => {
     expect(log).toContain("b:done");
   });
 
-  it("group addresses do not collide when a tag or key contains '::'", async () => {
-    // `{tag: "Spin", key: "a::b"}` and `{tag: "Spin::a", key: "b"}` both
-    // flattened to the string "Spin::a::b" under the old `${tag}::${key}`
-    // group id, so an exact `Cancel` of one interrupted the other. The book is
-    // nested by tag then key so the two addresses stay distinct.
+  it("one `cancel(name)` reaches work started from different action tags under one name", async () => {
+    // The wart the flat namespace removes: cancelling logical work that two
+    // different tags started used to take N cancels naming foreign tags.
+    // `keyed(name)` sets the whole address, so one line does it.
     const { ref, layer } = makeLogLayer();
     const spin = (id: string, ms: number) =>
       Command.effect(() =>
@@ -2800,8 +2809,8 @@ describe("Blueprint.run — the effect leaf", () => {
       props: RunProps,
       state: RunState,
       action: Action.of([
-        Action("Spin", {}),
-        Action("Spin::a", {}),
+        Action("Search", {}),
+        Action("Poll", {}),
         Action("Arm", {}),
         Action("Stop", {}),
       ]),
@@ -2809,21 +2818,21 @@ describe("Blueprint.run — the effect leaf", () => {
     const feature = Feature.create({
       initialState: () => ({ count: 0 }),
       reducer: {
-        Spin: () => [{ count: 0 }, spin("plain", 200).pipe(Command.keyed("a::b"))],
-        "Spin::a": () => [{ count: 0 }, spin("colon", 60).pipe(Command.keyed("b"))],
+        Search: () => [{ count: 0 }, spin("search", 200).pipe(Command.keyed("job"))],
+        Poll: () => [{ count: 0 }, spin("poll", 200).pipe(Command.keyed("job"))],
         Arm: () => [
           { count: 0 },
           Command.effect((dispatch) =>
             Effect.andThen(Effect.sleep("20 millis"), dispatch({ _tag: "Stop" })),
           ),
         ],
-        Stop: () => [{ count: 0 }, Command.cancel({ tag: "Spin", key: "a::b" })],
+        Stop: () => [{ count: 0 }, Command.cancel("job")],
       },
       render: () => null,
     });
 
     await Effect.runPromise(
-      feature.run([{ _tag: "Spin" }, { _tag: "Spin::a" }, { _tag: "Arm" }], {
+      feature.run([{ _tag: "Search" }, { _tag: "Poll" }, { _tag: "Arm" }], {
         props: {},
         hooks: {},
         layer,
@@ -2831,12 +2840,73 @@ describe("Blueprint.run — the effect leaf", () => {
     );
 
     const log = await Effect.runPromise(Ref.get(ref));
-    // Only the exact `{Spin, a::b}` group was cancelled…
-    expect(log).toContain("plain:start");
-    expect(log).not.toContain("plain:done");
-    expect(log).toContain("plain:ensuring");
-    // …and `{Spin::a, b}` — the old encoding's collision victim — completed.
-    expect(log).toContain("colon:done");
+    expect(log).toContain("search:start");
+    expect(log).toContain("poll:start");
+    expect(log).not.toContain("search:done");
+    expect(log).not.toContain("poll:done");
+    expect(log).toContain("search:ensuring");
+    expect(log).toContain("poll:ensuring");
+  });
+
+  it("a key equal to an action tag is one shared address, deliberately", async () => {
+    // One flat namespace: a fiber forked under `keyed("Go")` and an unkeyed
+    // fiber from action `Go` book under the same name, so `cancel("Go")`
+    // reaches both. A collision is sharing, not a defect to encode around —
+    // one namespace means one meaning per name.
+    const { ref, layer } = makeLogLayer();
+    const spin = (id: string, ms: number) =>
+      Command.effect(() =>
+        Effect.ensuring(
+          Effect.andThen(
+            push(`${id}:start`),
+            Effect.andThen(Effect.sleep(`${ms} millis`), push(`${id}:done`)),
+          ),
+          push(`${id}:ensuring`),
+        ),
+      );
+    const Feature = define({
+      props: RunProps,
+      state: RunState,
+      action: Action.of([
+        Action("Go", {}),
+        Action("Other", {}),
+        Action("Arm", {}),
+        Action("Stop", {}),
+      ]),
+    });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        // Unkeyed, so it books under its own tag: "Go".
+        Go: () => [{ count: 0 }, spin("unkeyed", 200)],
+        // Keyed to the same name from a different tag.
+        Other: () => [{ count: 0 }, spin("keyed", 200).pipe(Command.keyed("Go"))],
+        Arm: () => [
+          { count: 0 },
+          Command.effect((dispatch) =>
+            Effect.andThen(Effect.sleep("20 millis"), dispatch({ _tag: "Stop" })),
+          ),
+        ],
+        Stop: () => [{ count: 0 }, Command.cancel("Go")],
+      },
+      render: () => null,
+    });
+
+    await Effect.runPromise(
+      feature.run([{ _tag: "Go" }, { _tag: "Other" }, { _tag: "Arm" }], {
+        props: {},
+        hooks: {},
+        layer,
+      }),
+    );
+
+    const log = await Effect.runPromise(Ref.get(ref));
+    expect(log).toContain("unkeyed:start");
+    expect(log).toContain("keyed:start");
+    expect(log).not.toContain("unkeyed:done");
+    expect(log).not.toContain("keyed:done");
+    expect(log).toContain("unkeyed:ensuring");
+    expect(log).toContain("keyed:ensuring");
   });
 
   it("an unkeyed command is addressable by its tag alone", async () => {
@@ -2890,6 +2960,93 @@ describe("Blueprint.run — the effect leaf", () => {
     expect(log).toContain("b:ensuring");
   });
 
+  it("bare-tag cancel reaches only the tag's unkeyed work; keyed work answers to its name", async () => {
+    // The flat namespace's one semantic narrowing, pinned: `keyed(name)` sets
+    // the whole address, so `cancel("Go")` no longer sweeps `Go`'s keyed
+    // fibers along — they die to `cancel(name)` alone.
+    const { ref, layer } = makeLogLayer();
+    const Feature = define({
+      props: RunProps,
+      state: RunState,
+      action: Action.of([
+        Action("Go", {}),
+        Action("Arm", {}),
+        Action("StopTag", {}),
+        Action("StopName", {}),
+      ]),
+    });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Go: () => [
+          { count: 0 },
+          Command.batch(
+            // Unkeyed: books under "Go", so the bare-tag cancel reaches it.
+            Command.effect(() =>
+              Effect.ensuring(
+                Effect.andThen(
+                  push("unkeyed:start"),
+                  Effect.andThen(Effect.sleep("200 millis"), push("unkeyed:done")),
+                ),
+                push("unkeyed:ensuring"),
+              ),
+            ),
+            // Keyed: books under "q" only. The mid marker separates the two
+            // cancels in time — logged only if the fiber survived `StopTag`.
+            Command.keyed(
+              "q",
+              Command.effect(() =>
+                Effect.ensuring(
+                  Effect.andThen(
+                    push("keyed:start"),
+                    Effect.andThen(
+                      Effect.sleep("40 millis"),
+                      Effect.andThen(
+                        push("keyed:mid"),
+                        Effect.andThen(Effect.sleep("200 millis"), push("keyed:done")),
+                      ),
+                    ),
+                  ),
+                  push("keyed:ensuring"),
+                ),
+              ),
+            ),
+          ),
+        ],
+        Arm: () => [
+          { count: 0 },
+          Command.effect((dispatch) =>
+            Effect.andThen(
+              Effect.sleep("20 millis"),
+              Effect.andThen(
+                dispatch({ _tag: "StopTag" }),
+                Effect.andThen(Effect.sleep("60 millis"), dispatch({ _tag: "StopName" })),
+              ),
+            ),
+          ),
+        ],
+        StopTag: () => [{ count: 0 }, Command.cancel("Go")],
+        StopName: () => [{ count: 0 }, Command.cancel("q")],
+      },
+      render: () => null,
+    });
+
+    await Effect.runPromise(
+      feature.run([{ _tag: "Go" }, { _tag: "Arm" }], { props: {}, hooks: {}, layer }),
+    );
+
+    const log = await Effect.runPromise(Ref.get(ref));
+    // The unkeyed member died to the bare-tag cancel at ~20ms…
+    expect(log).toContain("unkeyed:start");
+    expect(log).not.toContain("unkeyed:done");
+    expect(log).toContain("unkeyed:ensuring");
+    // …while the keyed member sailed past it (the 40ms marker logged) and
+    // died only to its own name at ~80ms.
+    expect(log).toContain("keyed:mid");
+    expect(log).not.toContain("keyed:done");
+    expect(log).toContain("keyed:ensuring");
+  });
+
   it("Batch members run in order, sharing the issuing action's group", async () => {
     const { ref, layer } = makeLogLayer();
     const Feature = define({
@@ -2927,7 +3084,7 @@ describe("Blueprint.run — the effect leaf", () => {
             Effect.andThen(Effect.sleep("30 millis"), dispatch({ _tag: "Stop" })),
           ),
         ],
-        Stop: () => [{ count: 0 }, Command.cancel({ tag: "Go", key: "shared" })],
+        Stop: () => [{ count: 0 }, Command.cancel("shared")],
       },
       render: () => null,
     });
@@ -2967,7 +3124,7 @@ describe("Blueprint.run — the effect leaf", () => {
         Go: (action) => [
           { count: 0 },
           Command.batch(
-            Command.cancel({ tag: "Go", key: "query" }),
+            Command.cancel("query"),
             Command.keyed(
               "query",
               Command.effect(() =>
@@ -3014,6 +3171,62 @@ describe("Blueprint.run — the effect leaf", () => {
     expect(log).not.toContain("first:done");
     expect(log).toContain("first:ensuring");
     // ...and the replacement survived its own cancel and ran to completion.
+    expect(log).toContain("second:done");
+  });
+
+  it("Command.restart supersedes the previous run of its group — the sugar twin", async () => {
+    // The scenario above, written as `Command.restart`. Same assertions, so
+    // the structural equivalence the constructor test pins is also pinned
+    // behaviourally: the sugar cannot drift from the hand-written pair.
+    const { ref, layer } = makeLogLayer();
+    const Feature = define({
+      props: RunProps,
+      state: RunState,
+      action: Action.of([Go, Action("Arm", {})]),
+    });
+    const feature = Feature.create({
+      initialState: () => ({ count: 0 }),
+      reducer: {
+        Go: (action) => [
+          { count: 0 },
+          Command.restart(
+            "query",
+            Command.effect(() =>
+              Effect.ensuring(
+                Effect.andThen(
+                  push(`${action.id}:start`),
+                  Effect.andThen(Effect.sleep(`${action.ms} millis`), push(`${action.id}:done`)),
+                ),
+                push(`${action.id}:ensuring`),
+              ),
+            ),
+          ),
+        ],
+        Arm: () => [
+          { count: 0 },
+          Command.effect((dispatch) =>
+            Effect.andThen(
+              Effect.sleep("30 millis"),
+              dispatch({ _tag: "Go", ms: 0, id: "second" }),
+            ),
+          ),
+        ],
+      },
+      render: () => null,
+    });
+
+    await Effect.runPromise(
+      feature.run([{ _tag: "Go", ms: 200, id: "first" }, { _tag: "Arm" }], {
+        props: {},
+        hooks: {},
+        layer,
+      }),
+    );
+
+    const log = await Effect.runPromise(Ref.get(ref));
+    expect(log).toContain("first:start");
+    expect(log).not.toContain("first:done");
+    expect(log).toContain("first:ensuring");
     expect(log).toContain("second:done");
   });
 
@@ -3245,12 +3458,12 @@ describe("createFeatureStore — devtools", () => {
 
     const commands = only(recorder, "Command");
     expect(commands).toHaveLength(1);
-    expect(commands[0]!.group).toEqual({ tag: "Bump" });
+    expect(commands[0]!.group).toBe("Bump");
     expect(commands[0]!.dropped).toBe(false);
     expect(commands[0]!.command).toEqual({
       _tag: "Batch",
       commands: [
-        { _tag: "Cancel", target: { tag: "Bump" } },
+        { _tag: "Cancel", target: "Bump" },
         { _tag: "Keyed", key: "k", command: { _tag: "Effect" } },
       ],
     });
@@ -3637,7 +3850,7 @@ describe("createFeatureStore — devtools", () => {
 
     const commands = only(recorder, "Command");
     expect(commands).toHaveLength(1);
-    expect(commands[0]!.group).toEqual({ tag: "Unmounted" });
+    expect(commands[0]!.group).toBe("Unmounted");
   });
 
   it("every emitted event survives `JSON.stringify`", async () => {

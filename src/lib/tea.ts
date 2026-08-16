@@ -362,12 +362,14 @@ export type Command<A, R = never> = Pipeable.Pipeable &
   );
 
 /**
- * What `Cancel` addresses.
+ * What `Cancel` addresses: one name in one flat namespace, per mount.
+ *
+ * `keyed(name)` sets a command's whole address (outermost wins); an unkeyed
+ * command books under its issuing action's tag, so the booking address is
+ * always `key ?? tag`. A key equal to some action's tag is deliberate sharing,
+ * not a collision — one namespace means one meaning per name.
  */
-export interface Group {
-  readonly tag: string;
-  readonly key?: string;
-}
+export type Group = string;
 
 const pipeable = <T extends object>(value: T): T & Pipeable.Pipeable =>
   Object.assign(value, {
@@ -412,9 +414,20 @@ export const Command: {
   readonly batch: <A, R>(...commands: ReadonlyArray<Command<A, R>>) => Command<A, R>;
 
   /**
-   * A bare string targets every group under that action tag.
+   * Interrupts the one group booked under `target`. A bare action tag reaches
+   * only that tag's *unkeyed* fibers — keyed work answers to its own name.
    */
-  readonly cancel: <A = never>(target: Group | string) => Command<A, never>;
+  readonly cancel: <A = never>(target: Group) => Command<A, never>;
+
+  /**
+   * Take-latest as one word: `restart(name, command)` is exactly
+   * `batch(cancel(name), keyed(name, command))`. Sugar, not a variant — the
+   * interpreter and devtools see the desugared batch.
+   */
+  readonly restart: {
+    (name: Group): <A, R>(command: Command<A, R>) => Command<A, R>;
+    <A, R>(name: Group, command: Command<A, R>): Command<A, R>;
+  };
 
   /**
    * Outbound announcement.
@@ -435,11 +448,16 @@ export const Command: {
 
   batch: (...commands) => pipeable({ _tag: "Batch", commands }),
 
-  cancel: (target) =>
-    pipeable({
-      _tag: "Cancel",
-      target: typeof target === "string" ? { tag: target } : target,
-    }),
+  cancel: (target) => pipeable({ _tag: "Cancel", target }),
+
+  restart: ((name: string, command?: Command<any, any>) =>
+    command === undefined
+      ? (inner: Command<any, any>) =>
+          Command.batch(Command.cancel(name), Command.keyed(name, inner))
+      : Command.batch(
+          Command.cancel(name),
+          Command.keyed(name, command),
+        )) as (typeof Command)["restart"],
 
   output: (message, payload) =>
     Command.effect<{ readonly _tag: string }>((dispatch) =>
@@ -448,8 +466,10 @@ export const Command: {
 };
 
 /**
- * The group a command's fibers belong to. `tag` is the issuing action's, filled
- * by the runtime; `key` is whatever a `Keyed` node named it. See `Group`.
+ * Attribution for a command's fibers. `tag` is the issuing action's, filled by
+ * the runtime; `key` is whatever a `Keyed` node named it. The booking address
+ * — the name a `Cancel` matches — is `key ?? tag`; both halves are kept so
+ * devtools can attribute an emission to its action *and* its key.
  */
 type CommandContext = {
   readonly tag: string;
@@ -457,23 +477,20 @@ type CommandContext = {
 };
 
 /**
- * Mutable bookkeeping for the fibers an interpreter has in flight. Every
- * mutation is synchronous and JS is single-threaded, so plain fields suffice —
- * fibers only interleave at yield points.
- *
- * Nested by tag then key (`undefined` = unkeyed) rather than a `${tag}:${key}`
- * string, so a tag or key containing the would-be delimiter cannot collide
- * with another group's address.
+ * Mutable bookkeeping for the fibers an interpreter has in flight, one flat
+ * map from group name to fibers. Every mutation is synchronous and JS is
+ * single-threaded, so plain fields suffice — fibers only interleave at yield
+ * points.
  */
 type FiberBook = {
-  readonly groups: Map<string, Map<string | undefined, Set<Fiber.Fiber<void>>>>;
+  readonly groups: Map<Group, Set<Fiber.Fiber<void>>>;
   inFlight: number;
 };
 
 const fiberBook = (): FiberBook => ({ groups: new Map(), inFlight: 0 });
 
 const allFibers = (book: FiberBook): Array<Fiber.Fiber<void>> =>
-  [...book.groups.values()].flatMap((byKey) => [...byKey.values()].flatMap((set) => [...set]));
+  [...book.groups.values()].flatMap((set) => [...set]);
 
 /**
  * The command interpreter, shared by `Blueprint.run` and `createFeatureStore`.
@@ -512,13 +529,10 @@ const commandInterpreter = (deps: {
 } => {
   const { book } = deps;
 
-  // Every fiber at the address: a bare tag addresses every key under it.
-  const fibersAt = (target: Group): Array<Fiber.Fiber<void>> => {
-    const byKey = book.groups.get(target.tag);
-    if (byKey === undefined) return [];
-    if (target.key !== undefined) return [...(byKey.get(target.key) ?? [])];
-    return [...byKey.values()].flatMap((set) => [...set]);
-  };
+  // Every fiber at the one name a `Cancel` addresses.
+  const fibersAt = (target: Group): Array<Fiber.Fiber<void>> => [
+    ...(book.groups.get(target) ?? []),
+  ];
 
   /** Fork one leaf, register it under `ctx`'s group, unregister however it ends. */
   const forkLeaf = (ctx: CommandContext, run: Effect.Effect<void, never, any>) =>
@@ -526,23 +540,18 @@ const commandInterpreter = (deps: {
       book.inFlight += 1;
 
       const fiber: Fiber.Fiber<void> = yield* Effect.forkChild(run);
-      const byKey =
-        book.groups.get(ctx.tag) ?? new Map<string | undefined, Set<Fiber.Fiber<void>>>();
-      book.groups.set(ctx.tag, byKey);
-      const group = byKey.get(ctx.key) ?? new Set<Fiber.Fiber<void>>();
-      byKey.set(ctx.key, group);
+      const name = ctx.key ?? ctx.tag;
+      const group = book.groups.get(name) ?? new Set<Fiber.Fiber<void>>();
+      book.groups.set(name, group);
       group.add(fiber);
 
-      // No identity guards on the deletes: a Set or key-map level is deleted
-      // only when empty, by the cleanup that emptied it, and cleanups run
-      // exactly once — so a registered instance can never be a stale one.
+      // No identity guard on the delete: a Set is deleted only when empty, by
+      // the cleanup that emptied it, and cleanups run exactly once — so a
+      // registered instance can never be a stale one.
       const cleanup = Effect.sync(() => {
         book.inFlight -= 1;
         group.delete(fiber);
-        if (group.size === 0) {
-          byKey.delete(ctx.key);
-          if (byKey.size === 0) book.groups.delete(ctx.tag);
-        }
+        if (group.size === 0) book.groups.delete(name);
       });
 
       // A fiber interrupted before the scheduler has started it never runs its
@@ -1267,7 +1276,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
           name,
           instance,
           cause,
-          group: ctx,
+          group: ctx.tag,
           command: summarizeCommand(command),
           dropped: !accepted,
         });
@@ -1503,7 +1512,7 @@ export const createFeatureStore = <Props, State, Action, H extends AnyHooks>(arg
             name,
             instance,
             cause: LIFECYCLE,
-            group: { tag: "Unmounted" },
+            group: "Unmounted",
             command: summarizeCommand(teardown),
             dropped: false,
           });
