@@ -2621,6 +2621,23 @@ describe("Command — the effect leaf", () => {
 });
 
 describe("Blueprint.run — the effect leaf", () => {
+  /**
+   * A cancellable log-writing command: `id:start`, then `id:done` after `ms`,
+   * with `id:ensuring` however the fiber ends — so an assertion can tell
+   * "interrupted mid-flight" (start + ensuring, no done) from "never ran" and
+   * from "ran to completion".
+   */
+  const spin = (id: string, ms: number) =>
+    Command.effect(() =>
+      Effect.ensuring(
+        Effect.andThen(
+          push(`${id}:start`),
+          Effect.andThen(Effect.sleep(`${ms} millis`), push(`${id}:done`)),
+        ),
+        push(`${id}:ensuring`),
+      ),
+    );
+
   it("a command emits by calling dispatch — zero times, once, or many", async () => {
     const Echo = Action("Echo", { id: Schema.String });
     const Feature = define({ props: RunProps, state: RunState, action: Action.of([Bump, Echo]) });
@@ -2795,16 +2812,6 @@ describe("Blueprint.run — the effect leaf", () => {
     // different tags started used to take N cancels naming foreign tags.
     // `keyed(name)` sets the whole address, so one line does it.
     const { ref, layer } = makeLogLayer();
-    const spin = (id: string, ms: number) =>
-      Command.effect(() =>
-        Effect.ensuring(
-          Effect.andThen(
-            push(`${id}:start`),
-            Effect.andThen(Effect.sleep(`${ms} millis`), push(`${id}:done`)),
-          ),
-          push(`${id}:ensuring`),
-        ),
-      );
     const Feature = define({
       props: RunProps,
       state: RunState,
@@ -2854,16 +2861,6 @@ describe("Blueprint.run — the effect leaf", () => {
     // reaches both. A collision is sharing, not a defect to encode around —
     // one namespace means one meaning per name.
     const { ref, layer } = makeLogLayer();
-    const spin = (id: string, ms: number) =>
-      Command.effect(() =>
-        Effect.ensuring(
-          Effect.andThen(
-            push(`${id}:start`),
-            Effect.andThen(Effect.sleep(`${ms} millis`), push(`${id}:done`)),
-          ),
-          push(`${id}:ensuring`),
-        ),
-      );
     const Feature = define({
       props: RunProps,
       state: RunState,
@@ -2982,15 +2979,7 @@ describe("Blueprint.run — the effect leaf", () => {
           { count: 0 },
           Command.batch(
             // Unkeyed: books under "Go", so the bare-tag cancel reaches it.
-            Command.effect(() =>
-              Effect.ensuring(
-                Effect.andThen(
-                  push("unkeyed:start"),
-                  Effect.andThen(Effect.sleep("200 millis"), push("unkeyed:done")),
-                ),
-                push("unkeyed:ensuring"),
-              ),
-            ),
+            spin("unkeyed", 200),
             // Keyed: books under "q" only. The mid marker separates the two
             // cancels in time — logged only if the fiber survived `StopTag`.
             Command.keyed(

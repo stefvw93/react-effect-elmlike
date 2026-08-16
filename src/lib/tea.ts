@@ -400,7 +400,10 @@ export const Command: {
   ) => Command<A, R>;
 
   /**
-   * Names the fiber a command forks so `Cancel` can find it.
+   * Names the group a command's fibers book under — the *whole* address,
+   * outermost wins — so `Cancel` can find them by that one name. An unkeyed
+   * command books under its issuing action's tag instead, which is why a
+   * bare-tag cancel does not reach keyed work.
    */
   readonly keyed: {
     (key: string): <A, R>(command: Command<A, R>) => Command<A, R>;
@@ -450,14 +453,13 @@ export const Command: {
 
   cancel: (target) => pipeable({ _tag: "Cancel", target }),
 
-  restart: ((name: string, command?: Command<any, any>) =>
-    command === undefined
-      ? (inner: Command<any, any>) =>
-          Command.batch(Command.cancel(name), Command.keyed(name, inner))
-      : Command.batch(
-          Command.cancel(name),
-          Command.keyed(name, command),
-        )) as (typeof Command)["restart"],
+  restart: ((name: string, command?: Command<any, any>) => {
+    // One spelling of the definitional identity, shared by both arities, so
+    // the curried and two-argument forms cannot drift apart.
+    const sugar = (inner: Command<any, any>) =>
+      Command.batch(Command.cancel(name), Command.keyed(name, inner));
+    return command === undefined ? sugar : sugar(command);
+  }) as (typeof Command)["restart"],
 
   output: (message, payload) =>
     Command.effect<{ readonly _tag: string }>((dispatch) =>
